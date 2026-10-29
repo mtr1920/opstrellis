@@ -1,6 +1,6 @@
 [package]
 name = "opstrellis"
-version = "0.3.1"
+version = "0.3.2"
 description = "Voice dictation for every app"
 edition = "2021"
 license = "MIT"
