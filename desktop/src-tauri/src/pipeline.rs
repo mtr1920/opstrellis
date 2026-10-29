@@ -145,6 +145,31 @@ impl App {
         });
     }
 
+    /// GNOME on Wayland focuses the pill when it's shown (unfocusable is an X11/macOS hint), so a
+    /// synthetic Ctrl+V or Ctrl+C would go to the pill. Hide it and let focus go back to the
+    /// user's app before sending keys. Call from a blocking thread, not the main thread.
+    fn hide_overlay_for_keys(&self) {
+        use std::sync::atomic::Ordering;
+        if !crate::insert::is_wayland() || !self.settings().overlay {
+            return;
+        }
+        {
+            let _overlay = self.overlay_lock.lock().unwrap();
+            // Drops a show or hide still queued from before.
+            self.overlay_gen.fetch_add(1, Ordering::SeqCst);
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = self.handle.clone();
+        let _ = self.handle.run_on_main_thread(move || {
+            if let Some(w) = handle.get_webview_window("overlay") {
+                let _ = w.hide();
+            }
+            let _ = tx.send(());
+        });
+        let _ = rx.recv_timeout(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(150));
+    }
+
     /// Tells the pill how the dictation ended. While idle (e.g. a press that couldn't start), the
     /// pill is shown just for the message.
     pub fn outcome(&self, kind: &'static str, message: impl Into<String>) {
@@ -572,6 +597,7 @@ impl App {
                 ins.inserter.set_clipboard(&t)?;
                 return Ok(Some(app));
             }
+            ins.hide_overlay_for_keys();
             ins.inserter.insert(&t, &c, &method, restore, delay)?;
             if press_enter {
                 ins.inserter.press_enter()?;
@@ -767,6 +793,7 @@ impl App {
             if let Some(app) = context::focus_moved(&c) {
                 return Err(anyhow!("You switched to {app}, so the command was cancelled. Select the text again and retry."));
             }
+            ins.hide_overlay_for_keys();
             ins.inserter.copy_selection(&c)
         })
         .await??;
