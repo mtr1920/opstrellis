@@ -7,7 +7,8 @@ use crate::context::AppContext;
 use anyhow::{anyhow, Result};
 use enigo::{Direction, Enigo, Key, Keyboard};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -16,10 +17,27 @@ enum Saved {
     Image(arboard::ImageData<'static>),
 }
 
+type Clipboard = Mutex<Option<arboard::Clipboard>>;
+
 pub struct Inserter {
     // Kept alive for the app's lifetime: on X11 the clipboard owner must exist while apps read it.
-    clipboard: Mutex<Option<arboard::Clipboard>>,
+    clipboard: Arc<Clipboard>,
+    /// The user's clipboard while its restore waits for the target app to finish pasting.
+    pending: Arc<Mutex<Option<Pending>>>,
 }
+
+struct Pending {
+    id: u64,
+    /// What we pasted; the restore only replaces this.
+    text: String,
+    saved: Saved,
+}
+
+static RESTORE_IDS: AtomicU64 = AtomicU64::new(1);
+
+/// A busy app can handle the queued paste shortcut well after we send it, and would then paste
+/// whatever the clipboard holds by that time.
+const RESTORE_AFTER: Duration = Duration::from_millis(1000);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Combo {
@@ -42,6 +60,54 @@ fn set_transient(c: &mut arboard::Clipboard, text: &str) -> Result<(), arboard::
     c.set().exclude_from_history().text(text.to_string())
 }
 
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn with_clipboard<T>(clipboard: &Clipboard, f: impl FnOnce(&mut arboard::Clipboard) -> T) -> Result<T> {
+    let mut g = lock(clipboard);
+    if g.is_none() {
+        *g = arboard::Clipboard::new().ok();
+    }
+    g.as_mut().map(f).ok_or_else(|| anyhow!("Clipboard is not available"))
+}
+
+/// Puts the user's clipboard back the way it was only there for us: out of clipboard history, so
+/// a password manager's concealed copy stays concealed.
+fn restore_clipboard(clipboard: &Clipboard, saved: Saved) {
+    #[cfg(target_os = "macos")]
+    use arboard::SetExtApple;
+    #[cfg(target_os = "linux")]
+    use arboard::SetExtLinux;
+    let _ = with_clipboard(clipboard, |c| match saved {
+        Saved::Text(t) => set_transient(c, &t),
+        Saved::Image(i) => c.set().exclude_from_history().image(i),
+    });
+}
+
+/// A restore still waiting holds the user's clipboard, as long as our text is still on it.
+fn still_pending(pending: Option<Pending>, current: Option<&str>) -> Option<Saved> {
+    pending.filter(|p| current == Some(p.text.as_str())).map(|p| p.saved)
+}
+
+/// The text the user has on the clipboard, `current` unless a waiting restore will replace it.
+fn users_text(pending: Option<&Pending>, current: Option<String>) -> Option<String> {
+    match pending {
+        Some(p) if current.as_deref() == Some(p.text.as_str()) => match &p.saved {
+            Saved::Text(t) => Some(t.clone()),
+            Saved::Image(_) => None,
+        },
+        _ => current,
+    }
+}
+
+/// Something the user copied in the meantime wins over what they had before.
+fn restore_if_ours(clipboard: &Clipboard, p: Pending) {
+    if with_clipboard(clipboard, |c| c.get_text().ok()).ok().flatten() == Some(p.text) {
+        restore_clipboard(clipboard, p.saved);
+    }
+}
+
 pub fn is_wayland() -> bool {
     cfg!(target_os = "linux") && std::env::var("XDG_SESSION_TYPE").map(|v| v == "wayland").unwrap_or(false)
 }
@@ -52,15 +118,14 @@ fn has_tool(name: &str) -> bool {
 
 impl Inserter {
     pub fn new() -> Self {
-        Inserter { clipboard: Mutex::new(arboard::Clipboard::new().map_err(|e| log::warn!("clipboard unavailable: {e}")).ok()) }
+        Inserter {
+            clipboard: Arc::new(Mutex::new(arboard::Clipboard::new().map_err(|e| log::warn!("clipboard unavailable: {e}")).ok())),
+            pending: Arc::new(Mutex::new(None)),
+        }
     }
 
     fn with_clipboard<T>(&self, f: impl FnOnce(&mut arboard::Clipboard) -> T) -> Result<T> {
-        let mut g = self.clipboard.lock().unwrap_or_else(|e| e.into_inner());
-        if g.is_none() {
-            *g = arboard::Clipboard::new().ok();
-        }
-        g.as_mut().map(f).ok_or_else(|| anyhow!("Clipboard is not available"))
+        with_clipboard(&self.clipboard, f)
     }
 
     /// The user's clipboard (text or image) so it can be put back after we use it.
@@ -72,10 +137,28 @@ impl Inserter {
     }
 
     fn restore_clipboard(&self, saved: Saved) {
-        let _ = self.with_clipboard(|c| match saved {
-            Saved::Text(t) => c.set_text(t),
-            Saved::Image(i) => c.set_image(i),
-        });
+        restore_clipboard(&self.clipboard, saved);
+    }
+
+    fn clipboard_text(&self) -> Option<String> {
+        self.with_clipboard(|c| c.get_text().ok()).ok().flatten()
+    }
+
+    /// The user's own clipboard, to be put back later by the caller: a waiting restore is handed over.
+    fn take_users_clipboard(&self) -> Result<Option<Saved>> {
+        let waiting = lock(&self.pending).take();
+        match still_pending(waiting, self.clipboard_text().as_deref()) {
+            Some(saved) => Ok(Some(saved)),
+            None => self.save_clipboard(),
+        }
+    }
+
+    /// Puts back the user's clipboard now if its restore is still waiting (the app is quitting).
+    pub fn flush_restore(&self) {
+        let waiting = lock(&self.pending).take();
+        if let Some(p) = waiting {
+            restore_if_ours(&self.clipboard, p);
+        }
     }
 
     pub fn insert(&self, text: &str, ctx: &AppContext, method: &str, restore: bool, restore_delay_ms: u64) -> Result<()> {
@@ -88,8 +171,13 @@ impl Inserter {
         // On Wayland we can't see the focused app, so a native terminal may ignore Ctrl+V. Leave
         // the text on the clipboard in that case so it is never lost.
         let restore = restore && !(is_wayland() && ctx.app_name.is_none());
-        let saved = if restore { self.save_clipboard()? } else { None };
-        if saved.is_some() {
+        let saved = if restore {
+            self.take_users_clipboard()?
+        } else {
+            lock(&self.pending).take();
+            None
+        };
+        if restore {
             // Only there for the paste: keep it out of clipboard managers' history.
             self.with_clipboard(|c| set_transient(c, text))??;
         } else {
@@ -97,23 +185,32 @@ impl Inserter {
         }
         sleep(Duration::from_millis(40));
         send(if ctx.is_terminal { Combo::TerminalPaste } else { Combo::Paste })?;
-        if let Some(old) = saved {
-            // Restoring too early makes slow apps paste the old content.
-            sleep(Duration::from_millis(restore_delay_ms.max(100)));
-            // Something the user copied in the meantime wins over what they had before.
-            if self.with_clipboard(|c| c.get_text().ok())?.as_deref() == Some(text) {
-                self.restore_clipboard(old);
-            }
+        if let Some(saved) = saved {
+            // In the background, so the dictation isn't held up by the wait.
+            let id = RESTORE_IDS.fetch_add(1, Ordering::SeqCst);
+            *lock(&self.pending) = Some(Pending { id, text: text.to_string(), saved });
+            let (clipboard, pending) = (self.clipboard.clone(), self.pending.clone());
+            let wait = Duration::from_millis(restore_delay_ms).max(RESTORE_AFTER);
+            std::thread::spawn(move || {
+                sleep(wait);
+                let mut slot = lock(&pending);
+                if let Some(p) = slot.take_if(|p| p.id == id) {
+                    restore_if_ours(&clipboard, p);
+                }
+            });
         }
         Ok(())
     }
 
-    /// The clipboard's text, if it holds text.
+    /// The clipboard's text, if it holds text; right after a paste, the user's own rather than ours.
     pub fn get_clipboard(&self) -> Option<String> {
-        self.with_clipboard(|c| c.get_text().ok()).ok().flatten()
+        let pending = lock(&self.pending);
+        users_text(pending.as_ref(), self.clipboard_text())
     }
 
+    /// Stays on the clipboard: a restore still waiting is dropped.
     pub fn set_clipboard(&self, text: &str) -> Result<()> {
+        lock(&self.pending).take();
         self.with_clipboard(|c| c.set_text(text.to_string()))??;
         Ok(())
     }
@@ -122,7 +219,7 @@ impl Inserter {
     /// is selected. The user's clipboard is restored afterwards.
     pub fn copy_selection(&self, ctx: &AppContext) -> Result<Option<String>> {
         const SENTINEL: &str = "\u{2063}opstrellis-no-selection\u{2063}";
-        let saved = self.save_clipboard()?;
+        let saved = self.take_users_clipboard()?;
         self.with_clipboard(|c| c.set_text(SENTINEL.to_string()))??;
         sleep(Duration::from_millis(30));
         send(if ctx.is_terminal { Combo::TerminalCopy } else { Combo::Copy })?;
@@ -397,4 +494,28 @@ pub fn accessibility_granted(prompt: bool) -> bool {
 #[cfg(not(target_os = "macos"))]
 pub fn accessibility_granted(_prompt: bool) -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_waiting_restore_keeps_the_users_clipboard() {
+        let pending = || Some(Pending { id: 1, text: "dictated".into(), saved: Saved::Text("user's copy".into()) });
+        assert!(matches!(still_pending(pending(), Some("dictated")), Some(Saved::Text(t)) if t == "user's copy"), "the next paste restores what the user had");
+        assert!(still_pending(pending(), Some("copied since")).is_none(), "the user's newer copy is what gets saved");
+        assert!(still_pending(pending(), None).is_none());
+        assert!(still_pending(None, Some("dictated")).is_none());
+    }
+
+    #[test]
+    fn the_users_text_not_ours_while_a_restore_waits() {
+        let p = Pending { id: 1, text: "dictated".into(), saved: Saved::Text("user's copy".into()) };
+        assert_eq!(users_text(Some(&p), Some("dictated".into())).as_deref(), Some("user's copy"), "the clipboard snippet placeholder gets the user's text");
+        assert_eq!(users_text(Some(&p), Some("copied since".into())).as_deref(), Some("copied since"));
+        assert_eq!(users_text(None, Some("dictated".into())).as_deref(), Some("dictated"));
+        let image = Pending { id: 2, text: "dictated".into(), saved: Saved::Image(arboard::ImageData { width: 1, height: 1, bytes: vec![0; 4].into() }) };
+        assert_eq!(users_text(Some(&image), Some("dictated".into())), None, "an image isn't text");
+    }
 }

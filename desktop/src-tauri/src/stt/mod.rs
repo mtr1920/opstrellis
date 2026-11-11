@@ -137,6 +137,12 @@ fn cloud_v1(p: &Provider) -> String {
     format!("{}/v1", p.entry.base_url.as_deref().unwrap_or("http://localhost:8787").trim_end_matches('/'))
 }
 
+/// Sends a request. Its error never names the URL: a query string can carry the user's vocabulary
+/// (Deepgram `keyterm`), and request errors end up in the log.
+pub async fn send(rb: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+    rb.send().await.map_err(|e| e.without_url().into())
+}
+
 /// Turns a non-2xx response into a readable error ("deepgram 401: Invalid credentials").
 pub async fn check(name: &str, resp: reqwest::Response) -> Result<reqwest::Response> {
     if resp.status().is_success() {
@@ -151,8 +157,13 @@ pub async fn check(name: &str, resp: reqwest::Response) -> Result<reqwest::Respo
                 .iter()
                 .find_map(|path| path.split('.').try_fold(&v, |acc, k| acc.get(k)).and_then(|x| x.as_str().map(String::from)))
         })
-        .unwrap_or_else(|| body.chars().take(200).collect());
-    Err(anyhow!("{name} {}: {msg}", status.as_u16()))
+        .unwrap_or(body);
+    Err(anyhow!("{name} {}: {}", status.as_u16(), one_line(&msg, 200)))
+}
+
+/// A provider's message as it goes into logs, history and toasts: one line, at most `max` chars.
+fn one_line(msg: &str, max: usize) -> String {
+    msg.split(|c: char| c.is_control()).filter(|s| !s.trim().is_empty()).map(str::trim).collect::<Vec<_>>().join(" ").chars().take(max).collect()
 }
 
 pub fn pcm_bytes(samples: &[i16]) -> Vec<u8> {
@@ -199,6 +210,32 @@ mod tests {
         assert_eq!(clean_transcript("see the note (music section) [draft]"), "see the note (music section) [draft]");
         assert_eq!(clean_transcript("Thanks for watching the kids yesterday!"), "Thanks for watching the kids yesterday!");
         assert_eq!(clean_transcript("Para one.\n\nPara two."), "Para one.\n\nPara two.", "providers' paragraphs stay");
+    }
+
+    #[test]
+    fn provider_messages_are_one_short_line() {
+        assert_eq!(super::one_line("Invalid\r\ncredentials\n\n\x1b[31mx", 200), "Invalid credentials [31mx");
+        assert_eq!(super::one_line(&"é".repeat(500), 200).chars().count(), 200);
+    }
+
+    #[tokio::test]
+    async fn provider_errors_are_capped_and_request_errors_omit_the_url() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let _ = s.read(&mut [0u8; 2048]);
+            let body = format!(r#"{{"error":{{"message":"bad key\n{}"}}}}"#, "x".repeat(5000));
+            let _ = write!(s, "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        });
+        let resp = super::send(super::HTTP.get(format!("http://{addr}/"))).await.unwrap();
+        let e = super::check("deepgram", resp).await.unwrap_err().to_string();
+        assert!(e.starts_with("deepgram 401: bad key x") && !e.contains('\n') && e.len() < 260, "{e}");
+
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let e = super::send(super::HTTP.get(format!("http://{closed}/v1/listen?keyterm=Project%20Falcon"))).await.unwrap_err();
+        assert!(!format!("{e:#} {e:?}").contains("Falcon"), "{e:#}");
     }
 
     #[tokio::test]

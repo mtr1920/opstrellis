@@ -243,3 +243,36 @@ export function useSearch<T>(items: T[], text: (t: T) => string) {
   const filtered = q ? items.filter((i) => text(i).toLowerCase().includes(q)) : items;
   return { query, setQuery, filtered };
 }
+
+const LOCAL_SUFFIXES = [".local", ".lan", ".internal", ".home", ".home.arpa", ".localdomain", ".ts.net"];
+
+function localV4(a: number, b: number) {
+  return a === 127 || a === 10 || (a === 172 && b >= 16 && b < 32) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b < 128) || (a === 169 && b === 254);
+}
+
+/**
+ * What an `http://` address risks, mirroring the backend (`endpoint.rs`): "refused" for a host beyond
+ * the local network (nothing is sent there), "unencrypted" for one on it other than this computer.
+ */
+export function httpRisk(url: string | null | undefined): "refused" | "unencrypted" | null {
+  let u: URL;
+  try { u = new URL((url ?? "").trim()); } catch { return null; }
+  if (u.protocol !== "http:") return null;
+  const host = u.hostname.replace(/\.$/, "");
+  if (["localhost", "[::1]", "[::]", "0.0.0.0"].includes(host) || /^127\.\d+\.\d+\.\d+$/.test(host)) return null;
+  const v4 = host.match(/^(\d+)\.(\d+)\.\d+\.\d+$/);
+  const v6 = host.match(/^\[(.*)\]$/)?.[1];
+  const mapped = v6?.match(/^::ffff:([0-9a-f]{1,4}):[0-9a-f]{1,4}$/);
+  const first = v6 ? parseInt(v6.split(":")[0] || "0", 16) : 0;
+  const local = v4 ? localV4(+v4[1], +v4[2])
+    : mapped ? localV4(parseInt(mapped[1], 16) >> 8, parseInt(mapped[1], 16) & 255)
+    : v6 !== undefined ? (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80
+    : !host.includes(".") || LOCAL_SUFFIXES.some((s) => host.endsWith(s) && host.length > s.length);
+  return local ? "unencrypted" : "refused";
+}
+
+export function UnencryptedWarning({ url }: { url: string | null | undefined }) {
+  const risk = httpRisk(url);
+  if (risk === "refused") return <div className="error">OpsTrellis won't send anything to this address. Use https://.</div>;
+  return risk ? <div className="error">Not encrypted: anyone on this network can read your audio, text and key.</div> : null;
+}

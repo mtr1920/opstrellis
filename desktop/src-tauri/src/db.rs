@@ -27,6 +27,8 @@ pub struct HistoryItem {
     pub mode: String,
     #[serde(skip)]
     pub fixes: i64,
+    /// Not stored: whether a recording of it can be transcribed again (`recovery.rs`).
+    pub has_audio: bool,
 }
 
 /// Result of learning from a correction: entries added (or changed), corrections that will be
@@ -36,6 +38,8 @@ pub struct Learned {
     pub added: Vec<DictEntry>,
     pub pending: Vec<crate::learn::Correction>,
     pub undo: Vec<UndoRow>,
+    /// A fix was not learned because the dictionary is full (`DICT_MAX_ENTRIES`, `DICT_MAX_BYTES`).
+    pub full: bool,
 }
 
 /// A dictionary row's (phrase, replacement), or None when there is no row.
@@ -73,6 +77,95 @@ pub struct DictEntry {
     /// Added automatically from a correction (auto-learn), not typed in by the user.
     #[serde(default)]
     pub learned: bool,
+}
+
+/// A dictionary entry and where it came from: "manual", "learned", "agent" (`opstrellis mcp`) or "team".
+#[derive(Debug, Clone, Serialize)]
+pub struct DictRow {
+    #[serde(flatten)]
+    pub entry: DictEntry,
+    pub source: String,
+    /// Why a team entry is not used (see `team_unused`); None when it is, and for the user's own.
+    pub unused: Option<&'static str>,
+}
+
+/// A snippet or action as the library pages list it: whether it came from the team library, and
+/// why a team entry is not used.
+#[derive(Debug, Clone, Serialize)]
+pub struct LibraryRow<T> {
+    #[serde(flatten)]
+    pub entry: T,
+    pub team: bool,
+    pub unused: Option<&'static str>,
+}
+
+/// Team entries past these are not used (the server allows 2000 library entries in all). Every
+/// snippet trigger is compiled and matched on every dictation, about 0.2 ms each (`text.rs` snippet_speed).
+pub const TEAM_MAX_SNIPPETS: usize = 50;
+pub const TEAM_MAX_ACTIONS: usize = 200;
+pub const TEAM_READ_ONLY: &str = "Team entries are edited in the team dashboard";
+
+/// Why each team row is not used: "shadowed" when its key is one of the keys of the user's own
+/// rows (or a built-in), else "limit" from the first that `fits` refuses, in the order given (oldest
+/// first). None for the user's own rows and team rows in use.
+fn team_unused<T>(
+    rows: &[T],
+    team: impl Fn(&T) -> bool,
+    own_keys: impl Fn(&T) -> Vec<String>,
+    team_key: impl Fn(&T) -> String,
+    mut fits: impl FnMut(&T) -> bool,
+) -> Vec<Option<&'static str>> {
+    let own: std::collections::HashSet<String> = rows.iter().filter(|r| !team(r)).flat_map(&own_keys).collect();
+    let mut full = false;
+    rows.iter()
+        .map(|r| {
+            if !team(r) {
+                None
+            } else if own.contains(&team_key(r)) {
+                Some("shadowed")
+            } else if full || !fits(r) {
+                full = true;
+                Some("limit")
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Whether `entries` build into the dictionary matcher, remembered for the last dictionary checked
+/// (it changes only when an entry does).
+fn matcher_builds(entries: &[DictEntry]) -> bool {
+    use std::hash::{Hash, Hasher};
+    static LAST: Mutex<Option<(u64, bool)>> = Mutex::new(None);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for e in entries {
+        (&e.phrase, &e.replacement).hash(&mut h);
+    }
+    let key = h.finish();
+    if let Some((k, ok)) = *LAST.lock().unwrap_or_else(|e| e.into_inner()) {
+        if k == key {
+            return ok;
+        }
+    }
+    let ok = crate::text::dictionary_builds(entries);
+    *LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, ok));
+    ok
+}
+
+/// A snippet trigger as the matchers compare it (`text::normalize` also drops end punctuation).
+fn trigger_key(trigger: &str) -> String {
+    crate::terms::norm(trigger.trim().trim_end_matches(['.', '!', '?', ',']))
+}
+
+/// Refuses to change row `id` of `table` when it came from the team library.
+fn ensure_own(c: &Connection, table: &str, id: Option<i64>) -> Result<()> {
+    let Some(id) = id else { return Ok(()) };
+    // The dictionary marks team rows by source too, which databases opened without migrations (`open_existing`) have.
+    let team = if table == "dictionary" { "source = 'team'" } else { "team_id IS NOT NULL" };
+    let is_team: bool = c.query_row(&format!("SELECT {team} FROM {table} WHERE id = ?1"), [id], |r| r.get(0)).optional()?.unwrap_or(false);
+    anyhow::ensure!(!is_team, TEAM_READ_ONLY);
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +265,32 @@ pub struct UsageEvent {
     pub created_at: String,
 }
 
+/// The matcher compiles the whole dictionary into one regex; past roughly this size it fails to
+/// build and no entry applies any more.
+pub const DICT_MAX_ENTRIES: usize = 2000;
+pub const DICT_MAX_BYTES: usize = 150_000;
+
+/// Words, triggers and names are matched and typed into other apps: a stray `\r` would press Enter.
+pub fn plain_line(s: &str) -> bool {
+    !s.chars().any(char::is_control)
+}
+
+/// Multi-line text (expansions, prompts) may hold newlines and tabs, no other control characters.
+pub fn plain_text(s: &str) -> bool {
+    s.chars().all(|c| !c.is_control() || c == '\n' || c == '\t')
+}
+
+/// Entries and bytes (phrases plus replacements) of the user's own dictionary, leaving out row
+/// `except`. Team entries only fill what is left (`list_dictionary_rows`).
+pub fn dictionary_usage(c: &Connection, except: Option<i64>) -> Result<(usize, usize)> {
+    let (n, bytes): (i64, i64) = c.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(phrase AS BLOB)) + LENGTH(CAST(COALESCE(replacement, '') AS BLOB))), 0) FROM dictionary WHERE id IS NOT ?1 AND source != 'team'",
+        [except],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok((n as usize, bytes as usize))
+}
+
 const BUILTIN_TRANSFORMS: &[(&str, &str)] = &[
     ("Polish", "Rewrite the text to be clear, concise and well structured. Fix grammar and flow. Keep the author's meaning, voice and language."),
     ("Prompt engineer", "Rewrite the text as a clear, well-structured prompt for an AI assistant: state the goal, context, constraints and the expected output format."),
@@ -190,6 +309,8 @@ impl Db {
     pub fn open(path: &Path) -> Result<Db> {
         let mut conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Deleted dictations are overwritten, not just unlinked from the b-tree.
+        conn.pragma_update(None, "secure_delete", "ON")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS history (
                 id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, raw_text TEXT NOT NULL, text TEXT NOT NULL,
@@ -255,11 +376,49 @@ impl Db {
             migration.pragma_update(None, "user_version", 4)?;
         }
         migration.commit()?;
+        // v0.5: entries synced from the user's team library (`team.rs`), marked by the server's entry id.
+        let migration = conn.transaction()?;
+        for table in ["dictionary", "snippets", "transforms"] {
+            let has_team: i64 = migration.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = 'team_id'"), [], |r| r.get(0))?;
+            if has_team == 0 {
+                migration.execute(&format!("ALTER TABLE {table} ADD COLUMN team_id TEXT"), [])?;
+            }
+            migration.execute(&format!("CREATE UNIQUE INDEX IF NOT EXISTS {table}_team_id ON {table}(team_id)"), [])?;
+        }
+        migration.execute_batch(
+            "CREATE TABLE IF NOT EXISTS team_sync (id INTEGER PRIMARY KEY CHECK (id = 1), epoch INTEGER NOT NULL, team_id TEXT, team_name TEXT,
+                version INTEGER NOT NULL, synced_at TEXT, error TEXT);
+             INSERT OR IGNORE INTO team_sync (id, epoch, version) VALUES (1, 0, 0);
+             CREATE TABLE IF NOT EXISTS team_skipped (id TEXT PRIMARY KEY);",
+        )?;
+        migration.commit()?;
+        Ok(Db(Mutex::new(conn)))
+    }
+
+    /// The database as it is, never created, migrated or seeded: for `opstrellis mcp` and the CLI,
+    /// which run beside the app. Read-only unless `writable`.
+    pub fn open_existing(path: &Path, writable: bool) -> Result<Db> {
+        use rusqlite::OpenFlags;
+        let mode = if writable { OpenFlags::SQLITE_OPEN_READ_WRITE } else { OpenFlags::SQLITE_OPEN_READ_ONLY };
+        let conn = Connection::open_with_flags(path, mode | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        if writable {
+            conn.pragma_update(None, "secure_delete", "ON")?;
+        }
         Ok(Db(Mutex::new(conn)))
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Runs `f` in one transaction: an error from `f` undoes everything it did.
+    pub fn in_transaction<T>(&self, f: impl FnOnce(&rusqlite::Transaction) -> Result<T>) -> Result<T> {
+        let mut c = self.conn();
+        let tx = c.transaction()?;
+        let out = f(&tx)?;
+        tx.commit()?;
+        Ok(out)
     }
 
     // ---------- history ----------
@@ -320,6 +479,7 @@ impl Db {
                 error: r.get(12)?,
                 mode: r.get(13)?,
                 fixes: r.get(14)?,
+                has_audio: false,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -363,22 +523,59 @@ impl Db {
         )? == 1)
     }
 
+    /// Saves a new transcription of `old` (from its kept recording), unless the row was changed or
+    /// deleted meanwhile. A failed dictation that now worked counts in the aggregates once, on its
+    /// own day; a dictation already counted keeps its count, as after a correction.
+    pub fn retranscribed_history(&self, old: &HistoryItem, new: &HistoryItem) -> Result<bool> {
+        let mut c = self.conn();
+        let tx = c.transaction()?;
+        let changed = tx.execute(
+            "UPDATE history SET raw_text = ?1, text = ?2, provider = ?3, model = ?4, words = ?5, fixes = ?6, status = 'ok', error = NULL
+             WHERE id = ?7 AND status = ?8 AND text = ?9 AND raw_text = ?10",
+            params![new.raw_text, new.text, new.provider, new.model, new.words, new.fixes, old.id, old.status, old.text, old.raw_text],
+        )? == 1;
+        if changed && old.status != "ok" {
+            tx.execute(
+                "INSERT INTO daily_stats (date, category, dictations, words, audio_ms, fixes) VALUES (?1, ?2, 1, ?3, ?4, ?5)
+                 ON CONFLICT(date, category) DO UPDATE SET dictations = dictations + 1, words = words + ?3,
+                 audio_ms = audio_ms + ?4, fixes = fixes + ?5",
+                params![old.created_at.get(..10).unwrap_or_default(), old.category, new.words, old.audio_ms, new.fixes],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// The newest failed dictations, newest first.
+    pub fn failed_dictation_ids(&self, limit: i64) -> Result<Vec<i64>> {
+        let c = self.conn();
+        let mut s = c.prepare("SELECT id FROM history WHERE status = 'error' AND mode = 'dictate' ORDER BY id DESC LIMIT ?1")?;
+        let rows = s.query_map([limit], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     pub fn delete_history(&self, id: i64) -> Result<()> {
-        self.conn().execute("DELETE FROM history WHERE id = ?1", [id])?;
-        Ok(())
+        let c = self.conn();
+        c.execute("DELETE FROM history WHERE id = ?1", [id])?;
+        checkpoint(&c)
     }
 
     /// Also drops pending corrections, which are fragments of history.
     pub fn clear_history(&self) -> Result<()> {
-        self.conn().execute_batch("DELETE FROM history; DELETE FROM learn_pending;")?;
-        Ok(())
+        let c = self.conn();
+        c.execute_batch("DELETE FROM history; DELETE FROM learn_pending;")?;
+        checkpoint(&c)
     }
 
     pub fn purge_history_older_than(&self, days: u32) -> Result<usize> {
         let cutoff = (Local::now() - Duration::days(days as i64)).to_rfc3339();
         let c = self.conn();
-        c.execute("DELETE FROM learn_pending WHERE updated_at < ?1", [&cutoff])?;
-        Ok(c.execute("DELETE FROM history WHERE created_at < ?1", [cutoff])?)
+        let pending = c.execute("DELETE FROM learn_pending WHERE updated_at < ?1", [&cutoff])?;
+        let deleted = c.execute("DELETE FROM history WHERE created_at < ?1", [cutoff])?;
+        if pending + deleted > 0 {
+            checkpoint(&c)?;
+        }
+        Ok(deleted)
     }
 
     pub fn stats(&self, today: NaiveDate) -> Result<Stats> {
@@ -392,13 +589,56 @@ impl Db {
 
     // ---------- dictionary / snippets / transforms / notes ----------
 
+    /// The dictionary dictation uses: the user's own entries, then the team's in use. The matcher
+    /// keeps the first entry per phrase, so the order makes the user's own win.
     pub fn list_dictionary(&self) -> Result<Vec<DictEntry>> {
-        let c = self.conn();
-        let mut s = c.prepare("SELECT id, phrase, replacement, created_at, source = 'learned' FROM dictionary ORDER BY id DESC")?;
-        let rows = s.query_map([], |r| {
-            Ok(DictEntry { id: r.get(0)?, phrase: r.get(1)?, replacement: r.get(2)?, created_at: r.get(3)?, learned: r.get(4)? })
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        Ok(self.list_dictionary_rows()?.into_iter().filter(|r| r.unused.is_none()).map(|r| r.entry).collect())
+    }
+
+    /// The user's own rows, then the team's, each newest first. Team entries fill the budget the
+    /// user's own leave, oldest first; one whose phrase is a phrase or output of the user's own (as
+    /// the matcher compares them) is shadowed; and if the team's make the matcher fail to build,
+    /// none of them is used ("complex"), so the user's own still apply.
+    pub fn list_dictionary_rows(&self) -> Result<Vec<DictRow>> {
+        let (rows, (mut n, mut bytes)) = {
+            let c = self.conn();
+            let mut s = c.prepare("SELECT id, phrase, replacement, created_at, source FROM dictionary ORDER BY id")?;
+            let rows: Vec<DictRow> = s
+                .query_map([], |r| {
+                    let source: String = r.get(4)?;
+                    let entry = DictEntry { id: r.get(0)?, phrase: r.get(1)?, replacement: r.get(2)?, created_at: r.get(3)?, learned: source == "learned" };
+                    Ok(DictRow { entry, source, unused: None })
+                })?
+                .collect::<Result<_, _>>()?;
+            (rows, dictionary_usage(&c, None)?)
+        };
+        use crate::terms::norm;
+        let unused = team_unused(
+            &rows,
+            |r| r.source == "team",
+            |r| vec![norm(&r.entry.phrase), norm(r.entry.replacement.as_deref().unwrap_or(&r.entry.phrase))],
+            |r| norm(&r.entry.phrase),
+            |r| {
+                n += 1;
+                bytes += r.entry.phrase.len() + r.entry.replacement.as_ref().map_or(0, String::len);
+                n <= DICT_MAX_ENTRIES && bytes <= DICT_MAX_BYTES
+            },
+        );
+        let mut rows: Vec<DictRow> = rows.into_iter().zip(unused).map(|(r, unused)| DictRow { unused, ..r }).collect();
+        let team_in_use = |r: &DictRow| r.source == "team" && r.unused.is_none();
+        if rows.iter().any(team_in_use) {
+            let mut in_use: Vec<DictEntry> = rows.iter().filter(|r| r.unused.is_none() && r.source != "team").map(|r| r.entry.clone()).collect();
+            in_use.extend(rows.iter().filter(|r| team_in_use(r)).map(|r| r.entry.clone()));
+            if !matcher_builds(&in_use) {
+                log::warn!("the team's dictionary entries make the dictionary too complex to match; only the user's own are used");
+                for r in rows.iter_mut().filter(|r| r.source == "team" && r.unused.is_none()) {
+                    r.unused = Some("complex");
+                }
+            }
+        }
+        rows.reverse();
+        rows.sort_by_key(|r| r.source == "team");
+        Ok(rows)
     }
 
     /// Adds learned corrections. Entries the user created by hand are never overridden; an earlier
@@ -413,10 +653,11 @@ impl Db {
         let now = now_rfc3339();
         // A fix not repeated within 30 days is forgotten.
         tx.execute("DELETE FROM learn_pending WHERE updated_at < ?1", [(Local::now() - Duration::days(30)).to_rfc3339()])?;
-        let (mut added, mut pending, mut undo) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut added, mut pending, mut undo, mut full) = (Vec::new(), Vec::new(), Vec::new(), false);
         for k in corrections {
+            // Team entries are read-only and never block learning: the user's own entry then wins over one.
             let rows: Vec<(i64, String, Option<String>, bool)> = tx
-                .prepare("SELECT id, phrase, replacement, source = 'learned' FROM dictionary ORDER BY id")?
+                .prepare("SELECT id, phrase, replacement, source = 'learned' FROM dictionary WHERE source != 'team' ORDER BY id")?
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
                 .collect::<Result<_, _>>()?;
             let same: Vec<_> = rows.iter().filter(|r| key(&r.1) == key(&k.phrase)).collect();
@@ -453,6 +694,11 @@ impl Db {
                     *id
                 }
                 None => {
+                    let (entries, bytes) = dictionary_usage(&tx, None)?;
+                    if entries >= DICT_MAX_ENTRIES || bytes + k.phrase.len() + k.replacement.as_ref().map_or(0, String::len) > DICT_MAX_BYTES {
+                        full = true;
+                        continue;
+                    }
                     tx.execute(
                         "INSERT INTO dictionary (phrase, replacement, created_at, source) VALUES (?1, ?2, ?3, 'learned')",
                         params![k.phrase, k.replacement, now],
@@ -465,7 +711,7 @@ impl Db {
             added.push(DictEntry { id: Some(id), phrase: k.phrase, replacement: k.replacement, created_at: Some(now.clone()), learned: true });
         }
         tx.commit()?;
-        Ok(Learned { added, pending, undo })
+        Ok(Learned { added, pending, undo, full })
     }
 
     /// Reverts what `learn` changed, newest first. Rows changed since, or turned into hand-made
@@ -474,7 +720,7 @@ impl Db {
         let mut c = self.conn();
         let tx = c.transaction()?;
         for r in rows.iter().rev() {
-            let manual: bool = tx.query_row("SELECT source = 'manual' FROM dictionary WHERE id = ?1", [r.id], |x| x.get(0)).optional()?.unwrap_or(false);
+            let manual: bool = tx.query_row("SELECT source IN ('manual', 'team') FROM dictionary WHERE id = ?1", [r.id], |x| x.get(0)).optional()?.unwrap_or(false);
             if manual || row_state(&tx, r.id)? != r.after {
                 continue;
             }
@@ -492,7 +738,7 @@ impl Db {
     }
 
     /// Counts what a dictation used: dictionary entries that matched and built-in terms it contains.
-    pub fn record_usage(&self, entries: &[i64], terms: &[&str]) -> Result<()> {
+    pub fn record_usage(&self, entries: &[i64], terms: &[impl AsRef<str>]) -> Result<()> {
         if entries.is_empty() && terms.is_empty() {
             return Ok(());
         }
@@ -506,32 +752,47 @@ impl Db {
             tx.execute(
                 "INSERT INTO term_usage (term, hits, last_used) VALUES (?1, 1, ?2)
                  ON CONFLICT(term) DO UPDATE SET hits = hits + 1, last_used = ?2",
-                params![t, now],
+                params![t.as_ref(), now],
             )?;
         }
         tx.commit()?;
         Ok(())
     }
 
-    /// Words to send as transcription hints: the user's dictionary, most used first, then the
-    /// built-in terms they say most.
-    pub fn vocabulary(&self, limit: usize, terms: usize) -> Result<Vec<String>> {
+    /// Words to send as transcription hints: the user's dictionary, most used first, then up to
+    /// `terms` terms of the packs in use: the ones they say most (`in_use` leaves out those of
+    /// packs turned off since), then `pack_terms` in order.
+    pub fn vocabulary(&self, limit: usize, terms: usize, in_use: impl Fn(&str) -> bool, pack_terms: &[String]) -> Result<Vec<String>> {
+        let unused: std::collections::HashSet<i64> = self.list_dictionary_rows()?.into_iter().filter(|r| r.unused.is_some()).filter_map(|r| r.entry.id).collect();
         let c = self.conn();
         let mut out: Vec<String> = c
-            .prepare("SELECT COALESCE(replacement, phrase) FROM dictionary WHERE length(COALESCE(replacement, phrase)) <= 60 ORDER BY hits DESC, id DESC LIMIT ?1")?
-            .query_map([limit as i64], |r| r.get(0))?
+            .prepare("SELECT id, COALESCE(replacement, phrase) FROM dictionary WHERE length(COALESCE(replacement, phrase)) <= 60 ORDER BY hits DESC, id DESC")?
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .filter(|r| !matches!(r, Ok((id, _)) if unused.contains(id)))
+            .take(limit)
+            .map(|r| r.map(|(_, w)| w))
             .collect::<Result<_, _>>()?;
-        let used: Vec<String> = c
-            .prepare("SELECT term FROM term_usage ORDER BY hits DESC, last_used DESC LIMIT ?1")?
-            .query_map([terms as i64], |r| r.get(0))?
-            .collect::<Result<_, _>>()?;
-        for t in used {
-            if out.len() >= limit {
+        let end = (out.len() + terms).min(limit);
+        let add = |out: &mut Vec<String>, t: &str| {
+            if !out.iter().any(|w| w.eq_ignore_ascii_case(t)) {
+                out.push(t.to_string());
+            }
+        };
+        let mut used = c.prepare("SELECT term FROM term_usage ORDER BY hits DESC, last_used DESC")?;
+        for t in used.query_map([], |r| r.get::<_, String>(0))? {
+            if out.len() >= end {
                 break;
             }
-            if !out.iter().any(|w| w.eq_ignore_ascii_case(&t)) {
-                out.push(t);
+            let t = t?;
+            if in_use(&t) {
+                add(&mut out, &t);
             }
+        }
+        for t in pack_terms {
+            if out.len() >= end {
+                break;
+            }
+            add(&mut out, t);
         }
         Ok(out)
     }
@@ -540,7 +801,14 @@ impl Db {
         e.phrase = e.phrase.trim().to_string();
         e.replacement = e.replacement.map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
         anyhow::ensure!(!e.phrase.is_empty(), "Word or phrase is required");
+        anyhow::ensure!(plain_line(&e.phrase) && e.replacement.as_deref().is_none_or(plain_line), "Words and replacements can't contain control characters");
         let c = self.conn();
+        ensure_own(&c, "dictionary", e.id)?;
+        let (others, bytes) = dictionary_usage(&c, e.id)?;
+        anyhow::ensure!(
+            others < DICT_MAX_ENTRIES && bytes + e.phrase.len() + e.replacement.as_ref().map_or(0, String::len) <= DICT_MAX_BYTES,
+            "The dictionary is full: it holds up to {DICT_MAX_ENTRIES} entries and {DICT_MAX_BYTES} bytes of words and replacements. Delete some first."
+        );
         let now = now_rfc3339();
         match e.id {
             Some(id) => {
@@ -555,24 +823,64 @@ impl Db {
         Ok(e)
     }
 
+    /// Adds `phrase` as a vocabulary hint (no replacement), checked like an entry typed in, and marks
+    /// it as coming from `source`. None if the dictionary already has the phrase (trimmed, any case).
+    pub fn add_hint(&self, phrase: &str, source: &str) -> Result<Option<DictEntry>> {
+        // One write transaction, so the app can't add the same phrase or fill the budget in between.
+        self.conn().execute_batch("BEGIN IMMEDIATE")?;
+        let added = (|| {
+            let key = phrase.trim().to_lowercase();
+            if self.list_dictionary()?.iter().any(|e| e.phrase.trim().to_lowercase() == key) {
+                return Ok(None);
+            }
+            let e = self.upsert_dictionary(DictEntry { id: None, phrase: phrase.into(), replacement: None, created_at: None, learned: false })?;
+            self.conn().execute("UPDATE dictionary SET source = ?1 WHERE id = ?2", params![source, e.id])?;
+            Ok(Some(e))
+        })();
+        let end = if added.is_ok() { "COMMIT" } else { "ROLLBACK" };
+        if let Err(e) = self.conn().execute_batch(end) {
+            let _ = self.conn().execute_batch("ROLLBACK");
+            return Err(e.into());
+        }
+        added
+    }
+
     pub fn delete_dictionary(&self, id: i64) -> Result<()> {
-        self.conn().execute("DELETE FROM dictionary WHERE id = ?1", [id])?;
+        let c = self.conn();
+        ensure_own(&c, "dictionary", Some(id))?;
+        c.execute("DELETE FROM dictionary WHERE id = ?1", [id])?;
         Ok(())
     }
 
+    /// The snippets dictation uses: the user's own, then the team's in use. Snippets expand in this
+    /// order and the first match wins, so a team expansion can never trigger one of the user's own.
     pub fn list_snippets(&self) -> Result<Vec<Snippet>> {
+        Ok(self.list_snippet_rows()?.into_iter().filter(|r| r.unused.is_none()).map(|r| r.entry).collect())
+    }
+
+    /// The user's own snippets, then the team's, each newest first.
+    pub fn list_snippet_rows(&self) -> Result<Vec<LibraryRow<Snippet>>> {
         let c = self.conn();
-        let mut s = c.prepare("SELECT id, trigger, expansion, created_at FROM snippets ORDER BY id DESC")?;
-        let rows = s.query_map([], |r| {
-            Ok(Snippet { id: r.get(0)?, trigger: r.get(1)?, expansion: r.get(2)?, created_at: r.get(3)? })
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        let mut s = c.prepare("SELECT id, trigger, expansion, created_at, team_id IS NOT NULL FROM snippets ORDER BY id")?;
+        let rows: Vec<(Snippet, bool)> = s
+            .query_map([], |r| Ok((Snippet { id: r.get(0)?, trigger: r.get(1)?, expansion: r.get(2)?, created_at: r.get(3)? }, r.get(4)?)))?
+            .collect::<Result<_, _>>()?;
+        let mut used = 0;
+        let unused = team_unused(&rows, |r| r.1, |r| vec![trigger_key(&r.0.trigger)], |r| trigger_key(&r.0.trigger), |_| {
+            used += 1;
+            used <= TEAM_MAX_SNIPPETS
+        });
+        let mut rows: Vec<_> = rows.into_iter().zip(unused).map(|((entry, team), unused)| LibraryRow { entry, team, unused }).rev().collect();
+        rows.sort_by_key(|r| r.team);
+        Ok(rows)
     }
 
     pub fn upsert_snippet(&self, mut s: Snippet) -> Result<Snippet> {
         s.trigger = s.trigger.trim().to_string();
         anyhow::ensure!(!s.trigger.is_empty() && !s.expansion.trim().is_empty(), "Trigger and expansion are required");
+        anyhow::ensure!(plain_line(&s.trigger) && plain_text(&s.expansion), "Triggers can't contain control characters, and expansions only newlines and tabs");
         let c = self.conn();
+        ensure_own(&c, "snippets", s.id)?;
         let now = now_rfc3339();
         match s.id {
             Some(id) => {
@@ -588,21 +896,45 @@ impl Db {
     }
 
     pub fn delete_snippet(&self, id: i64) -> Result<()> {
-        self.conn().execute("DELETE FROM snippets WHERE id = ?1", [id])?;
+        let c = self.conn();
+        ensure_own(&c, "snippets", Some(id))?;
+        c.execute("DELETE FROM snippets WHERE id = ?1", [id])?;
         Ok(())
     }
 
+    /// Built-in and the user's own actions, never the team's: these are the ones an auto action,
+    /// a backup or a lookup by name may use. Command mode asks `team_action` only when none matches.
     pub fn list_transforms(&self) -> Result<Vec<Transform>> {
+        Ok(self.list_transform_rows()?.into_iter().filter(|r| !r.team).map(|r| r.entry).collect())
+    }
+
+    /// The team action in use whose name is exactly `spoken` (trimmed and lowercased by the caller).
+    pub fn team_action(&self, spoken: &str) -> Result<Option<Transform>> {
+        Ok(self.list_transform_rows()?.into_iter().find(|r| r.team && r.unused.is_none() && r.entry.name.trim().to_lowercase() == spoken).map(|r| r.entry))
+    }
+
+    /// Every action: built-in, the user's own, then the team's, each oldest first.
+    pub fn list_transform_rows(&self) -> Result<Vec<LibraryRow<Transform>>> {
         let c = self.conn();
-        let mut s = c.prepare("SELECT id, name, prompt, builtin, output FROM transforms ORDER BY builtin DESC, id")?;
-        let rows = s.query_map([], |r| Ok(Transform { id: r.get(0)?, name: r.get(1)?, prompt: r.get(2)?, builtin: r.get(3)?, output: r.get(4)? }))?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        let mut s = c.prepare("SELECT id, name, prompt, builtin, output, team_id IS NOT NULL AS team FROM transforms ORDER BY builtin DESC, team, id")?;
+        let rows: Vec<(Transform, bool)> = s
+            .query_map([], |r| Ok((Transform { id: r.get(0)?, name: r.get(1)?, prompt: r.get(2)?, builtin: r.get(3)?, output: r.get(4)? }, r.get(5)?)))?
+            .collect::<Result<_, _>>()?;
+        let mut used = 0;
+        let key = |r: &(Transform, bool)| r.0.name.trim().to_lowercase();
+        let unused = team_unused(&rows, |r| r.1, |r| vec![key(r)], key, |_| {
+            used += 1;
+            used <= TEAM_MAX_ACTIONS
+        });
+        Ok(rows.into_iter().zip(unused).map(|((entry, team), unused)| LibraryRow { entry, team, unused }).collect())
     }
 
     pub fn upsert_transform(&self, mut t: Transform) -> Result<Transform> {
         anyhow::ensure!(!t.name.trim().is_empty() && !t.prompt.trim().is_empty(), "Name and prompt are required");
+        anyhow::ensure!(plain_line(&t.name) && plain_text(&t.prompt), "Names can't contain control characters, and prompts only newlines and tabs");
         anyhow::ensure!(matches!(t.output.as_str(), "replace" | "copy"), "Unknown output \"{}\"", t.output);
         let c = self.conn();
+        ensure_own(&c, "transforms", t.id)?;
         match t.id {
             Some(id) => {
                 c.execute("UPDATE transforms SET name = ?1, prompt = ?2, output = ?3 WHERE id = ?4", params![t.name, t.prompt, t.output, id])?;
@@ -616,7 +948,9 @@ impl Db {
     }
 
     pub fn delete_transform(&self, id: i64) -> Result<()> {
-        self.conn().execute("DELETE FROM transforms WHERE id = ?1 AND builtin = 0", [id])?;
+        let c = self.conn();
+        ensure_own(&c, "transforms", Some(id))?;
+        c.execute("DELETE FROM transforms WHERE id = ?1 AND builtin = 0", [id])?;
         Ok(())
     }
 
@@ -654,8 +988,42 @@ impl Db {
     }
 
     pub fn delete_note(&self, id: i64) -> Result<()> {
-        self.conn().execute("DELETE FROM notes WHERE id = ?1", [id])?;
-        Ok(())
+        let c = self.conn();
+        c.execute("DELETE FROM notes WHERE id = ?1", [id])?;
+        checkpoint(&c)
+    }
+
+    /// Once per database: rebuilds it, so text deleted before `secure_delete` was on (freed pages
+    /// keep their old content) is gone from the file. Returns whether it ran.
+    ///
+    /// On a connection of its own, so the app's (and a dictation starting meanwhile) isn't held. With
+    /// WAL the app keeps reading from its snapshot; only a write waits, within the 5 s busy timeout,
+    /// which is why a file over `VACUUM_MAX_BYTES` (seconds to rebuild) is skipped, and logged.
+    pub fn vacuum_once(path: &Path) -> Result<bool> {
+        Self::vacuum_once_within(path, VACUUM_MAX_BYTES)
+    }
+
+    fn vacuum_once_within(path: &Path, max_bytes: u64) -> Result<bool> {
+        const TASK: &str = "vacuum-secure-delete";
+        let c = Connection::open(path)?;
+        c.busy_timeout(std::time::Duration::from_secs(5))?;
+        c.execute("CREATE TABLE IF NOT EXISTS maintenance (task TEXT PRIMARY KEY)", [])?;
+        if c.query_row("SELECT COUNT(*) FROM maintenance WHERE task = ?1", [TASK], |r| r.get::<_, i64>(0))? > 0 {
+            return Ok(false);
+        }
+        let size = std::fs::metadata(path)?.len();
+        if size > max_bytes {
+            log::warn!("not compacting the database ({size} bytes): text deleted by earlier versions may remain in its free space");
+            return Ok(false);
+        }
+        // The rebuild's temporary copy stays in memory, not in a temp file on disk.
+        c.pragma_update(None, "temp_store", "MEMORY")?;
+        let vacuumed = c.execute_batch("VACUUM");
+        c.pragma_update(None, "temp_store", "DEFAULT")?;
+        vacuumed?;
+        c.execute("INSERT INTO maintenance (task) VALUES (?1)", [TASK])?;
+        checkpoint(&c)?;
+        Ok(true)
     }
 
     // ---------- usage outbox ----------
@@ -676,6 +1044,11 @@ impl Db {
             .collect())
     }
 
+    pub fn clear_usage(&self) -> Result<()> {
+        self.conn().execute("DELETE FROM usage_outbox", [])?;
+        Ok(())
+    }
+
     pub fn ack_usage(&self, ids: &[String]) -> Result<()> {
         let c = self.conn();
         for id in ids {
@@ -683,6 +1056,15 @@ impl Db {
         }
         Ok(())
     }
+}
+
+/// Above this a one-time rebuild could make a dictation's history write wait past its busy timeout.
+const VACUUM_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Copies the WAL into the database file and empties it, so deleted rows' old pages don't linger there.
+fn checkpoint(c: &Connection) -> Result<()> {
+    c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+    Ok(())
 }
 
 /// rows: (date, category, dictations, words, audio_ms, fixes)
@@ -751,6 +1133,70 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("opstrellis-db-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         Db::open(&dir.join("t.db")).unwrap()
+    }
+
+    #[test]
+    fn deleted_history_is_gone_from_the_files() {
+        let dir = std::env::temp_dir().join(format!("opstrellis-db-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let db = Db::open(&path).unwrap();
+        let on_disk = |needle: &str| {
+            ["t.db", "t.db-wal"].iter().any(|f| std::fs::read(dir.join(f)).unwrap_or_default().windows(needle.len()).any(|w| w == needle.as_bytes()))
+        };
+        let item = |text: &str, created_at: &str| HistoryItem { text: text.into(), raw_text: text.into(), created_at: created_at.into(), status: "ok".into(), ..Default::default() };
+        db.add_history(&item("zebra quartz secret one", &now_rfc3339()), true).unwrap();
+        db.add_history(&item("zebra quartz secret old", "2001-01-01T00:00:00+00:00"), true).unwrap();
+        let single = db.add_history(&item("zebra quartz secret single", &now_rfc3339()), true).unwrap().unwrap();
+        let note = db.upsert_note(Note { id: None, title: "t".into(), body: "zebra quartz meeting".into(), updated_at: None, kind: "meeting".into() }).unwrap();
+        assert!(on_disk("zebra quartz secret one") && on_disk("zebra quartz secret old") && on_disk("zebra quartz secret single") && on_disk("zebra quartz meeting"));
+        db.delete_history(single).unwrap();
+        db.delete_note(note.id.unwrap()).unwrap();
+        assert!(!on_disk("zebra quartz secret single") && !on_disk("zebra quartz meeting"), "single deletes too");
+        assert_eq!(db.purge_history_older_than(30).unwrap(), 1);
+        assert!(!on_disk("zebra quartz secret old") && on_disk("zebra quartz secret one"));
+        db.clear_history().unwrap();
+        assert!(!on_disk("zebra quartz secret one"));
+        assert_eq!(db.stats(chrono::Local::now().date_naive()).unwrap().total_dictations, 3, "Insights totals are kept");
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn text_deleted_before_secure_delete_is_compacted_away_once() {
+        let dir = std::env::temp_dir().join(format!("opstrellis-db-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        drop(Db::open(&path).unwrap());
+        {
+            // As an earlier version left it: deleted without secure_delete.
+            let c = Connection::open(&path).unwrap();
+            c.pragma_update(None, "secure_delete", "OFF").unwrap();
+            c.execute("INSERT INTO notes (title, body, updated_at) VALUES ('t', ?1, 'x')", [format!("walrus ledger {}", "pad ".repeat(2000))]).unwrap();
+            c.execute("DELETE FROM notes", []).unwrap();
+            c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())).unwrap();
+        }
+        let in_file = || std::fs::read(&path).unwrap().windows(13).any(|w| w == b"walrus ledger");
+        assert!(in_file(), "an old-style delete leaves the text in the file");
+        let db = Db::open(&path).unwrap();
+        assert!(!Db::vacuum_once_within(&path, 10).unwrap() && in_file(), "a large database is skipped");
+        assert!(Db::vacuum_once(&path).unwrap(), "runs beside the app's open connection");
+        assert!(!in_file());
+        assert!(!db.list_notes(None).unwrap().iter().any(|n| n.body.contains("walrus")), "the app's connection still works");
+        assert!(!Db::vacuum_once(&path).unwrap(), "only once");
+        drop(db);
+        assert!(!Db::vacuum_once(&path).unwrap(), "also across launches");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn usage_outbox_can_be_cleared() {
+        let db = temp_db();
+        let ev = UsageEvent { id: "a".into(), provider: "local".into(), model: "m".into(), mode: "local".into(), audio_seconds: 1.0, words: 3, app_category: "other".into(), created_at: now_rfc3339() };
+        db.queue_usage(&ev).unwrap();
+        assert_eq!(db.pending_usage(10).unwrap().len(), 1);
+        db.clear_usage().unwrap();
+        assert!(db.pending_usage(10).unwrap().is_empty());
     }
 
     #[test]
@@ -995,9 +1441,16 @@ mod tests {
         // Hints: most used dictionary entries first, then the built-in terms the user says.
         let alice = second.added[0].id.unwrap();
         db.record_usage(&[alice, alice], &["kubectl", "PostgreSQL", "kubectl"]).unwrap();
-        let v = db.vocabulary(100, 10).unwrap();
+        let v = db.vocabulary(100, 10, |_| true, &[]).unwrap();
         assert_eq!(v[0], "Alice");
         assert!(v.ends_with(&["kubectl".into(), "PostgreSQL".into()]), "{v:?}");
-        assert_eq!(db.vocabulary(2, 10).unwrap().len(), 2);
+        assert_eq!(db.vocabulary(2, 10, |_| true, &[]).unwrap().len(), 2);
+
+        // Then the terms of enabled packs in pack order, so they help before they are ever said.
+        let dict = db.vocabulary(100, 0, |_| true, &[]).unwrap().len();
+        let packs: Vec<String> = ["EBITDA", "kubectl", "GAAP", "IFRS"].map(String::from).into();
+        let v = db.vocabulary(100, 3, |t| t != "PostgreSQL", &packs).unwrap();
+        assert_eq!(&v[dict..], ["kubectl", "EBITDA", "GAAP"], "a term of a pack turned off is left out; a repeat takes no slot");
+        assert_eq!(&db.vocabulary(dict + 2, 30, |_| true, &packs).unwrap()[dict..], ["kubectl", "PostgreSQL"], "the total limit holds");
     }
 }

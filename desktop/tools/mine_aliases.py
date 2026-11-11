@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mine mis-hearings of built-in terms (src-tauri/terms/tech.json) from real speech models.
+"""Mine mis-hearings of built-in terms (src-tauri/terms/tech.json, or a pack with --terms) from real speech models.
 
 Each term's spoken forms ("say") are synthesized with several quantized TTS voices (Kokoro int8 and
 Piper LibriTTS from the sherpa-onnx releases), transcribed with the app's local models, and what
@@ -10,7 +10,7 @@ the models write instead of the term becomes a candidate alias:
   - only dictionary words -> "techAliases" (applied in code editors and terminals only);
   - otherwise -> "aliases" (applied everywhere).
 
-Candidates are written to --out for review; nothing is applied to tech.json automatically.
+Candidates are written to --out for review; nothing is applied to the terms file automatically.
 
   pip install sherpa-onnx soundfile numpy
   python3 tools/mine_aliases.py --tts DIR --models DIR --out aliases.json
@@ -83,9 +83,11 @@ def main():
     ap.add_argument("--work", default="/tmp/opstrellis-mine")
     ap.add_argument("--out", required=True)
     ap.add_argument("--limit", type=int, help="only the first N terms (smoke test)")
+    ap.add_argument("--terms", default=TERMS, help="tech.json (default) or a term pack file, e.g. terms/packs/finance.json")
     a = ap.parse_args()
 
-    terms = json.load(open(TERMS))[: a.limit]
+    data = json.load(open(a.terms))
+    terms = (data["terms"] if isinstance(data, dict) else data)[: a.limit]
     os.makedirs(a.work, exist_ok=True)
     clips = []
     for engine, tts, voices in tts_engines(a.tts):

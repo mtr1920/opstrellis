@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import {
-  api, errMsg, useEvent, type CloudStatus, type LocalModel, type Permissions, type PolishModel, type WaylandShortcuts, type ProviderKind, type Settings, type SttEntry,
+  api, errMsg, useEvent, type BackupSummary, type CloudStatus, type SettingsDetail, type LocalModel, type Permissions, type PolishModel, type WaylandShortcuts, type ProviderKind, type Settings, type SttEntry, type TeamStatus, type UpdateInfo,
 } from "../api";
 import { Icon } from "../icons";
-import { IS_MAC, Keys, isSingleKey, Modal, Page, Progress, Row, Section, Toggle, comboText, useModelDownloads, type SettingsProps } from "../ui";
+import { WorkspacesSection } from "./Workspaces";
+import { IS_MAC, Keys, isSingleKey, Modal, Page, Progress, Row, Section, Toggle, UnencryptedWarning, comboText, useModelDownloads, type SettingsProps } from "../ui";
 
 export const PROVIDERS: Record<ProviderKind, string> = {
   local: "Local model (offline)", openai: "OpenAI-compatible", deepgram: "Deepgram", assemblyai: "AssemblyAI",
@@ -28,12 +29,12 @@ const LANGUAGES: [string, string][] = [
 const GROUPS: [string, string[]][] = [
   ["App", ["General"]],
   ["Dictation", ["Shortcuts", "Voice input", "Text insertion", "Permissions"]],
-  ["Speech & AI", ["Transcription", "Local models", "AI polish"]],
-  ["Account & privacy", ["Privacy", "Account", "About"]],
+  ["Speech & AI", ["Transcription", "Local models", "AI polish", "Workspaces"]],
+  ["Account & privacy", ["Privacy", "Agents", "Backup", "Account", "About"]],
 ];
 const SECTIONS = GROUPS.flatMap(([, sections]) => sections);
 
-type Props = SettingsProps & { saveError: string | null; saveNow: () => Promise<void> };
+type Props = SettingsProps & { saveError: string | null; saveNow: () => Promise<void>; update: UpdateInfo | null };
 
 export default function SettingsPage(props: Props) {
   const { settings, set } = props;
@@ -129,12 +130,17 @@ export default function SettingsPage(props: Props) {
 
           <SettingsSection title="AI polish" desc="AI polish cleans up dictations, runs transforms and command mode, and summarizes meetings.">
             <LlmSection settings={settings} set={set} saveNow={props.saveNow} />
+            <ReviewRewrites settings={settings} set={set} />
           </SettingsSection>
 
+          <WorkspacesSection id={anchor("Workspaces")} settings={settings} set={set} />
+
           <SettingsSection title="Privacy"><Privacy {...props} /></SettingsSection>
+          <SettingsSection title="Agents" desc="Let AI agents like Claude Code or Cursor read what you dictated and your notes, through OpsTrellis as an MCP server."><Agents {...props} /></SettingsSection>
+          <SettingsSection title="Backup" desc="Save your dictionary, snippets, actions and style settings to a file, or add them from one. API keys, providers and shortcuts are never included."><Backup {...props} /></SettingsSection>
           <SettingsSection title="Account"><Account {...props} /></SettingsSection>
 
-          <SettingsSection title="About"><About /></SettingsSection>
+          <SettingsSection title="About"><About {...props} /></SettingsSection>
 
         </div>
       </div>
@@ -192,6 +198,8 @@ export function LlmSection({ settings, set, saveNow }: SettingsProps & { saveNow
 
   async function saveKey() {
     try {
+      // A pending save of a new address would delete a key saved before it.
+      await saveNow();
       await api.setSecret("llm", key.trim());
       setKey(""); setHasKey(true); setMsg(null);
     } catch (e) { setMsg(errMsg(e)); }
@@ -239,7 +247,13 @@ export function LlmSection({ settings, set, saveNow }: SettingsProps & { saveNow
             <label className="field span2">
               <span>Base URL <em>optional: Groq, OpenRouter, Ollama, LM Studio…</em></span>
               <input value={llm.baseUrl ?? ""} placeholder="https://api.openai.com/v1"
-                onChange={(e) => update({ baseUrl: e.target.value || null })} />
+                onChange={(e) => {
+                  update({ baseUrl: e.target.value || null });
+                  // Saving drops the key entered for the old address; show that it's gone.
+                  if (hasKey) saveNow().then(() => api.hasSecrets()).then((s) => setHasKey(s.includes("llm")), () => {});
+                }} />
+              <UnencryptedWarning url={llm.baseUrl} />
+              {hasKey && <span className="meta">Changing the address clears the saved key.</span>}
             </label>
           )}
           {llm.provider !== "cloud" && llm.provider !== "local" && (
@@ -307,6 +321,26 @@ function LocalPolish() {
       {model && !model.installed && !busy && <p className="meta">Until it's downloaded, dictation uses the rule-based cleanup.</p>}
       {failed && <div className="error">Download failed: {failed}. Check your connection and try again.</div>}
     </div>
+  );
+}
+
+/** Command mode: whether a rewrite is shown in the pill before it replaces the selection. */
+function ReviewRewrites({ settings, set }: SettingsProps) {
+  const [perm] = usePermissions();
+  const wayland = !!perm?.wayland;
+  return (
+    <Row title="Review AI rewrites"
+      desc={wayland
+        ? "Not available on Wayland, where apps can't use Enter and Esc as shortcuts: rewrites replace the selection right away."
+        : "Command mode shows the rewrite in the recording pill before it replaces your selection: press Enter to insert it or Esc to discard it. Long means over 280 characters."
+          + (settings.overlay ? "" : " Needs the recording pill (General).")}>
+      <select value={wayland ? "never" : settings.reviewRewrites} disabled={wayland} aria-label="Review AI rewrites"
+        onChange={(e) => set("reviewRewrites", e.target.value as Settings["reviewRewrites"])}>
+        <option value="long">Only long text</option>
+        <option value="always">Always</option>
+        <option value="never">Never</option>
+      </select>
+    </Row>
   );
 }
 
@@ -490,7 +524,7 @@ function ProviderEntry({ entry, index, count, primary, localIds, hasKey, update,
   const needsKey = entry.provider !== "local";
 
   async function saveKey() {
-    try { await api.setSecret(`stt:${entry.id}`, key.trim()); setKey(""); onKeySaved(); }
+    try { await saveNow(); await api.setSecret(`stt:${entry.id}`, key.trim()); setKey(""); onKeySaved(); }
     catch (e) { setTest({ error: errMsg(e) }); }
   }
   async function runTest() {
@@ -521,6 +555,8 @@ function ProviderEntry({ entry, index, count, primary, localIds, hasKey, update,
             const provider = e.target.value as ProviderKind;
             const model = provider === "local" ? localIds[0] ?? "moonshine-tiny-en" : MODELS[provider][0];
             update({ provider, model, streaming: STREAMING.includes(provider) && entry.streaming });
+            // Saving drops the key kept for the previous provider; show that it's gone.
+            saveNow().then(onKeySaved, () => {});
           }}>
             {Object.entries(PROVIDERS).map(([id, label]) => <option key={id} value={id}>{label}</option>)}
           </select>
@@ -534,7 +570,12 @@ function ProviderEntry({ entry, index, count, primary, localIds, hasKey, update,
           <label className="field span2">
             <span>Base URL <em>{entry.provider === "openai" ? "optional: Groq, Fireworks, self-hosted…" : "optional: self-hosted gateway"}</em></span>
             <input value={entry.baseUrl ?? ""} placeholder={entry.provider === "openai" ? "https://api.openai.com/v1" : "Uses your OpsTrellis Cloud URL"}
-              onChange={(e) => update({ baseUrl: e.target.value || null })} />
+              onChange={(e) => {
+                update({ baseUrl: e.target.value || null });
+                if (hasKey) saveNow().then(onKeySaved, () => {});
+              }} />
+            <UnencryptedWarning url={entry.baseUrl} />
+            {hasKey && <span className="meta">Changing the address clears the saved key.</span>}
           </label>
         )}
         {entry.provider === "azure" && (
@@ -577,6 +618,7 @@ function LocalModels({ models, reload }: { models: LocalModel[]; reload: () => v
   const progress = useModelDownloads(() => reload());
   const [error, setError] = useState<string | null>(null);
   const failed = models.map((m) => progress[m.id]).find((p) => p?.error);
+  const download = (id: string, allowUnverified = false) => { setError(null); api.downloadLocalModel(id, allowUnverified).catch((e) => setError(errMsg(e))); };
 
   return (
     <>
@@ -598,7 +640,7 @@ function LocalModels({ models, reload }: { models: LocalModel[]; reload: () => v
                 </>
               ) : (
                 <button className="btn" disabled={(!!p && !p.error) || m.downloading}
-                  onClick={() => api.downloadLocalModel(m.id).catch((e) => setError(errMsg(e)))}>
+                  onClick={() => download(m.id)}>
                   {p && !p.error ? `${Math.round((p.downloaded / (p.total || 1)) * 100)}%` : m.downloading ? "Downloading…" : "Download"}
                 </button>
               )}
@@ -607,7 +649,15 @@ function LocalModels({ models, reload }: { models: LocalModel[]; reload: () => v
         );
       })}
       {models.length === 0 && <div className="list-empty">No local models available.</div>}
-      {(error || failed) && <div className="error">{error ?? `Download failed: ${failed!.error}`}</div>}
+      {failed?.changed ? (
+        <div className="row column">
+          <div className="error">{failed.error}</div>
+          <div className="inline">
+            <button className="btn" onClick={() => download(failed.id, true)}>Download anyway</button>
+            <span className="meta">Or update OpsTrellis (Settings → About) to get the file it was checked against.</span>
+          </div>
+        </div>
+      ) : (error || failed) && <div className="error">{error ?? `Download failed: ${failed!.error}`}</div>}
     </>
   );
 }
@@ -631,6 +681,16 @@ function Privacy({ settings, set }: SettingsProps) {
           <option value="0">Don't save</option>
         </select>
       </Row>
+      <Row title="Keep recordings" desc={r === 0
+        ? "History is off, so recordings stay in memory only: a failed one until you retry it or quit."
+        : "A failed recording stays in memory until you retry it or quit; the other choices also save recordings on this computer, deleted within an hour of turning 24 hours old (or at the next launch)."}>
+        <select value={settings.privacy.audioRetention}
+          onChange={(e) => set("privacy", { ...settings.privacy, audioRetention: e.target.value as Settings["privacy"]["audioRetention"] })}>
+          <option value="off">Never</option>
+          <option value="failed">Failed ones, for 24 hours</option>
+          <option value="all">All, for 24 hours</option>
+        </select>
+      </Row>
       <Row title="Sync usage stats" desc="Send word counts and durations (never text or audio) to your OpsTrellis Cloud account.">
         <Toggle checked={settings.privacy.syncUsage} onChange={(v) => set("privacy", { ...settings.privacy, syncUsage: v })} />
       </Row>
@@ -646,7 +706,205 @@ function Privacy({ settings, set }: SettingsProps) {
               setConfirm(false);
             }}>Delete everything</button>
           </>}>
-          This deletes every saved dictation on this computer. Your stats history is removed too. This can't be undone.
+          This deletes every saved dictation and kept recording on this computer. Your Insights totals are kept. This can't be undone.
+        </Modal>
+      )}
+    </>
+  );
+}
+
+// ---------- Agents ----------
+
+const AGENT_SETUP: [string, string][] = [
+  ["Claude Code: run this in a terminal", "claude mcp add opstrellis -- opstrellis mcp"],
+  ["Other agents: add an MCP server with", `{ "command": "opstrellis", "args": ["mcp"] }`],
+];
+
+function Agents({ settings, set }: SettingsProps) {
+  const a = settings.agents;
+  const update = (patch: Partial<Settings["agents"]>) => set("agents", { ...a, ...patch });
+  const [copied, setCopied] = useState<string | null>(null);
+  const copy = (text: string) => navigator.clipboard.writeText(text).then(() => setCopied(text), () => {});
+
+  return (
+    <>
+      <Row title="Agent access" desc={a.enabled ? "On: agents can use what you allow below." : "Off: agents get nothing from OpsTrellis."}>
+        <Toggle checked={a.enabled} onChange={(v) => update({ enabled: v })} label="Agent access" />
+      </Row>
+      {a.enabled && <>
+        <Row title="Dictation history" desc="Agents can search and read your saved dictations, and read your dictionary.">
+          <Toggle checked={a.history} onChange={(v) => update({ history: v })} label="Dictation history" />
+        </Row>
+        <Row title="Notes" desc="Agents can list and read your notes and meeting notes, including what others said in a meeting.">
+          <Toggle checked={a.notes} onChange={(v) => update({ notes: v })} label="Notes" />
+        </Row>
+        <Row title="Add dictionary words" desc="Agents can add technical terms and names for OpsTrellis to spell right, only ones that can't be ordinary words: with a capital inside a word (gRPC, PostgreSQL), a digit (k8s), or + # . _ / (C++, Node.js). They can't add replacements or change or delete entries.">
+          <Toggle checked={a.addTerms} onChange={(v) => update({ addTerms: v })} label="Add dictionary words" />
+        </Row>
+        <Row title="Questions by voice" desc="Lets an agent show a question in the pill. You answer by dictating; OpsTrellis never starts recording by itself.">
+          <Toggle checked={a.voice} onChange={(v) => update({ voice: v })} label="Questions by voice" />
+        </Row>
+      </>}
+      <div className="row column">
+        {AGENT_SETUP.flatMap(([label, text]) => [
+          <div key={label} className="row-desc">{label}:</div>,
+          <div key={text} className="code-row">
+            <code className="code-line mono">{text}</code>
+            <button className="btn" onClick={() => copy(text)}>{copied === text ? "Copied" : "Copy"}</button>
+          </div>,
+        ])}
+        <div className="row-desc">
+          {IS_MAC
+            ? "Installed from the .dmg? Use /Applications/OpsTrellis.app/Contents/MacOS/opstrellis in place of opstrellis."
+            : "Running the AppImage without the installer? Use its full path in place of opstrellis."}
+          {" "}Turning a switch off applies to an agent's next request. After turning one on, restart the agent so it sees the new tools.
+        </div>
+        <div className="row-desc">
+          This is your consent for what agents get through OpsTrellis, not a lock: other software running as you can read OpsTrellis's files directly.
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ---------- Backup ----------
+
+const MAX_FILE_BYTES = 5 * 1024 * 1024;
+const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+const countLine = (c: { add: number; skip: number }, one: string, many: string) =>
+  `${plural(c.add, "new " + one, "new " + many)}${c.skip ? `, ${c.skip} already there` : ""}`;
+
+const TONE_NAMES: Record<string, string> = { formal: "formal", casual: "casual", very_casual: "very casual", excited: "excited" };
+
+/** One line per kind of setting the file would replace. */
+function settingsLines(d: SettingsDetail): string[] {
+  const pairs = (o: Record<string, string>) => Object.entries(o).map(([k, v]) => `${k} → ${TONE_NAMES[v] ?? v}`).join(", ");
+  return [
+    d.language && `Language: ${d.language}`,
+    d.promptStyle && `AI prompt style: ${d.promptStyle}`,
+    Object.keys(d.styles).length > 0 && `Tones: ${pairs(d.styles)}`,
+    d.styleNotes > 0 && plural(d.styleNotes, "style note", "style notes"),
+    d.cleanup > 0 && plural(d.cleanup, "cleanup switch", "cleanup switches"),
+    d.termPacks && `Built-in term packs: ${d.termPacks.length ? d.termPacks.join(", ") : "none"}`,
+    Object.keys(d.outputLanguages).length > 0 && `Write in: ${pairs(d.outputLanguages)}`,
+    d.reviewRewrites && `Review rewrites: ${d.reviewRewrites}`,
+    d.appRules > 0 && plural(d.appRules, "app rule", "app rules"),
+    Object.keys(d.autoActions).length > 0 && `Run after every dictation: ${pairs(d.autoActions)}`,
+  ].filter((l): l is string => !!l);
+}
+
+function Backup({ set, saveNow }: SettingsProps & { saveNow: () => Promise<void> }) {
+  const fileInput = useRef<HTMLInputElement>(null);
+  const [includeNotes, setIncludeNotes] = useState(false);
+  const [saved, setSaved] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [pending, setPending] = useState<{ json: string; summary: BackupSummary } | null>(null);
+  const [withSettings, setWithSettings] = useState(false);
+  const [withNotes, setWithNotes] = useState(false);
+
+  async function exportFile() {
+    setBusy(true);
+    setError(null);
+    setResult(null);
+    try {
+      const r = await api.exportBackup(includeNotes);
+      const parts = [plural(r.dictionary, "dictionary entry", "dictionary entries"), plural(r.snippets, "snippet", "snippets"), plural(r.actions, "action", "actions")];
+      if (includeNotes) parts.push(plural(r.notes, "note", "notes"));
+      setSaved(`Saved ${parts.join(", ")} to ${r.path}.${r.skipped ? ` ${plural(r.skipped, "entry was", "entries were")} left out because ${r.skipped === 1 ? "it" : "they"} couldn't be imported again (too long, with a control character, or beyond the dictionary's size limit).` : ""}`);
+    } catch (e) { setError(errMsg(e)); }
+    setBusy(false);
+  }
+
+  async function pick(file: File | undefined) {
+    if (!file) return;
+    setError(null);
+    setResult(null);
+    if (file.size > MAX_FILE_BYTES) return setError("That file is over 5 MB, too big to be an OpsTrellis backup.");
+    try {
+      const json = await file.text();
+      setPending({ json, summary: await api.previewBackup(json) });
+      setWithSettings(false);
+      setWithNotes(false);
+    } catch (e) { setError(errMsg(e)); }
+  }
+
+  async function importFile() {
+    if (!pending) return;
+    setBusy(true);
+    try {
+      if (withSettings) await saveNow(); // a save still in flight would send the old values back over the restored ones
+      const r = await api.importBackup(pending.json, withSettings, withNotes);
+      const added = [
+        r.dictionary.add && plural(r.dictionary.add, "dictionary entry", "dictionary entries"), r.snippets.add && plural(r.snippets.add, "snippet", "snippets"),
+        r.actions.add && plural(r.actions.add, "action", "actions"), r.notes && plural(r.notes, "note", "notes"),
+      ].filter(Boolean);
+      const already = r.dictionary.skip + r.snippets.skip + r.actions.skip;
+      setResult(`${added.length ? "Added " + added.join(", ") : "Nothing new to add"}.${already ? ` ${already} already there.` : ""}${r.hasSettings ? " Style and cleanup settings restored." : ""}`);
+      if (r.hasSettings) {
+        // The backend already saved them; take them into this window so a later edit here doesn't overwrite them.
+        const s = await api.getSettings();
+        set("language", s.language);
+        set("cleanup", s.cleanup);
+        set("styles", s.styles);
+        set("outputLanguages", s.outputLanguages);
+        set("reviewRewrites", s.reviewRewrites);
+        set("styleNotes", s.styleNotes);
+        set("promptStyle", s.promptStyle);
+        set("appCategories", s.appCategories);
+        set("autoTransforms", s.autoTransforms);
+      }
+      setPending(null);
+    } catch (e) { setError(errMsg(e)); setPending(null); }
+    setBusy(false);
+  }
+
+  const nothing = pending && !withSettings && !withNotes
+    && pending.summary.dictionary.add + pending.summary.snippets.add + pending.summary.actions.add === 0;
+
+  return (
+    <>
+      <Row title="Export backup" desc={saved ?? "Saves a file to your Downloads folder."}>
+        <label className="check">
+          <input type="checkbox" checked={includeNotes} onChange={(e) => setIncludeNotes(e.target.checked)} />Include notes and meetings
+        </label>
+        <button className="btn" disabled={busy} onClick={exportFile}>Export backup</button>
+      </Row>
+      <Row title="Import backup" desc={result ?? "Adds what's in the file. Entries you already have are kept. Settings you choose to restore replace the current ones."}>
+        <button className="btn" disabled={busy} onClick={() => fileInput.current?.click()}>Import backup…</button>
+        <input ref={fileInput} type="file" accept=".json,application/json" hidden
+          onChange={(e) => { void pick(e.target.files?.[0]); e.target.value = ""; }} />
+      </Row>
+      {error && <div className="error">{error}</div>}
+      {pending && (
+        <Modal title="Import backup?" onClose={() => setPending(null)}
+          footer={<>
+            <button className="btn" onClick={() => setPending(null)}>Cancel</button>
+            <button className="btn primary" disabled={busy || !!nothing} onClick={importFile}>Import</button>
+          </>}>
+          <div>
+            <div>{countLine(pending.summary.dictionary, "dictionary entry", "dictionary entries")}</div>
+            <div>{countLine(pending.summary.snippets, "snippet", "snippets")}</div>
+            <div>{countLine(pending.summary.actions, "action", "actions")}</div>
+            {pending.summary.notes > 0 && <div>{plural(pending.summary.notes, "new note or meeting", "new notes and meetings")}</div>}
+          </div>
+          {pending.summary.settings && (
+            <div>
+              <label className="check">
+                <input type="checkbox" checked={withSettings} onChange={(e) => setWithSettings(e.target.checked)} />Also restore these settings, replacing the current ones
+              </label>
+              <div className="meta">
+                {settingsLines(pending.summary.settings).map((l) => <div key={l}>{l}</div>)}
+                <div>App rules that mark an app as “AI prompts” are never restored. Actions to run after every dictation are only taken from the actions you already have.</div>
+              </div>
+            </div>
+          )}
+          {pending.summary.notes > 0 && (
+            <label className="check">
+              <input type="checkbox" checked={withNotes} onChange={(e) => setWithNotes(e.target.checked)} />Import notes and meetings
+            </label>
+          )}
         </Modal>
       )}
     </>
@@ -696,11 +954,59 @@ function Account({ settings, set }: SettingsProps) {
           <span className="spinner" aria-label="Waiting for approval" />
         </div>
       )}
-      <Row title="Server URL" desc="Change this only if you run your own OpsTrellis Cloud.">
-        <input className="wide" value={settings.cloud.baseUrl} onChange={(e) => set("cloud", { ...settings.cloud, baseUrl: e.target.value })} />
+      {status?.signedIn && <TeamLibrary settings={settings} set={set} />}
+      <Row title="Server URL" desc={status?.signedIn ? "Sign out to change the server." : "Change this only if you run your own OpsTrellis Cloud."}>
+        <input className="wide" value={settings.cloud.baseUrl} readOnly={!!status?.signedIn}
+          onChange={(e) => set("cloud", { ...settings.cloud, baseUrl: e.target.value })} />
       </Row>
+      <UnencryptedWarning url={settings.cloud.baseUrl} />
       {error && <div className="error">{error}</div>}
     </>
+  );
+}
+
+const count = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
+
+function synced(iso: string | null) {
+  if (!iso) return "not synced yet";
+  const min = Math.floor((Date.now() - new Date(iso).getTime()) / 60e3);
+  if (min < 1) return "synced just now";
+  if (min < 60) return `synced ${min} min ago`;
+  const h = Math.floor(min / 60);
+  return h < 24 ? `synced ${h} h ago` : `synced ${Math.floor(h / 24)} d ago`;
+}
+
+/** The team's shared dictionary, snippets and actions, synced down read-only. */
+function TeamLibrary({ settings, set }: SettingsProps) {
+  const [team, setTeam] = useState<TeamStatus | null>(null);
+  const [syncing, setSyncing] = useState(false);
+  const load = () => api.teamStatus().then(setTeam, () => {});
+  useEffect(() => {
+    void load();
+    const t = setInterval(load, 60e3); // keeps "synced … ago" current
+    return () => clearInterval(t);
+  }, []);
+  useEvent("team-updated", () => void load());
+  const on = settings.cloud.teamLibrary;
+
+  async function syncNow() {
+    setSyncing(true);
+    try { setTeam(await api.teamSyncNow()); } catch { /* the error is in the status */ } finally { setSyncing(false); }
+  }
+
+  let desc: ReactNode = "Off. Your team's shared words, snippets and actions aren't used.";
+  if (on && team) {
+    const what = team.team
+      ? `${team.team.name}: ${count(team.dictionary, "word")} · ${count(team.snippets, "snippet")} · ${count(team.actions, "action")}${team.skipped ? ` · ${team.skipped} not used` : ""}`
+      : team.syncedAt ? "You're not in a team." : "";
+    const text = [what, team.error ? "" : synced(team.syncedAt)].filter(Boolean).join(" · ");
+    desc = <>{text.charAt(0).toUpperCase() + text.slice(1)}{team.error && <>{text && " · "}<span className="error">Last sync failed: {team.error}</span></>}</>;
+  }
+  return (
+    <Row title="Team library" desc={desc}>
+      {on && <button className="btn" onClick={syncNow} disabled={syncing}>{syncing ? "Syncing…" : "Sync now"}</button>}
+      <Toggle checked={on} label="Use the team library" onChange={(v) => set("cloud", { ...settings.cloud, teamLibrary: v })} />
+    </Row>
   );
 }
 
@@ -708,14 +1014,48 @@ const humanize = (k: string) => k.replace(/([A-Z])/g, " $1").replace(/_/g, " ").
 
 // ---------- About ----------
 
-function About() {
+const INSTALL_COMMAND = "curl -fsSL https://raw.githubusercontent.com/mtr1920/opstrellis/main/install.sh | bash";
+
+function About({ settings, set, update: pending }: SettingsProps & { update: UpdateInfo | null }) {
   const [version, setVersion] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [checked, setChecked] = useState<UpdateInfo | null>(null);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
   useEffect(() => void api.version().then(setVersion, () => {}), []);
+
+  async function check() {
+    setChecking(true);
+    setUpdateError(null);
+    try { setChecked(await api.checkUpdate()); } catch (e) { setChecked(null); setUpdateError(errMsg(e)); }
+    setChecking(false);
+  }
+  const update = checked ?? pending; // a newer version the daily check already found shows without a click
+  const copy = () => navigator.clipboard.writeText(INSTALL_COMMAND).then(() => setCopied(true), () => {});
 
   return (
     <>
       <Row title="Version" desc="MIT licensed: free for anyone, including commercial use."><span className="meta mono">{version ?? "…"}</span></Row>
+      <Row title="Check for updates"
+        desc={updateError ? <span className="error">{updateError}</span>
+          : update ? (update.newer ? `Version ${update.latest.replace(/^v/, "")} is available.` : "You're on the latest version.")
+          : "Looks up the latest version on github.com. Nothing is installed."}>
+        {update?.newer && <button className="btn primary" onClick={() => api.openReleasePage(update.latest).catch((e) => setUpdateError(errMsg(e)))}>Open release page</button>}
+        <button className="btn" disabled={checking} onClick={check}>{checking ? "Checking…" : "Check for updates"}</button>
+      </Row>
+      {update?.newer && (
+        <div className="row column">
+          <div className="row-desc">To update, run this in a terminal:</div>
+          <div className="code-row">
+            <code className="code-line mono">{INSTALL_COMMAND}</code>
+            <button className="btn" onClick={copy}>{copied ? "Copied" : "Copy"}</button>
+          </div>
+        </div>
+      )}
+      <Row title="Check for updates automatically" desc="Once a day, OpsTrellis asks github.com for the latest version number. Nothing about you is sent.">
+        <Toggle checked={settings.checkUpdates} onChange={(v) => set("checkUpdates", v)} label="Check for updates automatically" />
+      </Row>
       <Row title="Logs" desc={error ?? "Timings and errors for each dictation, without the dictated text."}>
         <button className="btn" onClick={() => api.openLogs().then(() => setError(null), (e) => setError(errMsg(e)))}>Show logs</button>
       </Row>
