@@ -39,7 +39,7 @@ jobs:
           - os: ubuntu-22.04
             bundles: deb,appimage
             target: linux-x86_64
-          - os: macos-14
+          - os: macos-15
             bundles: app,dmg
             target: macos-aarch64
     runs-on: ${{ matrix.os }}
@@ -164,7 +164,7 @@ jobs:
           (cd dist && sha256sum -- * > SHA256SUMS && sha256sum --check SHA256SUMS)
           extra=()
           case "$GITHUB_REF_NAME" in *-*) extra+=(--prerelease) ;; esac
-          gh release create "$GITHUB_REF_NAME" dist/* --title "OpsTrellis $GITHUB_REF_NAME" --generate-notes --verify-tag "${extra[@]}"
+          gh release create "$GITHUB_REF_NAME" dist/* --title "OpsTrellis $GITHUB_REF_NAME" --generate-notes --verify-tag ${extra[@]+"${extra[@]}"}
 
   install-test:
     # Installs the published release with install.sh on each OS, then reruns it as an update would.
@@ -172,7 +172,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-14]
+        os: [ubuntu-22.04, macos-15]
     runs-on: ${{ matrix.os }}
     env:
       GITHUB_TOKEN: ${{ github.token }}
