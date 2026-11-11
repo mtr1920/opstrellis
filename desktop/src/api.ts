@@ -73,7 +73,8 @@ export interface Transform { id: number; name: string; prompt: string; builtin: 
 export interface Note { id: number; title: string; body: string; updatedAt: string; kind: "note" | "meeting" }
 export interface LocalModel {
   id: string; name: string; languages: string; sizeMb: number; installed: boolean; downloading: boolean; description: string;
-  langs: string[]; recommended: boolean;
+  /** Languages this model is a top pick for. */
+  langs: string[]; recommended: string[];
 }
 export interface CloudStatus { signedIn: boolean; email: string | null; plan: string | null; usage: any | null }
 export interface DictationState {

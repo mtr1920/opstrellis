@@ -62,25 +62,33 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: desktop/src-tauri
-          # sherpa-rs-sys downloads its libraries outside target/, and a cached build links
-          # against that folder, so cache it in the same entry.
-          key: sherpa
-          cache-directories: |
-            ~/.cache/sherpa-rs
-            ~/Library/Caches/sherpa-rs
-      - name: Put cached sherpa-onnx libraries back next to the builds (Linux)
-        # sherpa-rs-sys copies its .so files into target/<profile>/, which rust-cache prunes, and a
+          # A cached build links against the sherpa-onnx libraries in ~/.cache/sherpa-onnx, so keep
+          # them in the same entry.
+          key: sherpa-onnx-2.0.1
+          cache-directories: ~/.cache/sherpa-onnx
+      - name: sherpa-onnx libraries
+        # rust-cache empties unknown folders under target/ before saving, which would leave
+        # sherpa-onnx-sys's own download empty, so keep the libraries outside target/ and point the
+        # build at them. The version must match the sherpa-onnx crate in src-tauri/Cargo.toml.
+        run: |
+          case "$RUNNER_OS" in
+            Linux) name=sherpa-onnx-v2.0.1-linux-x64-shared-lib ;;
+            macOS) name=sherpa-onnx-v2.0.1-osx-arm64-static-lib ;;
+          esac
+          dir="$HOME/.cache/sherpa-onnx"
+          if [ ! -d "$dir/$name/lib" ]; then
+            mkdir -p "$dir"
+            curl -fsSL "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/$name.tar.bz2" | tar xj -C "$dir"
+          fi
+          echo "SHERPA_ONNX_LIB_DIR=$dir/$name/lib" >> "$GITHUB_ENV"
+      - name: Put the sherpa-onnx libraries next to the builds (Linux)
+        # sherpa-onnx-sys copies its .so files into target/<profile>/, which rust-cache prunes, and a
         # cached build doesn't rerun that copy. The tests load them from there and the bundle ships them.
         if: runner.os == 'Linux'
         run: |
-          for lib in ~/.cache/sherpa-rs/*/*/*/lib; do
-            [ -d "$lib" ] || continue
-            for profile in debug release; do
-              mkdir -p src-tauri/target/$profile
-              for f in "$lib"/*.so*; do
-                [ -e "src-tauri/target/$profile/$(basename "$f")" ] || cp "$f" "src-tauri/target/$profile/"
-              done
-            done
+          for profile in debug release; do
+            mkdir -p src-tauri/target/$profile
+            cp "$SHERPA_ONNX_LIB_DIR"/*.so* src-tauri/target/$profile/
           done
       - run: npm ci
       - run: npm run build

@@ -667,7 +667,8 @@ fn warm_up(app: &Arc<App>) {
     let s = app.settings();
     if let Some(e) = s.stt_chain.iter().find(|e| e.enabled).filter(|e| e.provider == settings::ProviderKind::Local) {
         let (dir, id) = (app.models_dir.clone(), e.model.clone());
-        std::thread::spawn(move || stt::local::warm_up(&dir, &id));
+        let language = Some(s.language.clone()).filter(|l| !l.is_empty() && l != "auto");
+        std::thread::spawn(move || stt::local::warm_up(&dir, &id, language.as_deref()));
     }
 }
 

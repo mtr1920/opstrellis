@@ -56,7 +56,7 @@ interface Snippet { id: number; trigger: string; expansion: string; createdAt: s
 interface Transform { id: number; name: string; prompt: string; builtin: boolean; output: "replace" | "copy" }   // command mode: replace the selection, or copy the result
 interface Note { id: number; title: string; body: string; updatedAt: string; kind: "note" | "meeting" }
 interface AppUse { appName: string; category: string; count: number }
-interface LocalModel { id: string; name: string; languages: string; sizeMb: number; installed: boolean; downloading: boolean; description: string; langs: string[]; recommended: boolean }
+interface LocalModel { id: string; name: string; languages: string; sizeMb: number; installed: boolean; downloading: boolean; description: string; langs: string[]; recommended: string[] }
 interface CloudStatus { signedIn: boolean; email: string | null; plan: string | null; usage: any | null }
 type DictationState = {
   status: "idle" | "recording" | "processing"; mode: "dictate" | "command"; handsFree: boolean;

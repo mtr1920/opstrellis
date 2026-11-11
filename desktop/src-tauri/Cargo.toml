@@ -34,7 +34,6 @@ arboard = { version = "3.6", features = ["wayland-data-control"] }
 keyring = { version = "3", features = ["apple-native", "sync-secret-service", "crypto-rust"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 active-win-pos-rs = "0.9"
-sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
@@ -47,10 +46,14 @@ urlencoding = "2"
 # Local AI polish (S1-mini): llama.cpp, statically linked, CPU by default.
 llama-cpp-2 = { version = "=0.1.158", default-features = false }
 
+# Linux ships sherpa-onnx's shared libraries next to the binary (see build.rs and tauri.conf.json).
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+sherpa-onnx = { version = "=2.0.1", default-features = false, features = ["shared"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-accessibility-client = "0.0.1"
 # Link sherpa-onnx statically on macOS so there are no dylibs to bundle as frameworks.
-sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries", "static"] }
+sherpa-onnx = { version = "=2.0.1", default-features = false, features = ["static"] }
 llama-cpp-2 = { version = "=0.1.158", default-features = false, features = ["metal"] }
 
 [profile.release]

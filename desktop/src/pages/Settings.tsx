@@ -588,11 +588,19 @@ function ProviderEntry({ entry, index, count, primary, localModels, hasKey, upda
 
 type ModelSort = "recommended" | "size" | "name";
 const MODEL_SORTS: [ModelSort, string][] = [["recommended", "Recommended"], ["size", "Smallest download"], ["name", "Name"]];
-const languageNames = (() => {
-  try { return new Intl.DisplayNames(["en"], { type: "language" }); } catch { return null; }
-})();
-/** "de" → "German". Whisper still uses "jw" for Javanese. */
-const languageName = (code: string) => languageNames?.of(code === "jw" ? "jv" : code) ?? code;
+const displayNames = (locale: string) => {
+  try { return new Intl.DisplayNames([locale], { type: "language" }); } catch { return null; }
+};
+const englishNames = displayNames("en");
+/** "de" → "German". */
+const languageName = (code: string) => englishNames?.of(code) ?? code;
+/** "hi" → "हिन्दी", or "" when it reads the same as the English name. */
+function nativeName(code: string) {
+  const own = displayNames(code)?.of(code) ?? "";
+  return own.toLowerCase() === languageName(code).toLowerCase() || own === code ? "" : own;
+}
+/** Languages most people dictate in, listed first after the user's own. */
+const COMMON_LANGUAGES = ["en", "hi", "es", "fr", "de", "zh", "ja", "pt", "ar", "ru", "bn", "ko", "it", "ta", "te", "mr", "ur"];
 
 /** Where a local model sits in the provider chain: the first enabled local entry using it, if any. */
 function chainRole(chain: SttEntry[], id: string): "Primary" | "Fallback" | null {
@@ -601,27 +609,53 @@ function chainRole(chain: SttEntry[], id: string): "Primary" | "Fallback" | null
   return chain.findIndex((e) => e.enabled) === i ? "Primary" : "Fallback";
 }
 
-/** A searchable catalog of on-device models: filter by language, download, cancel, use and delete. */
+/** A model browser in the spirit of T3 Code's: languages on the left, a scrolling list of on-device
+ * models on the right, with search, sorting, download, cancel, use and delete. */
 function LocalModels({ models, reload, settings, set }: SettingsProps & { models: LocalModel[]; reload: () => void }) {
   const [pending, setPending] = useState<Set<string>>(new Set());
   const settle = (id: string) => setPending((prev) => { const next = new Set(prev); next.delete(id); return next; });
   const progress = useModelDownloads((id) => { settle(id); reload(); });
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
+  const [langQuery, setLangQuery] = useState("");
   const [lang, setLang] = useState(settings.language === "auto" ? "all" : settings.language);
   const [sort, setSort] = useState<ModelSort>("recommended");
   const [downloadedOnly, setDownloadedOnly] = useState(false);
   const failed = models.filter((m) => !pending.has(m.id)).map((m) => progress[m.id]).find((p) => p?.error);
   const chain = settings.sttChain;
 
-  const languages = [...new Set(models.flatMap((m) => m.langs))]
-    .map((code) => [code, languageName(code)] as const)
-    .sort((a, b) => a[1].localeCompare(b[1]));
+  const counts = new Map<string, number>();
+  models.forEach((m) => m.langs.forEach((l) => counts.set(l, (counts.get(l) ?? 0) + 1)));
+  const own = [settings.language, ...navigator.languages.map((l) => l.split("-")[0].toLowerCase())].filter((c) => counts.has(c));
+  const preferred = [...own, ...COMMON_LANGUAGES].filter((c, i, all) => counts.has(c) && all.indexOf(c) === i);
+  const languages = [...counts.keys()]
+    .map((code) => ({ code, name: languageName(code), native: nativeName(code), rank: preferred.indexOf(code) }))
+    .sort((a, b) => (a.rank < 0 ? 1e3 : a.rank) - (b.rank < 0 ? 1e3 : b.rank) || a.name.localeCompare(b.name));
+  const lq = langQuery.trim().toLowerCase();
+  const langOptions = [
+    { code: "all", name: "All languages", native: "", count: models.length },
+    ...languages.filter((l) => !lq || `${l.name} ${l.native} ${l.code}`.toLowerCase().includes(lq)).map((l) => ({ ...l, count: counts.get(l.code) ?? 0 })),
+  ];
+  const langList = useRef<HTMLDivElement>(null);
+  const focusable = langOptions.some((o) => o.code === lang) ? lang : "all";
+  /** One tab stop for the whole list; arrows, Home and End move the selection. */
+  function onLangKey(e: KeyboardEvent<HTMLDivElement>) {
+    const i = langOptions.findIndex((o) => o.code === focusable);
+    const to = ({ ArrowDown: i + 1, ArrowUp: i - 1, Home: 0, End: langOptions.length - 1 } as Record<string, number>)[e.key];
+    if (to === undefined) return;
+    e.preventDefault();
+    const next = Math.max(0, Math.min(langOptions.length - 1, to));
+    setLang(langOptions[next].code);
+    (langList.current?.children[next] as HTMLElement | undefined)?.focus();
+  }
+
   const busy = (m: LocalModel) => {
     const p = progress[m.id];
     return pending.has(m.id) || (p ? !p.error && !p.done : m.downloading);
   };
-  const rank = (m: LocalModel) => chainRole(chain, m.id) ? 0 : m.installed ? 1 : busy(m) ? 2 : m.recommended ? 3 : 4;
+  /** Across all languages, only picks for the user's own languages earn the badge. */
+  const recommended = (m: LocalModel) => (lang === "all" ? m.recommended.some((l) => own.includes(l)) : m.recommended.includes(lang));
+  const rank = (m: LocalModel) => chainRole(chain, m.id) ? 0 : m.installed ? 1 : busy(m) ? 2 : recommended(m) ? 3 : 4;
   const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
   const shown = models
     .map((m, order) => ({ m, order, text: [m.name, m.description, m.languages, ...m.langs.map(languageName)].join(" ").toLowerCase() }))
@@ -632,6 +666,7 @@ function LocalModels({ models, reload, settings, set }: SettingsProps & { models
           : rank(a.m) - rank(b.m) || a.order - b.order)
     .map(({ m }) => m);
   const filtered = !!words.length || lang !== "all" || downloadedOnly;
+  const clearFilters = () => { setQuery(""); setLang("all"); setLangQuery(""); setDownloadedOnly(false); };
 
   function download(id: string) {
     setError(null);
@@ -651,64 +686,81 @@ function LocalModels({ models, reload, settings, set }: SettingsProps & { models
   }
 
   return (
-    <>
-      <div className="model-tools">
-        <Search value={query} onChange={setQuery} placeholder="Search models or languages" />
-        <select value={lang} onChange={(e) => setLang(e.target.value)} aria-label="Language">
-          <option value="all">All languages</option>
-          {languages.map(([code, name]) => <option key={code} value={code}>{name}</option>)}
-        </select>
-        <select value={sort} onChange={(e) => setSort(e.target.value as ModelSort)} aria-label="Sort by">
-          {MODEL_SORTS.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
-        </select>
-        <label className="toggle-label">
-          <Toggle checked={downloadedOnly} onChange={setDownloadedOnly} label="Downloaded only" />Downloaded only
-        </label>
-        <span className="meta model-count">{shown.length === models.length ? `${models.length} models` : `${shown.length} of ${models.length}`}</span>
+    <div className="model-browser-wrap">
+    <div className="model-browser">
+      <div className="lang-pane">
+        <Search value={langQuery} onChange={setLangQuery} placeholder="Search languages" />
+        <div className="lang-list" role="listbox" aria-label="Languages" ref={langList} onKeyDown={onLangKey}>
+          {langOptions.map((o) => (
+            <div key={o.code} role="option" aria-selected={lang === o.code} tabIndex={o.code === focusable ? 0 : -1}
+              className={"lang-item" + (lang === o.code ? " active" : "")} onClick={() => setLang(o.code)}>
+              <span className="lang-name">{o.name}{o.native && <span className="lang-native"> {o.native}</span>}</span>
+              <span className="lang-count">{o.count}</span>
+            </div>
+          ))}
+        </div>
+        {langOptions.length === 1 && lq && <div className="meta lang-empty">No languages match.</div>}
       </div>
-      {shown.map((m) => {
-        const p = progress[m.id];
-        const role = chainRole(chain, m.id);
-        const downloading = busy(m);
-        const pct = p?.total && !p.done ? Math.min(100, Math.floor((p.downloaded / p.total) * 100)) : null;
-        return (
-          <div key={m.id} className="row model-row">
-            <div className="row-text">
-              <div className="row-title">{m.name}{m.recommended && <span className="tag" title="A good default for the languages it covers.">Recommended</span>}</div>
-              <div className="row-desc">{m.description}</div>
-              <div className="row-desc model-facts">{m.languages} · {m.sizeMb >= 1000 ? `${(m.sizeMb / 1000).toFixed(1)} GB` : `${m.sizeMb} MB`}</div>
-              {downloading && <Progress value={pct === null ? 0 : pct / 100} />}
-            </div>
-            <div className="row-control">
-              {downloading && pct === 100 ? (
-                <span className="meta">Installing…</span>
-              ) : downloading ? (
-                <>
-                  <span className="meta model-pct">{pct === null ? "Starting…" : `${pct}%`}</span>
-                  <button className="icon-btn" title="Cancel download" aria-label={`Cancel ${m.name} download`}
-                    onClick={() => api.cancelLocalDownload(m.id).catch((e) => setError(errMsg(e)))}><Icon name="x" /></button>
-                </>
-              ) : !m.installed ? (
-                <button className="btn" onClick={() => download(m.id)}>Download</button>
-              ) : (
-                <>
-                  {role
-                    ? <span className="tag ok" title={role === "Primary" ? "Dictation uses this model." : "Used when the providers above it fail."}>{role === "Primary" ? "In use" : "Fallback"}</span>
-                    : <button className="btn" onClick={() => use(m.id)}>Use model</button>}
-                  <button className="icon-btn" title="Delete model" aria-label={`Delete ${m.name}`}
-                    onClick={() => api.deleteLocalModel(m.id).then(reload, (e) => setError(errMsg(e)))}><Icon name="trash" /></button>
-                </>
-              )}
-            </div>
-          </div>
-        );
-      })}
-      {models.length === 0 && <div className="list-empty">No local models available.</div>}
-      {models.length > 0 && shown.length === 0 && (
-        <div className="list-empty">No models match.{filtered && <> <button className="link" onClick={() => { setQuery(""); setLang("all"); setDownloadedOnly(false); }}>Clear filters</button></>}</div>
-      )}
-      {(error || failed) && <div className="error">{error ?? `Download failed: ${failed!.error}`}</div>}
-    </>
+      <div className="models-pane">
+        <div className="model-tools">
+          <Search value={query} onChange={setQuery} placeholder="Search models" />
+          <select value={sort} onChange={(e) => setSort(e.target.value as ModelSort)} aria-label="Sort by">
+            {MODEL_SORTS.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
+          </select>
+          <label className="toggle-label">
+            <Toggle checked={downloadedOnly} onChange={setDownloadedOnly} label="Downloaded only" />Downloaded only
+          </label>
+          <span className="meta model-count">
+            {lang === "all" ? "All languages" : languageName(lang)} · {shown.length === models.length ? `${models.length} models` : `${shown.length} of ${models.length}`}
+          </span>
+        </div>
+        <div className="model-list" role="region" aria-label="Local models" tabIndex={0}>
+          {shown.map((m) => {
+            const p = progress[m.id];
+            const role = chainRole(chain, m.id);
+            const downloading = busy(m);
+            const pct = p?.total && !p.done ? Math.min(100, Math.floor((p.downloaded / p.total) * 100)) : null;
+            return (
+              <div key={m.id} className="row model-row">
+                <div className="row-text">
+                  <div className="row-title">{m.name}{recommended(m) && <span className="tag" title="A good default for the languages it covers.">Recommended</span>}</div>
+                  <div className="row-desc">{m.description}</div>
+                  <div className="row-desc model-facts">{m.languages} · {m.sizeMb >= 1000 ? `${(m.sizeMb / 1000).toFixed(1)} GB` : `${m.sizeMb} MB`}</div>
+                  {downloading && <Progress value={pct === null ? 0 : pct / 100} />}
+                </div>
+                <div className="row-control">
+                  {downloading && pct === 100 ? (
+                    <span className="meta">Installing…</span>
+                  ) : downloading ? (
+                    <>
+                      <span className="meta model-pct">{pct === null ? "Starting…" : `${pct}%`}</span>
+                      <button className="icon-btn" title="Cancel download" aria-label={`Cancel ${m.name} download`}
+                        onClick={() => api.cancelLocalDownload(m.id).catch((e) => setError(errMsg(e)))}><Icon name="x" /></button>
+                    </>
+                  ) : !m.installed ? (
+                    <button className="btn" onClick={() => download(m.id)}>Download</button>
+                  ) : (
+                    <>
+                      {role
+                        ? <span className="tag ok" title={role === "Primary" ? "Dictation uses this model." : "Used when the providers above it fail."}>{role === "Primary" ? "In use" : "Fallback"}</span>
+                        : <button className="btn" onClick={() => use(m.id)}>Use model</button>}
+                      <button className="icon-btn" title="Delete model" aria-label={`Delete ${m.name}`}
+                        onClick={() => api.deleteLocalModel(m.id).then(reload, (e) => setError(errMsg(e)))}><Icon name="trash" /></button>
+                    </>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+          {models.length === 0 && <div className="list-empty">No local models available.</div>}
+          {models.length > 0 && shown.length === 0 && (
+            <div className="list-empty">No models match.{filtered && <> <button className="link" onClick={clearFilters}>Clear filters</button></>}</div>
+          )}
+        </div>
+        {(error || failed) && <div className="error">{error ?? `Download failed: ${failed!.error}`}</div>}
+      </div>
+    </div>
+    </div>
   );
 }
 
