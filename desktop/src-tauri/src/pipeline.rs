@@ -603,15 +603,17 @@ impl App {
             let decode = |a: &[i16]| crate::stt::local::transcribe_blocking(&p.models_dir, &p.entry.model, language.as_deref(), a);
             let (mut committed, mut texts) = (0usize, Vec::<String>::new());
             let mut last_preview = Instant::now();
-            // Whisper: one pass on release unless the recording outgrows its 30 s window.
-            let fixed = crate::stt::local::fixed_window(&p.entry.model);
+            // Whisper: one pass on release unless the recording outgrows its window, except for
+            // scripts that need short segments to fit its token budget.
+            let longest = RATE * crate::stt::local::max_segment_secs(&p.entry.model, language.as_deref());
+            let fixed = crate::stt::local::fixed_window(&p.entry.model) && longest >= RATE * 30;
             let shortest = if fixed { RATE * 20 } else { 0 };
             while !done.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(300));
                 // Empty once the recording is stopped and its buffer taken.
                 let pending = buffer.lock().unwrap_or_else(|e| e.into_inner()).get(committed..).map(<[i16]>::to_vec).unwrap_or_default();
-                // A fixed-window model only hears its first 30 s, so a segment must end within them.
-                let (window, max) = if fixed { (&pending[..pending.len().min(RATE * 30)], RATE * 29) } else { (&pending[..], RATE * 30) };
+                // A segment must end within what the model takes in one pass.
+                let (window, max) = (&pending[..pending.len().min(longest)], longest - RATE);
                 let cut = if pending.len() >= shortest { audio::split_point(window, RATE * 6 / 10, max) } else { None };
                 let shown = if let Some(cut) = cut {
                     if !audio::is_silent(&pending[..cut]) {
@@ -1277,17 +1279,8 @@ async fn finish_local_segments(seg: std::thread::JoinHandle<Option<Segments>>, p
     let text = tokio::task::spawn_blocking(move || {
         let (committed, mut texts) = seg.join().ok()??;
         let decode = |a: &[i16]| crate::stt::local::transcribe_blocking(&p.models_dir, &p.entry.model, language.as_deref(), a);
-        let mut rest = audio.get(committed..).unwrap_or_default();
-        // A fixed-window model only hears 30 s: the part left on release can be longer if decoding
-        // fell behind, so split it the same way as during recording.
-        const RATE: usize = audio::SAMPLE_RATE as usize;
-        while crate::stt::local::fixed_window(&p.entry.model) && rest.len() > RATE * 30 {
-            let cut = audio::split_point(&rest[..RATE * 30], RATE * 6 / 10, RATE * 29).unwrap_or(RATE * 30);
-            if !audio::is_silent(&rest[..cut]) {
-                texts.push(decode(&rest[..cut]).ok()?);
-            }
-            rest = &rest[cut..];
-        }
+        // transcribe_blocking cuts what's left into pieces the model can take.
+        let rest = audio.get(committed..).unwrap_or_default();
         if !audio::is_silent(rest) {
             texts.push(decode(rest).ok()?);
         }

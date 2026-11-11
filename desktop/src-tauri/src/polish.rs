@@ -74,7 +74,7 @@ pub async fn download(models_dir: &Path, progress: impl Fn(u64, u64)) -> Result<
     let dest = path(models_dir);
     std::fs::create_dir_all(dest.parent().unwrap()).context("creating the models folder")?;
     let tmp = dest.with_extension("gguf.part");
-    crate::stt::local::fetch("huggingface", URL, &tmp, SIZE_MB, progress).await?;
+    crate::stt::local::fetch("huggingface", URL, &tmp, SIZE_MB, || false, progress).await?;
     let file = tmp.clone();
     let checked = tokio::task::spawn_blocking(move || verify(&file, SHA256)).await.map_err(|e| anyhow!("{e}")).and_then(|r| r);
     if let Err(e) = checked {

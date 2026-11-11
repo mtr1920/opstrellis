@@ -101,12 +101,50 @@ let notes: Note[] = [
   { id: 3, title: "Meeting · Oct 14, 10:00", body: "## Summary\nWeekly sync on the launch.\n\n## Action items\n- [ ] Sam: send the pricing draft\n\n## Transcript (12 min)\nOk let's start…", updatedAt: iso(D), kind: "meeting" },
 ];
 const polishModel: PolishModel = { name: "S1-mini by Superwhisper", sizeMb: 484, installed: false, downloading: false };
+const CANARY = ["en", "de", "es", "fr"];
+const COHERE = ["en", "fr", "de", "it", "es", "pt", "el", "nl", "pl", "zh", "ja", "ko", "vi", "ar"];
+const EUROPEAN = ["bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de", "el", "hu", "it", "lv", "lt", "mt", "pl", "pt", "ro", "sk", "sl", "es", "sv", "ru", "uk"];
+const EUROPEAN_NOT_EN_RU = ["bg", "hr", "cs", "da", "nl", "et", "fi", "fr", "de", "el", "hu", "it", "lv", "lt", "mt", "pl", "pt", "ro", "sk", "sl", "es", "sv", "uk"];
+const WHISPER = ["en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca", "nl", "ar", "sv", "it", "id", "hi", "fi", "vi", "he", "uk", "el", "ms", "cs", "ro", "da", "hu", "ta", "no", "th", "ur", "hr", "bg", "lt", "la", "mi", "ml", "cy", "sk", "te", "fa", "lv", "bn", "sr", "az", "sl", "kn", "et", "mk", "br", "eu", "is", "hy", "ne", "mn", "bs", "kk", "sq", "sw", "gl", "mr", "pa", "si", "km", "sn", "yo", "so", "af", "oc", "ka", "be", "tg", "sd", "gu", "am", "yi", "lo", "uz", "fo", "ht", "ps", "tk", "nn", "mt", "sa", "lb", "my", "bo", "tl", "mg", "as", "tt", "haw", "ln", "ha", "ba", "jv", "su"];
+const TURBO_PICKS = ["ko", "ar", "tr", "id", "he", "fa", "th", "ms", "tl", "ca"];
+const QWEN3 = ["zh", "en", "yue", "ar", "de", "fr", "es", "pt", "id", "it", "ko", "ru", "th", "vi", "ja", "tr", "hi", "ms", "nl", "sv", "da", "fi", "pl", "cs", "tl", "fa", "el", "hu", "mk", "ro"];
+const OMNILINGUAL = ["en", "zh", "yue", "ja", "ko", "vi", "th", "id", "ms", "tl", "ar", "fa", "ur", "hi", "bn", "ta", "te", "mr", "gu", "kn", "ml", "pa", "or", "as", "ne", "sd", "ks", "ps", "tr", "az", "uz", "kk", "ky", "tg", "tk", "mn", "ug", "ru", "uk", "be", "bg", "sr", "hr", "sl", "sk", "cs", "pl", "de", "fr", "es", "pt", "it", "nl", "sv", "da", "no", "fi", "et", "lv", "lt", "hu", "ro", "el", "mt", "is", "ga", "cy", "eu", "ca", "gl", "he", "am", "ha", "yo", "ig", "zu", "xh", "so", "sw", "my", "km", "lo", "si", "jv", "su", "ceb", "tt", "ba", "ka", "hy", "mai", "bho", "brx", "kok", "doi", "mni"];
+const INDIAN_NOT_HI = ["bn", "ta", "te", "kn", "ml", "mr", "gu", "pa", "ur", "or", "as", "ne"];
+const DOLPHIN = ["zh", "ja", "th", "ru", "ko", "id", "vi", "yue", "hi", "ur", "ms", "uz", "ar", "fa", "bn", "ta", "te", "ug", "gu", "my", "tl", "kk", "or", "ne", "mn", "km", "jv", "lo", "si", "ps", "pa", "kab", "ba", "ks", "tg", "su", "mr", "ky", "az"];
+const EAST_ASIAN = ["zh", "en", "ja", "ko", "yue"];
+const m = (id: string, name: string, languages: string, sizeMb: number, langs: string[], recommended: string[], description: string, installed = false): LocalModel =>
+  ({ id, name, languages, sizeMb, langs, recommended, description, installed, downloading: false });
+// Mirrors MODELS in src-tauri/src/stt/local.rs.
 const models: LocalModel[] = [
-  { id: "moonshine-tiny-en", name: "Moonshine Tiny", languages: "English", sizeMb: 103, installed: true, downloading: false, description: "Fast and small. Great default for English." },
-  { id: "moonshine-base-en", name: "Moonshine Base", languages: "English", sizeMb: 250, installed: false, downloading: false, description: "More accurate English model." },
-  { id: "whisper-small", name: "Whisper Small", languages: "99 languages", sizeMb: 610, installed: false, downloading: false, description: "Multilingual, slower on CPU." },
-  { id: "sensevoice-small", name: "SenseVoice Small", languages: "zh, en, ja, ko, yue", sizeMb: 240, installed: false, downloading: false, description: "Fast multilingual model." },
+  m("moonshine-tiny-en", "Moonshine Tiny", "English", 103, ["en"], [], "Fastest. Good for short English dictation on any CPU.", true),
+  m("moonshine-base-en", "Moonshine Base", "English", 251, ["en"], [], "More accurate English, still faster than real time on laptops."),
+  m("parakeet-110m-en", "Parakeet TDT 110M", "English", 108, ["en"], [], "Small, very fast English with punctuation and capitalization."),
+  m("parakeet-v2-en", "Parakeet TDT 0.6B v2", "English", 482, ["en"], [], "Very accurate English with punctuation and capitalization."),
+  m("parakeet-unified-en", "Parakeet Unified 0.6B", "English", 501, ["en"], ["en"], "Newest NVIDIA English model (2026): best English accuracy, with punctuation and capitalization."),
+  m("distil-whisper-v3.5", "Distil-Whisper Large v3.5", "English", 528, ["en"], [], "Whisper Large accuracy on English at a fraction of the cost; robust to accents and noise."),
+  m("canary-180m", "Canary 180M Flash", "English, German, Spanish, French", 153, CANARY, [], "Small NVIDIA model with punctuation. Set your spoken language; it uses English otherwise."),
+  m("cohere-transcribe", "Cohere Transcribe 2B", "14 languages", 1699, COHERE, [], "Top of the 2026 Open ASR leaderboard. Large and slow on CPU; set your spoken language (English otherwise)."),
+  m("parakeet-v3", "Parakeet TDT 0.6B v3", "25 European languages", 487, EUROPEAN, [], "Multilingual European model with automatic language detection."),
+  m("parakeet-ultra", "Parakeet Ultra 0.6B", "25 European languages", 487, EUROPEAN, EUROPEAN_NOT_EN_RU, "Moondream's retrained Parakeet v3 (2026): more accurate than v3 in every language tested."),
+  m("fastconformer-de", "FastConformer German", "German", 108, ["de"], [], "Small dedicated German model with punctuation."),
+  m("fastconformer-es", "FastConformer Spanish", "Spanish", 107, ["es"], [], "Small dedicated Spanish model."),
+  m("gigaam-v3-ru", "GigaAM v3", "Russian", 170, ["ru"], ["ru"], "Sber's Russian model with punctuation; preferred over Whisper Large v3 in blind tests."),
+  m("whisper-tiny", "Whisper Tiny", "99 languages", 116, WHISPER, [], "Smallest multilingual Whisper: a quick way to try any language."),
+  m("whisper-base", "Whisper Base", "99 languages", 208, WHISPER, [], "Multilingual Whisper, small and quick."),
+  m("whisper-small", "Whisper Small", "99 languages", 639, WHISPER, [], "Multilingual Whisper with better accuracy."),
+  m("whisper-turbo", "Whisper Large v3 Turbo", "99 languages", 564, WHISPER, TURBO_PICKS, "Best speed-to-accuracy of the Whisper models; needs a fast CPU."),
+  m("whisper-large-v3", "Whisper Large v3", "99 languages", 1068, WHISPER, [], "The most accurate Whisper, and the slowest: best on a fast desktop CPU."),
+  m("qwen3-asr", "Qwen3-ASR 0.6B", "30 languages", 878, QWEN3, ["hi", "zh"], "Alibaba's 2026 model: detects the language and adds punctuation. Slower on CPU."),
+  m("omnilingual-300m", "Omnilingual ASR 300M", "1,600+ languages", 292, OMNILINGUAL, [], "Meta's model for over 1,600 languages, including Indian and African languages most models miss."),
+  m("omnilingual-1b", "Omnilingual ASR 1B", "1,600+ languages", 787, OMNILINGUAL, INDIAN_NOT_HI, "The larger, more accurate Omnilingual: about 1% character errors on Tamil, Telugu and Kannada in our tests."),
+  m("tara", "Tara by Trelis", "Hindi, English", 1043, ["hi", "en"], ["hi"], "Trelis Research's 2026 Hindi model built on Whisper Large v3: state of the art on Hindi benchmarks and strong on English. Hinglish comes out in Devanagari. Slow on CPU."),
+  m("dolphin-small", "Dolphin Small", "40 Asian languages", 191, DOLPHIN, [], "Built for Asian languages: Hindi, Bengali, Tamil, Telugu, Marathi, Urdu, Thai and more. No English."),
+  m("dolphin-base", "Dolphin Base", "40 Asian languages", 80, DOLPHIN, [], "Smaller, faster Dolphin."),
+  m("sense-voice", "SenseVoice Small", "Chinese, English, Japanese, Korean, Cantonese", 163, EAST_ASIAN, ["yue"], "Very fast multilingual model for East Asian languages."),
+  m("parakeet-ja", "Parakeet TDT-CTC 0.6B Japanese", "Japanese", 489, ["ja"], ["ja"], "NVIDIA's dedicated Japanese model with punctuation."),
+  m("zipformer-vi", "Zipformer Vietnamese", "Vietnamese", 60, ["vi"], ["vi"], "Small dedicated Vietnamese model trained on 70,000 hours."),
 ];
+const downloads = new Map<string, { timer: ReturnType<typeof setInterval>; finish: () => void }>();
 
 function upsert<T extends { id: number }>(list: T[], item: Partial<T>, fill: Partial<T>): [T[], T] {
   const existing = list.find((x) => x.id === item.id);
@@ -314,16 +352,28 @@ const handlers: Record<string, (a: any) => unknown> = {
   upsert_note: ({ note }) => { let e; [notes, e] = upsert(notes, note, { updatedAt: iso(0), kind: "note" }); e.updatedAt = iso(0); return e; },
   delete_note: ({ id }) => void (notes = notes.filter((x) => x.id !== id)),
   list_local_models: () => structuredClone(models),
-  download_local_model: ({ id }) => {
+  download_local_model: ({ id }) => new Promise<void>((finish) => {
     const m = models.find((x) => x.id === id)!;
     const total = m.sizeMb * 1e6;
     let downloaded = 0;
-    const t = setInterval(() => {
-      downloaded = Math.min(total, downloaded + total / 12);
-      const done = downloaded >= total;
-      if (done) { clearInterval(t); m.installed = true; }
-      emit("model-download", { id, downloaded, total, done, error: null });
+    m.downloading = true;
+    const timer = setInterval(() => {
+      downloaded = Math.min(total, downloaded + total / 40);
+      if (downloaded < total) return emit("model-download", { id, downloaded, total, done: false, error: null });
+      clearInterval(timer); downloads.delete(id); m.installed = true; m.downloading = false;
+      emit("model-download", { id, downloaded: 0, total: 0, done: true, error: null, cancelled: false });
+      finish();
     }, 250);
+    downloads.set(id, { timer, finish });
+  }),
+  cancel_local_download: ({ id }) => {
+    const d = downloads.get(id);
+    if (!d) return;
+    clearInterval(d.timer);
+    downloads.delete(id);
+    models.find((x) => x.id === id)!.downloading = false;
+    emit("model-download", { id, downloaded: 0, total: 0, done: true, error: null, cancelled: true });
+    d.finish();
   },
   polish_model_status: () => ({ ...polishModel }),
   download_polish_model: () => {

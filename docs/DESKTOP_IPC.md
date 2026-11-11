@@ -82,7 +82,7 @@ type TeamUnused = "shadowed" | "limit" | "complex";   // why a team entry is not
 interface TeamStatus { team: { id: string; name: string } | null; dictionary: number; snippets: number; actions: number; skipped: number; syncedAt: string | null /* RFC3339, last successful sync */; error: string | null /* last failed sync, cleared by the next success */ }   // counts are the team entries stored here; skipped = invalid ones plus those past a limit
 interface Note { id: number; title: string; body: string; updatedAt: string; kind: "note" | "meeting" }
 interface AppUse { appName: string; category: string; count: number }
-interface LocalModel { id: string; name: string; languages: string; sizeMb: number; installed: boolean; description: string }
+interface LocalModel { id: string; name: string; languages: string; sizeMb: number; installed: boolean; downloading: boolean; description: string; langs: string[]; recommended: string[] }
 interface CloudStatus { signedIn: boolean; email: string | null; plan: string | null; usage: any | null }
 interface AddSkip { add: number; skip: number }   // entries added / already there (an existing entry always wins)
 interface Workspace { path: string; name: string /* folder name */; files: number; identifiers: number /* declared names kept, ≤ 3000 */; indexedAt: string | null /* RFC3339, when the last run ended (also a failed one) */; indexing: boolean; error: string | null /* folder missing, or "Too many names…" when spoken names couldn't be built (hints and mentions still work) */ }
@@ -154,6 +154,7 @@ auto-repeat never reaches the app below; after Enter the paste waits for that.
 | `list_notes` / `upsert_note` / `delete_note` | `{ kind?: "note" \| "meeting" }` / `{ note: {id?, title, body} }` / `{ id }` | same pattern |
 | `list_local_models` | – | `LocalModel[]` |
 | `download_local_model` / `delete_local_model` | `{ id, allowUnverified?: boolean }` / `{ id }` | – (progress via events). A pinned archive that no longer matches its checksum is refused (event `changed: true`) unless `allowUnverified` |
+| `cancel_local_download` | `{ id }` | – (the download ends with `done: true, error: null, cancelled: true`) |
 | `test_stt` | `{ entryId }` | `{ text: string, latencyMs: number }` (transcribes a bundled sample) |
 | `test_llm` | – | `{ text: string, latencyMs: number }` (cleans up a sample sentence with the saved AI settings) |
 | `meeting_start` / `meeting_stop` / `meeting_status` | `{ secondDevice?, template? }` / – / – | – / – / `MeetingStatus` (a meeting stops by itself, and is saved, after 15 minutes in which no input produced transcribed text, or at 4 hours; the pill says why) |
@@ -203,7 +204,7 @@ auto-repeat never reaches the app below; after Enter the paste waits for that.
 | `update-available` | `UpdateInfo` (only while `checkUpdates` is on. The backend looks every 30 s and checks when the last successful check, `updateCheckedAt`, is over 24 h old or missing, so a restart does not trigger one; a failed try is repeated after an hour; the setting is read every time; failures are only logged) |
 | `shortcut-captured` | `string` (a single key such as `"Fn"` or `"RightOption"`, pressed on its own while the recorder is open; macOS) |
 | `history-updated` | – |
-| `model-download` | `{ id: string, downloaded: number, total: number, done: boolean, error: string \| null, changed?: boolean }` (`changed`: the archive isn't the one this version pinned; the UI offers "Download anyway") |
+| `model-download` | `{ id: string, downloaded: number, total: number, done: boolean, error: string \| null, cancelled?: boolean, changed?: boolean }` (`changed`: the archive isn't the one this version pinned; the UI offers "Download anyway") |
 | `cloud-status` | `CloudStatus` |
 | `team-updated` | – (a sync changed the team library, or it was deleted, or the setting was turned on; reload the library pages and `team_status`) |
 

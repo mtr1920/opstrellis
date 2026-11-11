@@ -200,8 +200,9 @@ export function Empty({ children, action }: { children: ReactNode; action?: Reac
   );
 }
 
-/** Tracks `model-download` progress events, keyed by model id. */
-export function useModelDownloads(onDone?: (id: string) => void) {
+/** Tracks `model-download` progress events, keyed by model id. `onDone` runs when a download
+ * installs or is cancelled. */
+export function useModelDownloads(onDone?: (id: string, cancelled: boolean) => void) {
   const [progress, setProgress] = useState<Record<string, ModelDownload>>({});
   useEvent("model-download", (p) => {
     setProgress((prev) => {
@@ -209,7 +210,7 @@ export function useModelDownloads(onDone?: (id: string) => void) {
       if (p.done && !p.error) delete next[p.id];
       return next;
     });
-    if (p.done && !p.error) onDone?.(p.id);
+    if (p.done && !p.error) onDone?.(p.id, !!p.cancelled);
   });
   return progress;
 }

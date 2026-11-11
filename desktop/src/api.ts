@@ -101,7 +101,11 @@ export interface TeamStatus {
   syncedAt: string | null; error: string | null;
 }
 export interface Note { id: number; title: string; body: string; updatedAt: string; kind: "note" | "meeting" }
-export interface LocalModel { id: string; name: string; languages: string; sizeMb: number; installed: boolean; downloading: boolean; description: string }
+export interface LocalModel {
+  id: string; name: string; languages: string; sizeMb: number; installed: boolean; downloading: boolean; description: string;
+  /** Languages this model is a top pick for. */
+  langs: string[]; recommended: string[];
+}
 export interface CloudStatus { signedIn: boolean; email: string | null; plan: string | null; usage: any | null }
 export interface DictationState {
   /** "review": a command's rewrite waits in the pill for Enter (insert) or Esc (discard). */
@@ -147,7 +151,7 @@ export interface WaylandShortcuts {
 }
 export interface InsertionStatus { ready: "wtype" | "ydotool" | null; problem: string | null; fix: string | null }
 export interface PolishModel { name: string; sizeMb: number; installed: boolean; downloading: boolean }
-export interface ModelDownload { id: string; downloaded: number; total: number; done: boolean; error: string | null; changed?: boolean }   // changed: the file isn't the one this version pinned
+export interface ModelDownload { id: string; downloaded: number; total: number; done: boolean; error: string | null; cancelled?: boolean; changed?: boolean }   // changed: the file isn't the one this version pinned
 
 export type Theme = "system" | "light" | "dark";
 
@@ -255,6 +259,7 @@ export const api = {
 
   listLocalModels: () => call<LocalModel[]>("list_local_models"),
   downloadLocalModel: (id: string, allowUnverified = false) => call<void>("download_local_model", { id, allowUnverified }),
+  cancelLocalDownload: (id: string) => call<void>("cancel_local_download", { id }),
   deleteLocalModel: (id: string) => call<void>("delete_local_model", { id }),
   polishModelStatus: () => call<PolishModel>("polish_model_status"),
   downloadPolishModel: () => call<void>("download_polish_model"),

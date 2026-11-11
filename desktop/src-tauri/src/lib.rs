@@ -501,14 +501,23 @@ async fn download_local_model(app: State<'_>, id: String, allow_unverified: Opti
         let _ = h.emit("model-download", json!({ "id": id2, "downloaded": downloaded, "total": total, "done": false, "error": null }));
     })
     .await;
-    let error = r.as_ref().err().map(|e| format!("{e:#}"));
+    let cancelled = r.as_ref().is_err_and(|e| e.is::<stt::local::Cancelled>());
+    let error = r.as_ref().err().filter(|_| !cancelled).map(|e| format!("{e:#}"));
     // The UI offers "Download anyway" for this one.
     let changed = r.as_ref().err().is_some_and(|e| e.downcast_ref::<stt::local::Changed>().is_some());
-    let _ = app.handle.emit("model-download", json!({ "id": id, "downloaded": 0, "total": 0, "done": true, "error": error, "changed": changed }));
+    let _ = app.handle.emit("model-download", json!({ "id": id, "downloaded": 0, "total": 0, "done": true, "error": error, "cancelled": cancelled, "changed": changed }));
+    if cancelled {
+        return Ok(());
+    }
     if r.is_ok() {
         warm_up(&app);
     }
     r.map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn cancel_local_download(id: String) {
+    stt::local::cancel_download(&id);
 }
 
 #[tauri::command]
@@ -975,7 +984,8 @@ fn warm_up(app: &Arc<App>) {
     let s = app.settings();
     if let Some(e) = s.stt_chain.iter().find(|e| e.enabled).filter(|e| e.provider == settings::ProviderKind::Local) {
         let (dir, id) = (app.models_dir.clone(), e.model.clone());
-        std::thread::spawn(move || stt::local::warm_up(&dir, &id));
+        let language = Some(s.language.clone()).filter(|l| !l.is_empty() && l != "auto");
+        std::thread::spawn(move || stt::local::warm_up(&dir, &id, language.as_deref()));
     }
 }
 
@@ -1247,7 +1257,7 @@ pub fn run() {
             retranscribe_history,
             list_dictionary, upsert_dictionary, delete_dictionary, list_snippets, upsert_snippet, delete_snippet,
             list_transforms, upsert_transform, delete_transform, list_notes, upsert_note, delete_note,
-            list_local_models, download_local_model, delete_local_model, polish_model_status, download_polish_model, delete_polish_model, test_stt, test_llm,
+            list_local_models, download_local_model, cancel_local_download, delete_local_model, polish_model_status, download_polish_model, delete_polish_model, test_stt, test_llm,
             start_dictation, stop_dictation, cancel_dictation, paste_last,
             cloud_login, cloud_logout, cloud_status, team_status, team_sync_now, permissions, request_accessibility, request_input_monitoring, open_logs,
             rebind_wayland_shortcuts, add_gnome_shortcuts,

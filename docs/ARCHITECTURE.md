@@ -89,7 +89,7 @@ Users configure an ordered fallback chain of provider entries:
 | Google Cloud Speech | v1 `speech:recognize` (API key) | — |
 | Azure Speech | short-audio REST | — |
 | ElevenLabs Scribe | `/v1/speech-to-text` | — |
-| Local (sherpa-onnx) | Moonshine / Whisper / SenseVoice / Parakeet, downloaded from GitHub releases | partials by re-decoding the growing buffer |
+| Local (official `sherpa-onnx` crate) | 27 curated models (Parakeet, Whisper, Moonshine, Qwen3-ASR, Cohere Transcribe, Canary, Omnilingual, Dolphin, SenseVoice, GigaAM, Zipformer, Tara…), commercial-use licences only, downloaded from sherpa-onnx's GitHub releases (Tara, our int8 ONNX export of Trelis/tara, from huggingface.co/mtr1920/sherpa-onnx-whisper-tara-int8 at a pinned revision); catalog in `stt/local.rs` | partials by re-decoding the growing buffer |
 
 Fallback rules:
 - If the stream fails at any point, the full recorded buffer is sent to the next provider in batch
