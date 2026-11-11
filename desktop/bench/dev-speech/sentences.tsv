@@ -1,0 +1,61 @@
+spoken	expected	terms
+run cube control get pods dash n staging	run kubectl get pods -n staging	kubectl|-n
+start the stack with docker compose up dash d	start the stack with docker compose up -d	docker compose|-d
+run git push dash dash force with lease before the release	run git push --force-with-lease before the release	git push|--force-with-lease
+install it with N P M install dash dash save dev type script	install it with npm install --save-dev typescript	npm|--save-dev|typescript
+cat package dot json and pipe it into J Q dot name	cat package.json and pipe it into jq .name	package.json|jq|.name
+change mod plus x on deploy dot S H and then run it	chmod +x deploy.sh and then run it	chmod|+x|deploy.sh
+S S H dash i key dot pem ubuntu at example dot com	ssh -i key.pem ubuntu@example.com	ssh|-i|key.pem|ubuntu@example.com
+run cargo test dash dash release dash dash ignored	run cargo test --release --ignored	cargo|--release|--ignored
+sue doo system control restart engine x	sudo systemctl restart nginx	sudo|systemctl|nginx
+tail dash f slash var slash log slash syslog	tail -f /var/log/syslog	tail|-f|/var/log/syslog
+run pie test dash x dash q on the api folder	run pytest -x -q on the api folder	pytest|-x|-q
+run git rebase dash i head tilde three	run git rebase -i HEAD~3	git rebase|-i|HEAD~3
+run N P M run build and then N P M test	run npm run build and then npm test	npm
+check the working tree with git status dash s	check the working tree with git status -s	git status|-s
+please open main dot r s in the editor	please open main.rs in the editor	main.rs
+edit the docker file in the backend folder	edit the Dockerfile in the backend folder	Dockerfile
+add the key to dot env dot local	add the key to .env.local	.env.local
+open S R C slash components slash button dot T S X	open src/components/button.tsx	src/components/button.tsx
+the config lives in slash etc slash nginx slash nginx dot conf	the config lives in /etc/nginx/nginx.conf	/etc/nginx/nginx.conf
+update package dot json and the lock file	update package.json and the lock file	package.json
+cd into tilde slash projects slash api	cd into ~/projects/api	~/projects/api
+rename old dot P Y to utils dot P Y	rename old.py to utils.py	old.py|utils.py
+add pie project dot toml to the commit	add pyproject.toml to the commit	pyproject.toml
+the logs are in slash var slash log slash app dot log	the logs are in /var/log/app.log	/var/log/app.log
+we should migrate this service from java script to type script	we should migrate this service from JavaScript to TypeScript	JavaScript|TypeScript
+the A P I uses fast A P I with pie dantic models	the API uses FastAPI with Pydantic models	API|FastAPI|Pydantic
+store the sessions in redis and the orders in post gress	store the sessions in Redis and the orders in Postgres	Redis|Postgres
+add a prisma schema and run the migration against sequel lite	add a Prisma schema and run the migration against SQLite	Prisma|SQLite
+the frontend is next dot J S with tailwind	the frontend is Next.js with Tailwind	Next.js|Tailwind
+write the handler in kotlin and expose it over G R P C	write the handler in Kotlin and expose it over gRPC	Kotlin|gRPC
+query elastic search from the node dot J S worker	query Elasticsearch from the Node.js worker	Elasticsearch|Node.js
+create an index on the email column in my S Q L	create an index on the email column in MySQL	MySQL
+the django app talks to mongo D B through a repository class	the Django app talks to MongoDB through a repository class	Django|MongoDB
+use numpy and pandas to load the parquet file	use NumPy and pandas to load the Parquet file	NumPy|pandas|Parquet
+deploy the container to E C S behind cloud front	deploy the container to ECS behind CloudFront	ECS|CloudFront
+upload the build to S three and invalidate the C D N cache	upload the build to S3 and invalidate the CDN cache	S3|CDN
+we manage the infrastructure with terraform and ansible	we manage the infrastructure with Terraform and Ansible	Terraform|Ansible
+the G C P bucket needs a service account with read access	the GCP bucket needs a service account with read access	GCP
+open a pull request on git hub and wait for the C I C D pipeline	open a pull request on GitHub and wait for the CI/CD pipeline	GitHub|CI/CD
+set up grafana dashboards fed by prometheus metrics	set up Grafana dashboards fed by Prometheus metrics	Grafana|Prometheus
+rotate the oh auth token before the J W T expires	rotate the OAuth token before the JWT expires	OAuth|JWT
+the helm chart installs into the kubernetes cluster on E K S	the Helm chart installs into the Kubernetes cluster on EKS	Helm|Kubernetes|EKS
+put engine x in front of the app and enable T L S	put nginx in front of the app and enable TLS	nginx|TLS
+the git hub actions workflow caches the docker layers	the GitHub Actions workflow caches the Docker layers	GitHub Actions|Docker
+rename user underscore id to account underscore id	rename user_id to account_id	user_id|account_id
+the function max underscore retries reads from the config	the function max_retries reads from the config	max_retries
+set is underscore enabled to true in the test	set is_enabled to true in the test	is_enabled
+add a find underscore user underscore by underscore email helper to the repository	add a find_user_by_email helper to the repository	find_user_by_email
+read database underscore url from the environment	read database_url from the environment	database_url
+the field created underscore at is missing from the response	the field created_at is missing from the response	created_at
+mark the test parse underscore config as ignored	mark the test parse_config as ignored	parse_config
+call get user by I D inside the request handler	call getUserById inside the request handler	getUserById
+the hook use auth state returns the current session	the hook useAuthState returns the current session	useAuthState
+rename the on click handler to handle submit	rename onClickHandler to handleSubmit	onClickHandler|handleSubmit
+the meeting moved to thursday afternoon so please update the invite	the meeting moved to thursday afternoon so please update the invite	
+I think we should keep the first design and revisit it next week	I think we should keep the first design and revisit it next week	
+thanks for the quick review and I will address the comments tomorrow	thanks for the quick review and I will address the comments tomorrow	
+please summarize the main risks in two short paragraphs	please summarize the main risks in two short paragraphs	
+can you explain why the second approach is slower than the first one	can you explain why the second approach is slower than the first one	
+the release went fine but the customer still sees the old banner	the release went fine but the customer still sees the old banner	
