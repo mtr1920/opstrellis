@@ -156,7 +156,7 @@ jobs:
           (cd dist && sha256sum -- * > SHA256SUMS && sha256sum --check SHA256SUMS)
           extra=()
           case "$GITHUB_REF_NAME" in *-*) extra+=(--prerelease) ;; esac
-          gh release create "$GITHUB_REF_NAME" dist/* --title "OpsTrellis $GITHUB_REF_NAME" --generate-notes --verify-tag "${extra[@]}"
+          gh release create "$GITHUB_REF_NAME" dist/* --title "OpsTrellis $GITHUB_REF_NAME" --generate-notes --verify-tag ${extra[@]+"${extra[@]}"}
 
   install-test:
     # Installs the published release with install.sh on each OS, then reruns it as an update would.
