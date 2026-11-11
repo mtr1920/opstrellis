@@ -2,15 +2,15 @@ import { serveStatic } from '@hono/node-server/serve-static';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { Hono } from 'hono';
-import { bodyLimit } from 'hono/body-limit';
 import { secureHeaders } from 'hono/secure-headers';
 import type { AppEnv } from './auth.js';
 import { config } from './config.js';
-import { ApiError, apiError } from './lib/http.js';
+import { ApiError, apiError, jsonBodyLimit } from './lib/http.js';
 import { admin } from './routes/admin.js';
 import { api } from './routes/api.js';
 import { authRoutes } from './routes/auth.js';
 import { gateway } from './routes/gateway.js';
+import { team } from './routes/team.js';
 
 export function createApp() {
   const app = new Hono<AppEnv>();
@@ -18,13 +18,14 @@ export function createApp() {
 
   app.get('/healthz', (c) => c.json({ ok: true }));
   // JSON bodies under /api are small; usage uploads and Stripe webhooks set their own 1 MB limit.
-  const smallBody = bodyLimit({ maxSize: 64 * 1024, onError: (c) => apiError(c, 413, 'payload_too_large', 'Request body is too large') });
+  const smallBody = jsonBodyLimit(64 * 1024);
   const ownLimit = new Set(['/api/usage', '/api/stripe/webhook']);
   app.use('/api/*', (c, next) => (ownLimit.has(c.req.path) ? next() : smallBody(c, next)));
   app.route('/v1', gateway);
   app.route('/api', authRoutes);
   app.route('/api/admin', admin);
   app.route('/api', api);
+  app.route('/api', team);
   app.all('/api/*', (c) => apiError(c, 404, 'not_found'));
   app.all('/v1/*', (c) => apiError(c, 404, 'not_found'));
 

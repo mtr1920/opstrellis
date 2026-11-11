@@ -973,6 +973,69 @@ tr.dim td code {
   display: grid;
 }
 
+textarea {
+  font: 400 14px/20px var(--font);
+  width: 100%;
+  min-width: 0;
+  min-height: 96px;
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--text);
+  resize: vertical;
+  transition: border-color 0.12s;
+}
+textarea:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+  border-color: var(--accent);
+}
+label > textarea {
+  font-size: 14px;
+  font-weight: 400;
+}
+[aria-invalid='true'] {
+  border-color: var(--rec-text);
+}
+
+/* ============ team ============ */
+.truncate {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 12px;
+  overflow-x: auto;
+}
+.tabs button[aria-selected='true'],
+.tabs button[aria-selected='true']:hover:not(:disabled) {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+.tab-count {
+  font-size: 12px;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+  color: inherit;
+}
+.tabs + .error {
+  margin-bottom: 12px;
+}
+.tabs + table thead th,
+.tabs + .error + table thead th {
+  border-top: 1px solid var(--line);
+}
+td.clip {
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ============ device ============ */
 .device-card {
   display: flex;
@@ -1325,7 +1388,8 @@ tr.dim td code {
   table.stack td.num:last-child:empty {
     display: none;
   }
-  .card-head + table.stack {
+  .card-head + table.stack,
+  .tabs + table.stack {
     border-top: 1px solid var(--line);
   }
   .user-code {

@@ -1,15 +1,14 @@
 // Account, catalog, usage ingestion, stats and billing endpoints for the desktop app and dashboard.
 import { and, eq } from 'drizzle-orm';
 import { Hono } from 'hono';
-import { bodyLimit } from 'hono/body-limit';
 import { z } from 'zod';
-import { requireAuth, type AppEnv } from '../auth.js';
+import { rateLimit, requireAuth, type AppEnv } from '../auth.js';
 import { PLANS } from '../billing.js';
 import { catalogEntry, listModels } from '../catalog.js';
 import { config, stripeEnabled } from '../config.js';
 import { db } from '../db/index.js';
 import { models, usageEvents, users } from '../db/schema.js';
-import { ApiError, readJson } from '../lib/http.js';
+import { ApiError, jsonBodyLimit, readJson, storableText } from '../lib/http.js';
 import { createCheckoutUrl, createPortalUrl, handleStripeEvent, verifyWebhook } from '../stripe.js';
 import { meSummary, userStats, validTimeZone } from '../usage.js';
 
@@ -28,9 +27,9 @@ api.patch('/me', requireAuth(), async (c) => {
   const body = await readJson(
     c,
     z.object({
-      name: z.string().trim().max(100).optional(),
-      preferred_model: z.string().max(100).nullable().optional(),
-      preferred_llm: z.string().max(100).nullable().optional(),
+      name: storableText().trim().max(100).optional(),
+      preferred_model: storableText().max(100).nullable().optional(),
+      preferred_llm: storableText().max(100).nullable().optional(),
     }),
   );
   await checkModel(body.preferred_model, 'stt');
@@ -61,22 +60,25 @@ api.get('/catalog', async (c) => {
 
 // ---------- usage ingestion (BYOK / local / cloud metadata from the desktop app) ----------
 
+const INT4_MAX = 2_147_483_647;
+
 const usageEvent = z.strictObject({
   id: z.uuid(),
-  provider: z.string().trim().min(1).max(50),
-  model: z.string().trim().min(1).max(100),
+  provider: storableText().trim().min(1).max(50),
+  model: storableText().trim().min(1).max(100),
   mode: z.enum(['byok', 'local', 'cloud']),
   kind: z.enum(['stt', 'llm']).default('stt'),
   audio_seconds: z.number().min(0).max(24 * 3600).default(0),
   words: z.number().int().min(0).max(1_000_000).default(0),
-  input_tokens: z.number().int().min(0).default(0),
-  output_tokens: z.number().int().min(0).default(0),
-  app_category: z.string().trim().max(50).nullish(),
+  input_tokens: z.number().int().min(0).max(INT4_MAX).default(0),
+  output_tokens: z.number().int().min(0).max(INT4_MAX).default(0),
+  app_category: storableText().trim().max(50).nullish(),
   provider_cost_usd: z.number().min(0).max(1000).nullish(),
   created_at: z.iso.datetime({ offset: true }),
 });
 
-api.post('/usage', requireAuth(), bodyLimit({ maxSize: 1024 * 1024 }), async (c) => {
+// A desktop flushes up to 500 events once a minute and after dictations, far below this.
+api.post('/usage', requireAuth(), rateLimit('usage', 30, 60_000, (c) => c.get('user').id), jsonBodyLimit(1024 * 1024), async (c) => {
   // strictObject rejects unknown keys, so transcript text can never be smuggled in.
   const { events } = await readJson(c, z.object({ events: z.array(usageEvent).max(500) }));
   const userId = c.get('user').id;
@@ -117,6 +119,7 @@ api.get('/billing', requireAuth(), async (c) => {
     plan: user.plan,
     plan_status: user.planStatus,
     has_customer: Boolean(user.stripeCustomerId),
+    max_overage_minutes: config.maxOverageMinutes,
     plans: PLANS,
   });
 });
@@ -129,7 +132,8 @@ api.post('/billing/checkout', requireAuth({ sessionOnly: true }), async (c) => {
   requireStripe();
   if (!config.stripe.pricePro) throw new ApiError(500, 'misconfigured', 'STRIPE_PRICE_PRO is not set');
   const user = c.get('user');
-  if (user.plan === 'pro' && user.stripeSubscriptionId) throw new ApiError(409, 'already_subscribed', 'Manage your plan in the billing portal');
+  // Also for an unpaid subscription (plan Free), which can still be paid in the portal and revive.
+  if (user.stripeSubscriptionId) throw new ApiError(409, 'already_subscribed', 'Manage your plan in the billing portal');
   return c.json({ url: await createCheckoutUrl(user) });
 });
 
@@ -138,7 +142,7 @@ api.post('/billing/portal', requireAuth({ sessionOnly: true }), async (c) => {
   return c.json({ url: await createPortalUrl(c.get('user')) });
 });
 
-api.post('/stripe/webhook', bodyLimit({ maxSize: 1024 * 1024 }), async (c) => {
+api.post('/stripe/webhook', jsonBodyLimit(1024 * 1024), async (c) => {
   if (!config.stripe.webhookSecret) throw new ApiError(400, 'billing_manual', 'Stripe webhooks are not configured');
   const payload = await c.req.text();
   let event;

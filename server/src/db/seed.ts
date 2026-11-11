@@ -1,9 +1,10 @@
 // Default catalog (inserted when missing on every migrate) and an optional admin from env.
-import { eq } from 'drizzle-orm';
+import { eq, sql as q } from 'drizzle-orm';
+import { adminError, config } from '../config.js';
 import { pathToFileURL } from 'node:url';
 import { hashPassword } from '../lib/crypto.js';
 import { db, sql } from './index.js';
-import { models, users } from './schema.js';
+import { apiTokens, deviceCodes, models, orgMembers, sessions, users } from './schema.js';
 
 type NewModel = typeof models.$inferInsert;
 const perHour = (usd: number) => usd / 60;
@@ -31,17 +32,45 @@ export async function seedCatalog() {
   await db.insert(models).values(DEFAULT_MODELS).onConflictDoNothing();
 }
 
-/** Creates (or promotes) the admin given by ADMIN_EMAIL / ADMIN_PASSWORD. */
-export async function seedAdmin(email = process.env.ADMIN_EMAIL, password = process.env.ADMIN_PASSWORD) {
-  if (!email || !password) throw new Error('Set ADMIN_EMAIL and ADMIN_PASSWORD');
+/**
+ * Creates (or promotes) the admin given by ADMIN_EMAIL / ADMIN_PASSWORD. Signup emails are unverified,
+ * so an existing account may have been registered by someone else: promoting it resets its password,
+ * revokes its sessions, API tokens and device sign-ins, and takes it out of its team.
+ */
+export async function seedAdmin(email = config.adminEmail, password = config.adminPassword, opts: { onlyIfNoAdmin?: boolean } = {}): Promise<string | null> {
+  if (!email || !password) throw new Error('Set ADMIN_EMAIL and ADMIN_PASSWORD (an existing account gets this password)');
+  const invalid = adminError(email, password);
+  if (invalid) throw new Error(invalid);
   const normalized = email.trim().toLowerCase();
-  const [existing] = await db.select().from(users).where(eq(users.email, normalized));
-  if (existing) {
-    await db.update(users).set({ role: 'admin' }).where(eq(users.id, existing.id));
-    return 'promoted';
-  }
-  await db.insert(users).values({ email: normalized, passwordHash: await hashPassword(password), role: 'admin' });
-  return 'created';
+  const passwordHash = await hashPassword(password);
+  // A failed query's message lists its parameters, which include the password hash: report only the code.
+  return db.transaction(async (tx) => {
+    // The signup lock: no account can be created with this email while we look.
+    await tx.execute(q`select pg_advisory_xact_lock(42)`);
+    if (opts.onlyIfNoAdmin) {
+      const [admin] = await tx.select({ id: users.id }).from(users).where(eq(users.role, 'admin')).limit(1);
+      if (admin) return null;
+    }
+    const [existing] = await tx.select({ id: users.id }).from(users).where(eq(users.email, normalized)).for('update');
+    if (existing) {
+      await tx.update(users).set({ role: 'admin', passwordHash }).where(eq(users.id, existing.id));
+      await tx.delete(sessions).where(eq(sessions.userId, existing.id));
+      await tx.delete(apiTokens).where(eq(apiTokens.userId, existing.id));
+      await tx.delete(deviceCodes).where(eq(deviceCodes.userId, existing.id));
+      await tx.delete(orgMembers).where(eq(orgMembers.userId, existing.id));
+      return 'promoted (password reset; sessions, API tokens, device sign-ins and team membership removed)';
+    }
+    await tx.insert(users).values({ email: normalized, passwordHash, role: 'admin' });
+    return 'created';
+  }).catch((e: { cause?: { code?: string }; code?: string }) => {
+    throw new Error(`Could not create or promote the admin account (database error ${e.cause?.code ?? e.code ?? 'unknown'})`);
+  });
+}
+
+/** At startup: with ADMIN_EMAIL and ADMIN_PASSWORD set and no admin yet, creates or promotes that account. */
+export async function bootstrapAdmin(email = config.adminEmail, password = config.adminPassword): Promise<string | null> {
+  if (!email || !password) return null;
+  return seedAdmin(email, password, { onlyIfNoAdmin: true });
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {

@@ -1,5 +1,5 @@
 // Stripe: Checkout, Customer Portal, webhook state sync, and metered overage reporting.
-import { and, eq, gt, isNotNull, isNull, lte, ne, or } from 'drizzle-orm';
+import { and, eq, gt, isNotNull, isNull, lt, ne, or, sql } from 'drizzle-orm';
 import Stripe from 'stripe';
 import { config, stripeEnabled } from './config.js';
 import { db } from './db/index.js';
@@ -67,22 +67,31 @@ async function findUser(customerId: string | null, userId?: string | null): Prom
   }
 }
 
-const PAID_STATUSES = new Set(['active', 'trialing', 'past_due', 'unpaid']);
+/** past_due keeps Pro (without overage) while Stripe retries the payment; unpaid and the rest are Free. */
+const PAID_STATUSES = new Set(['active', 'trialing', 'past_due']);
+
+/** With STRIPE_PRICE_PRO set, only a subscription to that price is Pro (not another product in the same account). */
+const isProSubscription = (sub: Stripe.Subscription) =>
+  !config.stripe.pricePro || (sub.items?.data ?? []).some((i) => i.price?.id === config.stripe.pricePro);
 const toDate = (s: number | undefined | null) => (s ? new Date(s * 1000) : null);
 
 /**
  * Writes `set` unless the user already has a newer event applied, or `subscriptionId` was deleted.
  * Webhooks arrive out of order and are retried, so a late "active" must not revive a cancelled plan.
+ * Event times have one-second resolution. With `incomplete` (a state that only ever precedes Pro), a
+ * same-second event cannot replace Pro on this subscription, so a "created" processed after "active"
+ * does not drop a paying customer. Without `stamp` the event is not recorded as the latest one.
  */
-async function applyEvent(event: Stripe.Event, userId: string, subscriptionId: string | null, set: Partial<User>) {
+async function applyEvent(event: Stripe.Event, userId: string, subscriptionId: string | null, set: Partial<User>, opts: { incomplete?: boolean; stamp?: boolean } = {}) {
   const at = new Date(event.created * 1000);
+  const tieAllowed = opts.incomplete && subscriptionId ? or(ne(users.plan, 'pro'), sql`${users.stripeSubscriptionId} is distinct from ${subscriptionId}`) : undefined;
   await db
     .update(users)
-    .set({ ...set, stripeEventAt: at })
+    .set(opts.stamp === false ? set : { ...set, stripeEventAt: at })
     .where(
       and(
         eq(users.id, userId),
-        or(isNull(users.stripeEventAt), lte(users.stripeEventAt, at)),
+        or(isNull(users.stripeEventAt), lt(users.stripeEventAt, at), and(eq(users.stripeEventAt, at), tieAllowed)),
         subscriptionId ? or(isNull(users.stripeEndedSubscriptionId), ne(users.stripeEndedSubscriptionId, subscriptionId)) : undefined,
       ),
     );
@@ -93,7 +102,9 @@ export async function handleStripeEvent(event: Stripe.Event): Promise<void> {
   switch (event.type) {
     case 'checkout.session.completed': {
       const s = event.data.object;
-      if (s.mode !== 'subscription') return;
+      // The session carries no line items (and a payment link can set client_reference_id), so with a
+      // Pro price configured the subscription events, which list their prices, decide the plan.
+      if (s.mode !== 'subscription' || config.stripe.pricePro) return;
       const user = await findUser(idOf(s.customer), s.client_reference_id ?? s.metadata?.user_id);
       if (!user) return;
       const subscriptionId = idOf(s.subscription);
@@ -106,10 +117,15 @@ export async function handleStripeEvent(event: Stripe.Event): Promise<void> {
       const sub = event.data.object;
       const user = await findUser(idOf(sub.customer), sub.metadata?.user_id);
       if (!user) return;
-      // Ignore events for an older subscription once the user has moved to a newer one.
-      if (user.stripeSubscriptionId && user.stripeSubscriptionId !== sub.id && event.type !== 'customer.subscription.created') return;
       const deleted = event.type === 'customer.subscription.deleted';
-      const active = !deleted && PAID_STATUSES.has(sub.status);
+      const active = !deleted && PAID_STATUSES.has(sub.status) && isProSubscription(sub);
+      // Another subscription replaces the tracked one only when it is itself an active Pro one, so an
+      // older, failed or second-checkout subscription cannot knock a paying subscriber to Free.
+      if (user.stripeSubscriptionId && user.stripeSubscriptionId !== sub.id && !active) return;
+      // A subscription to another product must not touch the plan unless it is the one we track.
+      if (!isProSubscription(sub) && sub.id !== user.stripeSubscriptionId) return;
+      // An unpaid subscription can still be paid and revive, so it stays linked (checkout then sends the user to the portal).
+      const linked = active || (!deleted && sub.status === 'unpaid');
       // Since API 2025-03-31 the period lives on the subscription items.
       const item = sub.items?.data?.[0] as { current_period_start?: number; current_period_end?: number } | undefined;
       const legacy = sub as unknown as { current_period_start?: number; current_period_end?: number };
@@ -117,16 +133,17 @@ export async function handleStripeEvent(event: Stripe.Event): Promise<void> {
         plan: active ? 'pro' : 'free',
         planStatus: deleted ? 'canceled' : sub.status,
         stripeCustomerId: idOf(sub.customer),
-        stripeSubscriptionId: active ? sub.id : null,
+        stripeSubscriptionId: linked ? sub.id : null,
         ...(deleted ? { stripeEndedSubscriptionId: sub.id } : {}),
         periodStart: active ? toDate(item?.current_period_start ?? legacy.current_period_start) : null,
         periodEnd: active ? toDate(item?.current_period_end ?? legacy.current_period_end) : null,
-      });
+      }, { incomplete: !deleted && sub.status === 'incomplete' });
       return;
     }
     case 'invoice.payment_failed': {
       const user = await findUser(idOf(event.data.object.customer));
-      if (user?.plan === 'pro') await applyEvent(event, user.id, null, { planStatus: 'past_due' });
+      // Not stamped: the subscription event Stripe sends in the same second (e.g. unpaid) must still apply.
+      if (user?.plan === 'pro') await applyEvent(event, user.id, null, { planStatus: 'past_due' }, { stamp: false });
       return;
     }
   }

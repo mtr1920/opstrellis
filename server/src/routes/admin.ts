@@ -7,7 +7,7 @@ import { currentPeriod } from '../billing.js';
 import { listModels } from '../catalog.js';
 import { db } from '../db/index.js';
 import { models, sessions, usageEvents, users, type User } from '../db/schema.js';
-import { ApiError, iso, parse, readJson } from '../lib/http.js';
+import { ApiError, iso, parse, readJson, storableText } from '../lib/http.js';
 import { deleteProviderKey, isProvider, listProviderKeys, setProviderKey } from '../providers.js';
 import { adminStats, meSummary, userStats } from '../usage.js';
 
@@ -35,7 +35,7 @@ const userJson = (u: User) => ({
 admin.get('/users', async (c) => {
   const q = parse(
     z.object({
-      q: z.string().trim().max(100).optional(),
+      q: storableText().trim().max(100).optional(),
       page: z.coerce.number().int().min(1).default(1),
       page_size: z.coerce.number().int().min(1).max(100).default(25),
     }),
@@ -124,9 +124,9 @@ admin.patch('/users/:id', async (c) => {
 
 const modelFields = {
   kind: z.enum(['stt', 'llm']),
-  provider: z.string().trim().min(1).max(50),
-  upstream_model: z.string().trim().min(1).max(200),
-  display_name: z.string().trim().min(1).max(100),
+  provider: storableText().trim().min(1).max(50),
+  upstream_model: storableText().trim().min(1).max(200),
+  display_name: storableText().trim().min(1).max(100),
   streaming: z.boolean().default(false),
   price_per_min_usd: z.number().min(0).default(0),
   cost_per_min_usd: z.number().min(0).default(0),
@@ -153,6 +153,12 @@ const toRow = (b: ModelInput) =>
       fallbackOrder: b.fallback_order,
     }).filter(([, v]) => v !== undefined),
   );
+
+/** An id from the URL; one Postgres could not compare (e.g. with NUL) cannot exist, so it is a 404. */
+function storedId(raw: string) {
+  if (!storableText().safeParse(raw).success) throw new ApiError(404, 'not_found');
+  return raw;
+}
 
 const modelJson = (m: typeof models.$inferSelect) => ({
   id: m.id,
@@ -186,13 +192,13 @@ admin.patch('/models/:id{.+}', async (c) => {
   const body = await readJson(c, z.object(modelFields).partial());
   const row = toRow(body);
   if (!Object.keys(row).length) throw new ApiError(400, 'invalid_request', 'Nothing to update');
-  const [updated] = await db.update(models).set(row).where(eq(models.id, c.req.param('id'))).returning();
+  const [updated] = await db.update(models).set(row).where(eq(models.id, storedId(c.req.param('id')))).returning();
   if (!updated) throw new ApiError(404, 'not_found');
   return c.json({ model: modelJson(updated) });
 });
 
 admin.delete('/models/:id{.+}', async (c) => {
-  const deleted = await db.delete(models).where(eq(models.id, c.req.param('id'))).returning();
+  const deleted = await db.delete(models).where(eq(models.id, storedId(c.req.param('id')))).returning();
   if (!deleted.length) throw new ApiError(404, 'not_found');
   return c.json({ ok: true });
 });
@@ -204,13 +210,13 @@ admin.get('/providers', async (c) => c.json({ providers: await listProviderKeys(
 admin.put('/providers/:provider', async (c) => {
   const provider = c.req.param('provider');
   if (!isProvider(provider)) throw new ApiError(404, 'not_found');
-  const { key } = await readJson(c, z.object({ key: z.string().trim().min(8).max(500) }));
+  const { key } = await readJson(c, z.object({ key: storableText().trim().min(8).max(500) }));
   await setProviderKey(provider, key);
   return c.json({ ok: true });
 });
 
 admin.delete('/providers/:provider', async (c) => {
-  await deleteProviderKey(c.req.param('provider'));
+  await deleteProviderKey(storedId(c.req.param('provider')));
   return c.json({ ok: true });
 });
 
