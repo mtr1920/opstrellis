@@ -27,6 +27,7 @@ export interface Me {
   plan_status: string;
   period: { start: string; end: string };
   usage: { managed_minutes: number; included_minutes: number; overage_minutes: number; remaining_minutes: number; words: number; cost_usd: number };
+  limits: { included_minutes: number; overage_per_min_usd: number; max_overage_minutes: number; llm_tokens: number };
   preferred_model: string | null;
   preferred_llm: string | null;
 }

@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { eq } from 'drizzle-orm';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { providerKeys, usageEvents } from '../src/db/schema.js';
+import { apiTokens, providerKeys, sessions, usageEvents, users } from '../src/db/schema.js';
+import { seedAdmin } from '../src/db/seed.js';
 import { getProviderKey } from '../src/providers.js';
 import { createToken, db, req, resetDb, signup, userWithToken } from './helpers.js';
 
@@ -133,5 +134,59 @@ describe('admin provider keys', () => {
     expect((await req('/api/admin/providers/nope', { method: 'PUT', cookie: adminCookie, json: { key } })).status).toBe(404);
     await req('/api/admin/providers/deepgram', { method: 'DELETE', cookie: adminCookie });
     expect(await getProviderKey('deepgram')).toBe(process.env.DEEPGRAM_API_KEY || null);
+  });
+});
+
+describe('admin user view with large totals', () => {
+  it('does not overflow int4 when summing words', async () => {
+    const u = await userWithToken();
+    await db.insert(usageEvents).values(
+      Array.from({ length: 3 }, () => ({ id: randomUUID(), userId: u.user.id, source: 'client' as const, mode: 'byok' as const, provider: 'deepgram', model: 'nova-3', audioSeconds: 1, words: 2_000_000_000 })),
+    );
+    const res = await req(`/api/admin/users/${u.user.id}`, { cookie: adminCookie });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.summary.usage.words).toBe(6_000_000_000);
+    expect(body.stats.totals.words).toBe(6_000_000_000);
+  });
+});
+
+describe('npm run db:seed', () => {
+  it('promoting an existing account resets its password and revokes its sessions and API tokens', async () => {
+    // someone registered the operator's address first (signup emails are unverified)
+    const squatter = await userWithToken('operator@example.com');
+    expect(await seedAdmin('Operator@example.com', 'operator chosen password')).toMatch(/^promoted/);
+    const [row] = await db.select().from(users).where(eq(users.id, squatter.user.id));
+    expect(row!.role).toBe('admin');
+    expect(await db.select().from(sessions).where(eq(sessions.userId, row!.id))).toEqual([]);
+    expect(await db.select().from(apiTokens).where(eq(apiTokens.userId, row!.id))).toEqual([]);
+    expect((await req('/api/me', { token: squatter.token })).status).toBe(401);
+    expect((await req('/api/auth/login', { json: { email: squatter.email, password: squatter.password } })).status).toBe(401);
+    expect((await req('/api/auth/login', { json: { email: 'operator@example.com', password: 'operator chosen password' } })).status).toBe(200);
+  });
+
+  it('creates a new admin, and refuses without ADMIN_PASSWORD', async () => {
+    expect(await seedAdmin('fresh-admin@example.com', 'another long password')).toBe('created');
+    await expect(seedAdmin('fresh-admin@example.com', '')).rejects.toThrow(/ADMIN_PASSWORD/);
+  });
+
+  it('refuses values the admin could never sign in with', async () => {
+    await expect(seedAdmin('x@example.com', 'short')).rejects.toThrow('ADMIN_PASSWORD must be 8 to 200 characters');
+    await expect(seedAdmin('x@example.com', 'p'.repeat(201))).rejects.toThrow('ADMIN_PASSWORD must be 8 to 200 characters');
+    await expect(seedAdmin('not-an-email', 'long enough pw')).rejects.toThrow('ADMIN_EMAIL is not a valid email address');
+    expect(await db.select().from(users).where(eq(users.email, 'x@example.com'))).toEqual([]);
+  });
+});
+
+describe('admin input that Postgres cannot store', () => {
+  it('rejects NUL in search, model fields and ids with 400/404 instead of 500', async () => {
+    expect((await req('/api/admin/users?q=a%00b', { cookie: adminCookie })).status).toBe(400);
+    const model = { id: 'openrouter/nul-test', kind: 'llm', provider: 'openrouter', upstream_model: 'x', display_name: 'bad\u0000name' };
+    expect((await req('/api/admin/models', { method: 'POST', cookie: adminCookie, json: model })).status).toBe(400);
+    expect((await req('/api/admin/models/local/moonshine-tiny-en', { method: 'PATCH', cookie: adminCookie, json: { display_name: 'x\u0000' } })).status).toBe(400);
+    expect((await req('/api/admin/models/local/a%00b', { method: 'PATCH', cookie: adminCookie, json: { enabled: true } })).status).toBe(404);
+    expect((await req('/api/admin/models/local/a%00b', { method: 'DELETE', cookie: adminCookie })).status).toBe(404);
+    expect((await req('/api/admin/providers/a%00b', { method: 'DELETE', cookie: adminCookie })).status).toBe(404);
+    expect((await req('/api/admin/providers/openai', { method: 'PUT', cookie: adminCookie, json: { key: 'sk-12345678\u0000' } })).status).toBe(400);
   });
 });

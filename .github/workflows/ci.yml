@@ -58,8 +58,11 @@ jobs:
             libasound2-dev libpulse-dev libxdo-dev libssl-dev libsecret-1-dev patchelf
       - uses: actions/setup-node@v4
         with: { node-version: 22, cache: npm, cache-dependency-path: desktop/package-lock.json }
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with: { toolchain: stable }
+      # A release is built from scratch, never from a cache another run wrote.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
           workspaces: desktop/src-tauri
           # A cached build links against the sherpa-onnx libraries in ~/.cache/sherpa-onnx, so keep
@@ -95,7 +98,9 @@ jobs:
       - name: Unit tests (with the real local model for the fallback test)
         run: |
           mkdir -p /tmp/opstrellis-models && cd /tmp/opstrellis-models
-          curl -sL https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-tiny-en-int8.tar.bz2 | tar xj
+          # GitHub has no published digest for this older asset, so it can't be pinned yet.
+          curl -fsSL -o moonshine.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-tiny-en-int8.tar.bz2
+          tar xjf moonshine.tar.bz2 && rm moonshine.tar.bz2
           touch sherpa-onnx-moonshine-tiny-en-int8/.complete
           cd "$GITHUB_WORKSPACE/desktop/src-tauri" && cargo test
       - name: Bundle

@@ -1,0 +1,1 @@
+ALTER TABLE "org_library" ADD COLUMN "size" integer DEFAULT 0 NOT NULL;

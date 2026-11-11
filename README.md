@@ -41,7 +41,9 @@
   intact, and adapts its tone per app. Optional AI polish, offline too, also fixes grammar and
   self-corrections.
 - **Built for developers:** knows `kubectl` from "cube control", writes `main.rs` when you say
-  "main dot rs", and cleans up prompts for ChatGPT, Claude, Cursor or Claude Code.
+  "main dot rs", and cleans up prompts for ChatGPT, Claude, Cursor or Claude Code. Add your
+  project folders and it also knows your own code: their names are hinted to the transcriber and
+  spelled right by AI polish, and "at sign pipeline dot rs" becomes `@src/pipeline.rs` in AI prompts.
 
 <p align="center">
   <picture>
@@ -104,6 +106,7 @@ are kept. To check the installed version, run `opstrellis --version` or open Set
 | Tap **Ctrl+Shift+Space** | Hands-free: keeps listening until you tap again. |
 | **Esc** | Cancels the current recording. |
 | Hold **Ctrl+Alt+Space** | Command mode: select text and say how to change it ("make this more formal"). |
+| **Enter** / **Esc** | While a command-mode rewrite is shown for review: insert it, or discard it. |
 | **Ctrl+Alt+V** | Pastes your last transcript again. |
 
 - **Use a single key (macOS):** in Settings → Shortcuts, set dictation to **🌐 fn**, Right ⌘,
@@ -163,13 +166,15 @@ are kept. To check the installed version, run `opstrellis --version` or open Set
 | Style per app | Personal, work, email, AI prompts and other categories, each formal, casual, very casual or excited, with optional "how you write here" notes for AI polish. The category comes from the focused app and window title; Style → Apps lets you correct it. |
 | AI prompts | Dictating to ChatGPT, Claude, Cursor or an AI agent in a terminal (Claude Code, Codex, Aider, Gemini CLI) gets prompt cleanup: instructions kept, file names, paths and flags written as code, and optional light structure (Goal, Context, Constraints) for long prompts. |
 | Auto action | Optional, per app category: run an action such as "Polish" or "Make formal" on every dictation before it's inserted. Off by default; never in a plain terminal shell. |
-| Command mode | Select text, hold the command shortcut and say what to do, or name a saved action (Library → Actions). With nothing selected, it writes new text. Actions can copy their result instead: select a message and say "reply saying Thursday works" or "summarize". |
+| Command mode | Select text, hold the command shortcut and say what to do, or name a saved action (Library → Actions). With nothing selected, it writes new text. Actions can copy their result instead: select a message and say "reply saying Thursday works" or "summarize". By default, before a rewrite of long text (over 280 characters) replaces your selection, the pill shows it: **Enter** inserts it, **Esc** discards it (Paste last still inserts it); Settings → AI polish → Review AI rewrites (only long text, always or never; not on Wayland). |
 | Snippets | A spoken trigger expands to saved text, with `{date}`, `{weekday}`, `{time}` and `{clipboard}` placeholders. |
 | Auto-learn dictionary | Optional: correct a dictation in History and misheard words become dictionary entries (`Karl → Karol`). Changes that don't sound like mis-hearings are learned only when you make them twice; common words are never turned into replacements; Undo restores the dictionary. |
-| Tech terms | About 300 developer and workplace terms (`kubectl`, `PostgreSQL`, `Next.js`, `Jira`, `OKR`). Common mis-hearings are fixed (`cube control → kubectl`); your own dictionary and snippets always win. |
-| Notetaker | Records meetings from the mic, optionally mixed with system audio (PulseAudio monitor or BlackHole), transcribes while recording, and saves a note with an AI summary (General, Sales call, Interview, 1:1, Standup). Then drafts a follow-up email or a CRM note, or copies the action items. |
-| History and Insights | Search and correct past dictations, compare the original transcript with the polished text, polish again with AI. Insights shows words, WPM, fixes, streaks, a heatmap and app categories. |
+| Tech terms and term packs | About 300 developer and workplace terms (`kubectl`, `PostgreSQL`, `Next.js`, `Jira`, `OKR`). Common mis-hearings are fixed (`cube control → kubectl`); your own dictionary and snippets always win. Optional packs for data and ML, product and design, and finance, or import your own (Style → Term packs, with a preview of what it replaces). A pack's terms are sent as hints, so the transcriber prefers their spellings: a built-in pack's even before you say them, an imported pack's once you have. [Contribute a pack](CONTRIBUTING.md#contributing-a-term-pack). |
+| Workspaces (repo-aware dictation) | Add project folders (Settings → Workspaces). In code editors, terminals and AI prompts, the workspace named in the window title (or the only one you added; the pill shows it) helps in three ways: up to 40 of its file and code names go to your transcription provider as hints; with AI polish (not the offline model) the code names you said are listed for the model, which spells them exactly only where you mean that code (`retranscribe_history`) and leaves ordinary phrases alone; and in AI prompts "at sign pipeline dot rs" or "@pipeline.rs" becomes `@desktop/src-tauri/src/pipeline.rs` when exactly one file has that name. Optional, off by default: write names said as words as code without AI ("user session store" → `UserSessionStore`), in editors and terminals only. That rule can't tell a name from a phrase, so it also rewrites ordinary words that match a name in your code ("plain text" → `plain_text`); your dictionary and snippets always win. Indexing reads folders directly and never runs git or anything else: it skips hidden, dependency and build folders and what simple `.gitignore` rules exclude (names, `*` globs, `/anchored`, `**/name`; negations and other patterns are skipped), keeps at most 20 000 files and only file names and the type, function and constant names declared in source files (not local variables or tests), never contents. File names with spaces or punctuation are never sent or used. Re-indexed in the background when 10 minutes old. |
+| Notetaker | Records meetings from the mic, optionally plus system audio (PulseAudio monitor or BlackHole) transcribed on its own, so the transcript reads `Me:` / `Them:`. Transcribes while recording and saves a note with an AI summary (General, Sales call, Interview, 1:1, Standup). Then drafts a follow-up email or a CRM note, or copies the action items. |
+| History and Insights | Search and correct past dictations, compare the original transcript with the polished text, polish again with AI. If every speech provider fails, the recording is kept so you can retry it from History or the tray; optionally recordings are kept on disk for about a day so any recent dictation can be transcribed again. Insights shows words, WPM, fixes, streaks, a heatmap and app categories. |
 | Multilingual | Auto-detect or a fixed language. Multilingual local models: Whisper (99 languages), Parakeet v3 (25 European languages) and SenseVoice. |
+| Speak one language, write another | Optional, per app category (Style → Write in): speak Hindi, Hinglish or any mix and AI polish writes English, or any of 27 languages. Names, code, URLs and your dictionary terms aren't translated; History keeps what you said. Needs a cloud or OpenAI-compatible AI provider; never in a plain terminal shell. If the AI is unavailable, the untranslated text is inserted and the pill says so. |
 
 </details>
 
@@ -196,15 +201,83 @@ are kept. To check the installed version, run `opstrellis --version` or open Set
 
 </details>
 
+## Use OpsTrellis from your AI agent
+
+AI coding agents such as Claude Code or Cursor can run OpsTrellis as an
+[MCP](https://modelcontextprotocol.io) server, so you can ask "what did I dictate about the deploy
+this morning?" or "use the action items from today's standup". It is off until you turn it on in
+**Settings → Agents**, where you also choose what agents can use.
+
+**Set up.** For Claude Code:
+
+```sh
+claude mcp add opstrellis -- opstrellis mcp
+```
+
+Other agents: add an MCP server with `{ "command": "opstrellis", "args": ["mcp"] }`. `opstrellis`
+is the command `install.sh` creates. Installed from the `.dmg`? Use
+`/Applications/OpsTrellis.app/Contents/MacOS/opstrellis` instead. The `.deb` puts `opstrellis` in
+`/usr/bin`; a downloaded AppImage works by its full path. OpsTrellis doesn't need to be running.
+
+**Tools** (each one only while its switch is on):
+
+| Tool | Switch | What it does |
+|---|---|---|
+| `search_dictations` | Dictation history | Your recent successful dictations, newest first (`query`, `limit` up to 50) |
+| `get_last_dictation` | Dictation history | Your last dictation |
+| `list_dictionary` | Dictation history | Your dictionary words and replacements |
+| `list_notes` | Notes | Your notes and meeting notes (`kind`: `note` or `meeting`) |
+| `get_note` | Notes | One note; a meeting note with its summary and transcript (cut at 100,000 characters) |
+| `add_dictionary_term` | Add dictionary words (off by default) | Adds a technical term or name as a spelling hint, only if some word in it mixes capital and small letters after its first letter (gRPC, PostgreSQL), has a digit (k8s), has + or # after its first character (C++) or . _ / between letters or digits (Node.js). Ordinary words, all-capital words and plain Titlecase names (Meeting, EMAIL, Kubernetes) are refused, as are words you already have in another capitalization and single words under 3 characters. Agents can't add replacements or change or delete entries; added words show an **Agent** badge in Library → Dictionary |
+| `ask_user` | Questions by voice (off by default) | Shows the whole question in a card above your screen's bottom edge ("Agent asks") and waits for your answer: 60 seconds for you to start, longer while you answer, 5 minutes at most |
+
+The same data is available in a terminal: `opstrellis last`, `opstrellis history [--search <text>]
+[--limit <n>]`, `opstrellis notes [--kind note|meeting]`, `opstrellis note <id>` and
+`opstrellis ask "<question>"`, as plain text or with `--json`. `opstrellis --help` lists every command.
+
+**Answering an agent by voice.** OpsTrellis never starts recording because an agent asked. The
+question waits in a card where the pill appears; to answer, dictate with your usual shortcut once you have had the question
+on screen for at least 2 seconds. A question that arrives while you are dictating shows up when you are
+done, and only counts from then. While you speak the pill says **Answering the agent**, and your words go
+to the agent instead of into the app in front; they are cleaned up like an AI prompt and saved in
+History as "Answer to an agent". A command, or a dictation started sooner, works as usual. Esc while
+recording keeps the question; to decline it, use the tray's **Decline agent question** or
+`opstrellis --cancel`. Unanswered after 60 seconds, the agent is told you didn't answer; an answer you
+are still speaking or that is being processed holds the question, and after a cancelled or empty attempt
+you get at least 15 more seconds (5 minutes at most in all). Turning voice questions, agent access or the
+pill off withdraws a waiting question, and an answer is only sent while they are on. OpsTrellis must be
+running, with the recording pill on.
+
+**Privacy.** Nothing leaves your computer through OpsTrellis: the agent reads your data and may send
+it to its own AI provider, as with anything else you show it. Turning a switch off applies to the
+agent's next request; after turning one on, restart the agent so it sees the new tools. With History
+off, agents get no dictations. Every tool tells the agent that what it returns is your content, not
+instructions, but meeting transcripts include other people's words, so keep an eye on what your agent
+does with them. The switches are your consent for what agents get through OpsTrellis, not a lock:
+other software running as you can read OpsTrellis's files directly.
+
 ## Privacy
 
 - Out of the box, transcription runs **on your computer**; nothing is sent anywhere.
 - Your API keys never leave your device except in requests to the provider you chose.
-- The microphone is open only while recording. Audio is never stored.
+- The microphone is open only while recording. By default recordings are never written to disk;
+  the last few whose transcription failed stay in memory until you retry them or quit. Keeping recordings on
+  disk (Settings → Privacy → Keep recordings: failed ones or all) is opt-in, local only and needs
+  History. A kept file is deleted within an hour of turning 24 hours old while OpsTrellis runs, or
+  at its next launch, and at once when you choose Never or turn History off.
 - History can be kept forever, 30 days, 7 days, or turned off.
+- Workspaces (off until you add a folder) read only file names and the names declared in source
+  files, keep them in memory, never run a program in the folder, and never send file contents
+  anywhere. With a cloud transcription or AI provider, up to 40 of those names (and the code names
+  you say, at most 30) go to it with each dictation, like your dictionary.
+- AI agents get nothing from OpsTrellis unless you turn on Settings → Agents
+  ([details](#use-opstrellis-from-your-ai-agent)).
 - The log (Settings → About → Show logs) has timings and errors, never what you said or typed.
 - Optional usage sync to OpsTrellis Cloud sends counts and durations only, never text, and can be
   turned off.
+- Optional update check (off by default, Settings → About): once a day OpsTrellis asks github.com
+  for the latest version number. The request carries no account, device or usage data (GitHub sees
+  your IP address, as with any request), and nothing is installed automatically.
 
 ## OpsTrellis Cloud (optional, self-hosted)
 
@@ -216,6 +289,9 @@ are kept. To check the installed version, run `opstrellis --version` or open Set
 - Accounts, device sign-in from the desktop app, and API tokens.
 - Usage and cost tracking, Stripe subscriptions with metered overage, admin pages and a web
   dashboard.
+- Teams with a shared library: dictionary entries, snippets and voice actions that team admins edit
+  on the dashboard. Every member's desktop app syncs it down read-only, and their own entries always
+  win over the team's (**Settings → Account → Team library**).
 
 ```sh
 cd server
@@ -223,7 +299,8 @@ cp .env.example .env          # set MASTER_KEY, provider keys, optional Stripe k
 docker compose up --build     # Postgres + server on :8787
 ```
 
-In the desktop app, open **Settings → Account**, set the server URL and sign in, then add
+In the desktop app, open **Settings → Account**, set the server URL (https://, or http:// only on
+your own computer or local network) and sign in, then add
 "OpsTrellis Cloud" as a transcription or AI provider. Full details:
 [server/README.md](server/README.md).
 
@@ -260,11 +337,12 @@ npx tauri build --bundles app,dmg      # macOS app (Linux: --bundles deb,appimag
   [architecture](docs/ARCHITECTURE.md), [design system](docs/DESIGN.md),
   [desktop IPC contract](docs/DESKTOP_IPC.md), [testing](docs/TESTING.md),
   [releasing](docs/RELEASING.md) and the [roadmap](docs/PRODUCT_ROADMAP.md).
-- **Tests:** `cd desktop/src-tauri && cargo test` (86 tests, plus live tests that need a
+- **Tests:** `cd desktop/src-tauri && cargo test` (unit and integration tests, plus live tests that need a
   microphone or API keys), `python3 tests/test_installer.py` and `python3 tests/test_release.py`
   for the installer, and `cd server && npm test` for the server. End-to-end suites with real
   shortcuts, a virtual microphone and real insertion are described in
   [docs/TESTING.md](docs/TESTING.md).
+  A reproducible developer-speech accuracy benchmark is in [docs/BENCHMARK.md](docs/BENCHMARK.md).
 
 ## Known limitations
 
@@ -275,8 +353,8 @@ npx tauri build --bundles app,dmg      # macOS app (Linux: --bundles deb,appimag
   response shapes; live tests run when keys are set ([docs/TESTING.md](docs/TESTING.md)).
 - **Wayland:** hold-to-talk needs the desktop's shortcut portal (GNOME 48+, KDE Plasma); the pill may take focus on some
   compositors (it can be turned off in Settings), and some Wayland docks ignore **Show in Dock**.
-- **Not yet:** learning from edits you make inside other apps after insertion, team-shared
-  dictionaries and snippets, Windows and mobile apps. Plans are in
+- **Not yet:** learning from edits you make inside other apps after insertion, Windows and mobile
+  apps. Plans are in
   [docs/PRODUCT_ROADMAP.md](docs/PRODUCT_ROADMAP.md).
 
 ## License

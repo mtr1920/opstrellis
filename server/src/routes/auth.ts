@@ -1,54 +1,116 @@
 // Email/password auth, API tokens, and the device-code flow for the desktop app.
 import { randomInt } from 'node:crypto';
-import { and, count, desc, eq, isNull, sql } from 'drizzle-orm';
+import { and, count, desc, eq, isNull, ne, sql } from 'drizzle-orm';
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { createApiToken, endSession, newApiToken, rateLimit, requireAuth, startSession, type AppEnv } from '../auth.js';
+import { checkLimit, clientKey, createApiToken, endSession, limitKey, newApiToken, rateLimit, requireAuth, requireSameOrigin, sessionId, recordHit, startSession, type AppEnv } from '../auth.js';
 import { config } from '../config.js';
 import { db } from '../db/index.js';
-import { apiTokens, deviceCodes, users } from '../db/schema.js';
+import { apiTokens, deviceCodes, sessions, users } from '../db/schema.js';
 import { hashPassword, randomToken, sha256, verifyPassword } from '../lib/crypto.js';
-import { ApiError, iso, readJson } from '../lib/http.js';
+import { ApiError, emailSchema, iso, passwordSchema, readJson, storableText } from '../lib/http.js';
 
 export const authRoutes = new Hono<AppEnv>();
 
-const email = z.string().trim().toLowerCase().pipe(z.email()).pipe(z.string().max(254));
-const password = z.string().min(8, 'Password must be at least 8 characters').max(200);
+const email = emailSchema;
+const password = passwordSchema;
 
 // ---------- signup / login / logout ----------
 
-authRoutes.post('/auth/signup', rateLimit('signup', 10), async (c) => {
-  const body = await readJson(c, z.object({ email, password, name: z.string().trim().max(100).default('') }));
+type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+async function signupCounts(tx: Tx | typeof db) {
+  const [row] = await tx
+    .select({
+      total: count(),
+      admins: sql<number>`count(*) filter (where ${users.role} = 'admin')::int`,
+      lastDay: sql<number>`count(*) filter (where ${users.createdAt} > now() - interval '1 day')::int`,
+    })
+    .from(users);
+  return row ?? { total: 0, admins: 0, lastDay: 0 };
+}
+
+/**
+ * Whether a signup would become the first admin: only the first account on an empty database, and
+ * never when ADMIN_EMAIL is set (that admin is created at startup instead).
+ */
+const isBootstrap = (counts: { total: number }) => !config.adminEmail && counts.total === 0;
+
+/** A startup warning while there is no admin and nothing configured will create one safely. */
+export async function bootstrapWarning(): Promise<string | null> {
+  const counts = await signupCounts(db);
+  if (!config.adminEmail) {
+    if (counts.total > 0) return null;
+    return 'WARNING: there are no users yet, so the next account to sign up becomes ADMIN. Create yours now, or set ADMIN_EMAIL and ADMIN_PASSWORD before exposing this server.';
+  }
+  if (counts.admins > 0 || config.adminPassword) return null;
+  return 'WARNING: ADMIN_EMAIL is set without ADMIN_PASSWORD and there is no admin yet; set ADMIN_PASSWORD so the server can create it, or run `npm run db:seed`.';
+}
+
+/** Public: lets the dashboard hide the signup form when signup is closed. */
+authRoutes.get('/auth/signup', async (c) => c.json({ open: config.allowSignup || isBootstrap(await signupCounts(db)) }));
+
+/** Accounts one client IP (IPv6: /64) may create a day, so one client cannot use up MAX_SIGNUPS_PER_DAY for everyone. */
+const SIGNUPS_PER_CLIENT_PER_DAY = 20;
+
+authRoutes.post('/auth/signup', rateLimit('signup', 10), requireSameOrigin, async (c) => {
+  const body = await readJson(c, z.object({ email, password, name: storableText().trim().max(100).default('') }));
   const passwordHash = await hashPassword(body.password);
   const user = await db.transaction(async (tx) => {
-    // Serialize signups so exactly one "first user" becomes admin. Other admins come from
-    // `npm run db:seed` or the admin UI, never from an unverified signup email.
+    // Serialize signups so exactly one account bootstraps the admin role and the daily cap is exact.
+    // Other admins come from ADMIN_EMAIL, `npm run db:seed` or the admin UI, never from an unverified signup email.
     await tx.execute(sql`select pg_advisory_xact_lock(42)`);
+    const counts = await signupCounts(tx);
+    const bootstrap = isBootstrap(counts);
+    if (!config.allowSignup && !bootstrap) throw new ApiError(403, 'signup_disabled', 'New accounts cannot be created on this server');
+    if (!bootstrap && counts.lastDay >= config.maxSignupsPerDay) {
+      throw new ApiError(429, 'signup_limit', 'Too many accounts were created today; try again tomorrow');
+    }
+    checkLimit(c, 'signup-day', clientKey(c), SIGNUPS_PER_CLIENT_PER_DAY);
     const [existing] = await tx.select({ id: users.id }).from(users).where(eq(users.email, body.email));
     if (existing) throw new ApiError(409, 'email_taken', 'An account with this email already exists');
-    const [{ n } = { n: 0 }] = await tx.select({ n: count() }).from(users);
-    const role = n === 0 ? 'admin' : 'user';
-    const [u] = await tx.insert(users).values({ email: body.email, name: body.name, passwordHash, role }).returning();
+    const [u] = await tx.insert(users).values({ email: body.email, name: body.name, passwordHash, role: bootstrap ? 'admin' : 'user' }).returning();
+    recordHit('signup-day', clientKey(c), 86_400_000);
     return u!;
   });
   await startSession(c, user.id);
   return c.json({ user: { id: user.id, email: user.email, name: user.name, role: user.role } }, 201);
 });
 
-authRoutes.post('/auth/login', rateLimit('login', 10), async (c) => {
+/** Checked when the email is unknown, so that path costs one scrypt like a wrong password does. */
+const DUMMY_HASH = 'scrypt$16384$8$1$m9rOYxyX4S-5-w60bK5cng$CNwXsZPrVb1i7YbZlYZcWbpqkKa0_4OrQqqq4Yy2yd-o3RG4OJ064rDEwPr5P-pmUoeJo-oq4J00kld4L5U6eA';
+
+authRoutes.post('/auth/login', rateLimit('login', 10), requireSameOrigin, async (c) => {
   const body = await readJson(c, z.object({ email, password: z.string().max(200) }));
+  // Tight per account and client, so guessing one password is slow; the account-wide ceiling is far
+  // higher, so others cannot lock the owner out from their own addresses.
+  limitKey(c, 'login-email-ip', `${body.email}|${clientKey(c)}`, 10, 15 * 60_000);
+  limitKey(c, 'login-email', body.email, 200, 15 * 60_000);
   const [user] = await db.select().from(users).where(eq(users.email, body.email));
+  const valid = await verifyPassword(body.password, user?.passwordHash ?? DUMMY_HASH);
   // Same error for unknown email and wrong password.
-  if (!user || !(await verifyPassword(body.password, user.passwordHash))) {
-    throw new ApiError(401, 'invalid_credentials', 'Wrong email or password');
-  }
+  if (!user || !valid) throw new ApiError(401, 'invalid_credentials', 'Wrong email or password');
   if (user.disabled) throw new ApiError(403, 'account_disabled', 'This account is disabled');
-  await startSession(c, user.id);
+  if (!(await startSession(c, user.id, user.passwordHash))) throw new ApiError(401, 'invalid_credentials', 'Wrong email or password');
   return c.json({ user: { id: user.id, email: user.email, name: user.name, role: user.role } });
 });
 
-authRoutes.post('/auth/logout', async (c) => {
+authRoutes.post('/auth/logout', requireSameOrigin, async (c) => {
   await endSession(c);
+  return c.json({ ok: true });
+});
+
+/** Signs out every other session; API tokens stay valid (they are revoked on the tokens page). */
+authRoutes.post('/auth/password', requireAuth({ sessionOnly: true }), rateLimit('password', 5, 15 * 60_000, (c) => c.get('user').id), async (c) => {
+  const body = await readJson(c, z.object({ current: z.string().max(200), next: password }));
+  const user = c.get('user');
+  if (!(await verifyPassword(body.current, user.passwordHash))) throw new ApiError(403, 'wrong_password', 'Your current password is not correct');
+  const passwordHash = await hashPassword(body.next);
+  const keep = sessionId(c)!;
+  await db.transaction(async (tx) => {
+    await tx.update(users).set({ passwordHash }).where(eq(users.id, user.id));
+    await tx.delete(sessions).where(and(eq(sessions.userId, user.id), ne(sessions.id, keep)));
+  });
   return c.json({ ok: true });
 });
 
@@ -68,7 +130,7 @@ authRoutes.get('/tokens', requireAuth({ sessionOnly: true }), async (c) => {
 });
 
 authRoutes.post('/tokens', requireAuth({ sessionOnly: true }), async (c) => {
-  const { name } = await readJson(c, z.object({ name: z.string().trim().min(1).max(100) }));
+  const { name } = await readJson(c, z.object({ name: storableText().trim().min(1).max(100) }));
   const { token, row } = await createApiToken(c.get('user').id, name);
   return c.json({ token, ...tokenJson(row) }, 201);
 });
@@ -102,7 +164,7 @@ const normalizeUserCode = (s: string) => {
 authRoutes.post('/device/start', rateLimit('device-start', 20), async (c) => {
   const body = await readJson(
     c,
-    z.object({ device_name: z.string().trim().max(100).optional(), client_name: z.string().trim().max(100).optional() }),
+    z.object({ device_name: storableText().trim().max(100).optional(), client_name: storableText().trim().max(100).optional() }),
   );
   const deviceCode = randomToken();
   const code = userCode();
@@ -142,12 +204,16 @@ async function pendingDevice(code: string) {
   return row;
 }
 
-authRoutes.get('/device/:code', requireAuth({ sessionOnly: true }), async (c) => {
+// Per user: guessing another device's code needs an account, and new accounts are capped per day.
+const deviceLookupLimit = rateLimit('device-lookup', 30, 60_000, (c) => c.get('user').id);
+const deviceDecideLimit = rateLimit('device-decide', 10, 60_000, (c) => c.get('user').id);
+
+authRoutes.get('/device/:code', requireAuth({ sessionOnly: true }), deviceLookupLimit, async (c) => {
   const row = await pendingDevice(c.req.param('code'));
   return c.json({ user_code: row.userCode, device_name: row.deviceName, expires_at: iso(row.expiresAt) });
 });
 
-authRoutes.post('/device/approve', requireAuth({ sessionOnly: true }), async (c) => {
+authRoutes.post('/device/approve', requireAuth({ sessionOnly: true }), deviceDecideLimit, async (c) => {
   const { user_code } = await readJson(c, z.object({ user_code: z.string().max(20) }));
   const row = await pendingDevice(user_code);
   const user = c.get('user');
@@ -165,7 +231,7 @@ authRoutes.post('/device/approve', requireAuth({ sessionOnly: true }), async (c)
   return c.json({ ok: true, device_name: row.deviceName });
 });
 
-authRoutes.post('/device/deny', requireAuth({ sessionOnly: true }), async (c) => {
+authRoutes.post('/device/deny', requireAuth({ sessionOnly: true }), deviceDecideLimit, async (c) => {
   const { user_code } = await readJson(c, z.object({ user_code: z.string().max(20) }));
   const row = await pendingDevice(user_code);
   await db.delete(deviceCodes).where(eq(deviceCodes.id, row.id));

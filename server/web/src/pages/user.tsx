@@ -1,7 +1,7 @@
-import { useState } from 'react';
+import { useState, type FormEvent } from 'react';
 import { api, date, mins, num, price, usd, type Me } from '../api';
-import { navigate } from '../router';
-import { BarChart, Card, ErrorText, Icon, Loading, Meter, Modal, Page, Stat, StatStrip, useAsync } from '../ui';
+import { Link, navigate } from '../router';
+import { BarChart, Card, ErrorText, Icon, Loading, Meter, Modal, Page, SecretCopy, Stat, StatStrip, useAsync } from '../ui';
 
 const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
@@ -56,7 +56,7 @@ export function Overview({ me }: { me: Me }) {
                   <div>
                     <dt>Overage</dt>
                     <dd>
-                      {u.overage_minutes} min ({usd(u.cost_usd)})
+                      {num(u.overage_minutes)} of {num(me.limits.max_overage_minutes)} min ({usd(u.cost_usd)})
                     </dd>
                   </div>
                 )}
@@ -162,7 +162,9 @@ export function Billing({ me }: { me: Me }) {
                 </li>
                 <li>
                   <Icon name="check" size={16} />
-                  {p.overagePerMinUsd ? `Then $${p.overagePerMinUsd.toFixed(2)} per extra minute` : 'Hard limit, no surprise bills'}
+                  {p.overagePerMinUsd && b.max_overage_minutes > 0
+                    ? `Then $${p.overagePerMinUsd.toFixed(2)} per extra minute, up to ${num(b.max_overage_minutes)} extra minutes`
+                    : 'Hard limit, no surprise bills'}
                 </li>
                 <li>
                   <Icon name="check" size={16} />
@@ -268,13 +270,7 @@ export function Tokens() {
       {created && (
         <Modal title="Your new token" onClose={() => setCreated(null)}>
           <p className="muted">Copy it now. It will not be shown again.</p>
-          <div className="row">
-            <code className="secret">{created}</code>
-            <button onClick={() => navigator.clipboard.writeText(created)}>
-              <Icon name="copy" size={16} />
-              Copy
-            </button>
-          </div>
+          <SecretCopy value={created} noun="token" />
         </Modal>
       )}
     </Page>
@@ -337,7 +333,54 @@ export function Settings({ me, onSaved }: { me: Me; onSaved: () => void }) {
           </div>
         </div>
       </Card>
+      <ChangePassword />
     </Page>
+  );
+}
+
+function ChangePassword() {
+  const [form, setForm] = useState({ current: '', next: '' });
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    setMsg(null);
+    try {
+      await api('/api/auth/password', { json: form });
+      setForm({ current: '', next: '' });
+      setMsg('Password changed');
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Card title="Change password" className="narrow">
+      <form className="form" onSubmit={submit}>
+        <label>
+          Current password
+          <input type="password" required autoComplete="current-password" value={form.current} onChange={(e) => setForm({ ...form, current: e.target.value })} />
+        </label>
+        <label>
+          New password
+          <input type="password" required minLength={8} autoComplete="new-password" placeholder="At least 8 characters" value={form.next} onChange={(e) => setForm({ ...form, next: e.target.value })} />
+        </label>
+        <p className="muted small">
+          Other browsers are signed out. Desktop apps and API tokens stay signed in; revoke them under <Link href="/tokens">Devices &amp; tokens</Link>.
+        </p>
+        <ErrorText error={error} />
+        <div className="row">
+          <button className="primary" disabled={busy}>
+            Change password
+          </button>
+          {msg && <span className="muted">{msg}</span>}
+        </div>
+      </form>
+    </Card>
   );
 }
 

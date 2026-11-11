@@ -15,7 +15,7 @@
 # Installs:
 #   macOS  /Applications/OpsTrellis.app (~/Applications if /Applications isn't writable)
 #   Linux  ~/.local/share/opstrellis/OpsTrellis.AppImage, plus an app-menu entry
-#   both   ~/.local/bin/opstrellis, the command-line launcher (`opstrellis --version`)
+#   both   ~/.local/bin/opstrellis, the command-line launcher (`opstrellis --version`, `opstrellis mcp`)
 
 set -euo pipefail
 

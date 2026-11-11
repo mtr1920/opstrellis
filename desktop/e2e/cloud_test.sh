@@ -8,7 +8,7 @@ WAV=/tmp/probe/sherpa-onnx-moonshine-tiny-en-int8/test_wavs/0.wav
 export DATABASE_URL=${DATABASE_URL:-postgres://postgres:postgres@localhost:5432/opstrellis_e2e}
 psql "${DATABASE_URL%/*}/postgres" -qc "DROP DATABASE IF EXISTS opstrellis_e2e WITH (FORCE)" -c "CREATE DATABASE opstrellis_e2e" >/dev/null
 (cd "$SERVER" && npm run -s db:migrate >/dev/null)
-(cd "$SERVER" && PORT=8787 PUBLIC_URL=http://localhost:8787 MASTER_KEY=e2e-master-key LOCAL_MODEL_DIR=models exec node dist/index.js >/tmp/server-e2e.log 2>&1) &
+(cd "$SERVER" && PORT=8787 PUBLIC_URL=http://localhost:8787 MASTER_KEY=e2e-master-key-for-the-test-run-only LOCAL_MODEL_DIR=models exec node dist/index.js >/tmp/server-e2e.log 2>&1) &
 SRV=$!
 trap 'kill $SRV 2>/dev/null || true' EXIT
 for _ in $(seq 1 50); do curl -sf localhost:8787/api/catalog >/dev/null && break; sleep 0.2; done

@@ -1,7 +1,8 @@
 //! Global shortcuts with press/release events (hold = push-to-talk, tap = hands-free). Single-key
 //! shortcuts on macOS (Fn, Right ⌥, …) are handled by `fnkey` instead (hold = push-to-talk,
 //! double-tap = hands-free).
-//! Esc is grabbed only while recording so it keeps working everywhere else.
+//! Esc is grabbed only while recording, and Enter and Esc only while a rewrite waits for review,
+//! so they keep working everywhere else.
 
 use crate::fnkey;
 use crate::pipeline::Mode;
@@ -9,6 +10,7 @@ use crate::App;
 use anyhow::{anyhow, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::Manager;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
 
@@ -20,6 +22,16 @@ pub enum Action {
     Cancel,
     /// `FALLBACK`: each press starts or finishes a hands-free dictation.
     Fallback,
+    /// Enter / Esc while a command's rewrite waits for review in the pill.
+    ReviewInsert,
+    ReviewDiscard,
+}
+
+impl Action {
+    /// Grabbed only for a moment (`set_cancel_key`), not part of the configured shortcuts.
+    fn transient(self) -> bool {
+        matches!(self, Action::Cancel | Action::ReviewInsert | Action::ReviewDiscard)
+    }
 }
 
 /// Always registered for dictation, so there is a way to dictate even when the configured
@@ -56,8 +68,9 @@ pub fn register(app: &Arc<App>, startup: bool) -> Result<()> {
         return Ok(());
     }
     let gs = app.handle.global_shortcut();
-    // Esc, grabbed while a dictation runs, stays as it is.
-    let (cancel, previous): (Vec<_>, Vec<_>) = std::mem::take(&mut *app.shortcuts.lock().unwrap()).into_iter().partition(|(_, a)| *a == Action::Cancel);
+    // A copy: the temporary keys (`sync_transient_keys`) stay listed throughout, so a grab made
+    // meanwhile is never lost from the list (it could then never be released).
+    let previous: Vec<(Shortcut, Action)> = app.shortcuts.lock().unwrap().iter().filter(|(_, a)| !a.transient()).copied().collect();
     // unregister_multiple, not unregister_all: the latter holds the plugin's lock across a
     // main-thread round-trip and can deadlock with a key event being dispatched.
     let _ = gs.unregister_multiple(previous.iter().map(|(s, _)| *s).collect::<Vec<_>>());
@@ -72,7 +85,7 @@ pub fn register(app: &Arc<App>, startup: bool) -> Result<()> {
             }
             let mut kept = previous;
             add_fallback(gs, &mut kept);
-            *app.shortcuts.lock().unwrap() = kept.into_iter().chain(cancel).collect();
+            with_configured(&mut app.shortcuts.lock().unwrap(), kept);
             if startup {
                 fnkey::set(app, binding);
             }
@@ -81,8 +94,7 @@ pub fn register(app: &Arc<App>, startup: bool) -> Result<()> {
         registered.push((*sc, *action));
     }
     add_fallback(gs, &mut registered);
-    registered.extend(cancel);
-    *app.shortcuts.lock().unwrap() = registered;
+    with_configured(&mut app.shortcuts.lock().unwrap(), registered);
     *app.hotkey_error.lock().unwrap() = None;
     if !fnkey::set(app, binding) {
         // Not fatal: Fn starts working by itself once the permission is granted (and then clears
@@ -99,6 +111,12 @@ pub fn register(app: &Arc<App>, startup: bool) -> Result<()> {
         app.report_error(&msg);
     }
     Ok(())
+}
+
+/// Replaces the configured shortcuts in the list, keeping the temporary keys as they are.
+fn with_configured(list: &mut Vec<(Shortcut, Action)>, configured: Vec<(Shortcut, Action)>) {
+    list.retain(|(_, a)| a.transient());
+    list.extend(configured);
 }
 
 /// Registers `FALLBACK` unless `list` has it already, or a configured shortcut uses the same
@@ -137,7 +155,7 @@ pub fn suspend(app: &Arc<App>) {
         return;
     }
     fnkey::set_recording(true);
-    let list: Vec<Shortcut> = app.shortcuts.lock().unwrap().iter().filter(|(_, a)| *a != Action::Cancel).map(|(s, _)| *s).collect();
+    let list: Vec<Shortcut> = app.shortcuts.lock().unwrap().iter().filter(|(_, a)| !a.transient()).map(|(s, _)| *s).collect();
     let _ = app.handle.global_shortcut().unregister_multiple(list);
 }
 
@@ -155,29 +173,140 @@ pub fn resume(app: &Arc<App>) {
     }
 }
 
-/// Grabs Esc while recording. Runs on its own thread: (un)registering from inside a shortcut
-/// callback deadlocks the X11 hotkey thread. It re-reads the recording state when it runs, so
-/// out-of-order calls still converge to the right state.
-/// Grabs Esc while recording. Runs on its own thread because (un)registering waits for the main
-/// thread, which may be inside a shortcut callback. It re-reads the recording state when it runs,
-/// so out-of-order calls still converge. The shortcut list lock is never held while registering
-/// (the shortcut handler on the main thread needs it).
+/// Grabs Esc while recording, and Enter and Esc while a rewrite waits for review. Runs on its own
+/// thread: (un)registering waits for the main thread, which may be inside a shortcut callback (and
+/// doing it from inside a callback deadlocks the X11 hotkey thread). `sync_transient_keys`
+/// re-reads the state when it runs, so out-of-order calls still converge.
 pub fn set_cancel_key(app: &Arc<App>, _on: bool) {
-    static SERIAL: Mutex<()> = Mutex::new(());
     let app = app.clone();
     std::thread::spawn(move || {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let esc: Shortcut = "Escape".parse().expect("valid");
-        let gs = app.handle.global_shortcut();
-        let on = app.is_recording();
-        let has = app.shortcuts.lock().unwrap().iter().any(|(_, a)| *a == Action::Cancel);
-        if on && !has && gs.register(esc).is_ok() {
-            app.shortcuts.lock().unwrap().push((esc, Action::Cancel));
-        } else if !on && has {
-            app.shortcuts.lock().unwrap().retain(|(_, a)| *a != Action::Cancel);
-            let _ = gs.unregister(esc);
-        }
+        sync_transient_keys(&app);
     });
+}
+
+/// The keys grabbed for a state: a review takes Esc over from a recording.
+fn transient_keys(recording: bool, reviewing: bool) -> &'static [(&'static str, Action)] {
+    if reviewing {
+        &[("Enter", Action::ReviewInsert), ("Escape", Action::ReviewDiscard)]
+    } else if recording {
+        &[("Escape", Action::Cancel)]
+    } else {
+        &[]
+    }
+}
+
+/// Every key `transient_keys` can ask for.
+const TRANSIENT: [&str; 2] = ["Enter", "Escape"];
+
+/// What `sync_transient_keys` changes.
+#[derive(Debug, Default, PartialEq)]
+struct Plan {
+    /// Ungrabbed, listed or not: a grab that somehow went missing from the list is released too.
+    release: Vec<Shortcut>,
+    /// Grabbed already: only what the key does changes (Esc from a recording to a review).
+    retag: Vec<(Shortcut, Action)>,
+    grab: Vec<(Shortcut, Action)>,
+    /// A wanted key is also a configured shortcut (a hand-edited setting): that one is left alone.
+    blocked: bool,
+}
+
+/// `held`: the key that ended a review or a recording and is still down (`hold`): kept grabbed.
+fn plan(list: &[(Shortcut, Action)], wanted: &[(Shortcut, Action)], held: Option<u32>) -> Plan {
+    let configured = |id: u32| list.iter().any(|(s, a)| !a.transient() && s.id() == id);
+    let mut p = Plan::default();
+    for sc in TRANSIENT.iter().map(|k| k.parse::<Shortcut>().expect("valid")) {
+        if !wanted.iter().any(|(w, _)| w.id() == sc.id()) && held != Some(sc.id()) && !configured(sc.id()) {
+            p.release.push(sc);
+        }
+    }
+    for (sc, action) in wanted {
+        if configured(sc.id()) {
+            p.blocked = true;
+        } else if let Some((_, a)) = list.iter().find(|(s, a)| a.transient() && s.id() == sc.id()) {
+            if a != action {
+                p.retag.push((*sc, *action));
+            }
+        } else {
+            p.grab.push((*sc, *action));
+        }
+    }
+    p
+}
+
+/// Grabs exactly the keys of the current state (`transient_keys`), plus a held one (`hold`); true
+/// if all the wanted ones are grabbed. Blocks until done: never call it on the main thread. The
+/// shortcut list lock is never held while registering (the shortcut handler on the main thread
+/// needs it).
+pub fn sync_transient_keys(app: &Arc<App>) -> bool {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let gs = app.handle.global_shortcut();
+    let wanted: Vec<(Shortcut, Action)> =
+        transient_keys(app.is_recording(), app.is_reviewing()).iter().map(|(k, a)| (k.parse().expect("valid"), *a)).collect();
+    let list = app.shortcuts.lock().unwrap().clone();
+    let p = plan(&list, &wanted, held_key());
+    for sc in &p.release {
+        app.shortcuts.lock().unwrap().retain(|(s, a)| !(a.transient() && s.id() == sc.id()));
+        let _ = gs.unregister(*sc);
+    }
+    for (sc, action) in &p.retag {
+        for entry in app.shortcuts.lock().unwrap().iter_mut().filter(|(s, a)| a.transient() && s.id() == sc.id()) {
+            entry.1 = *action;
+        }
+    }
+    let mut all = !p.blocked;
+    for (sc, action) in &p.grab {
+        // Listed before it is grabbed, so the grab can never exist without its entry.
+        app.shortcuts.lock().unwrap().push((*sc, *action));
+        // It may be our own grab, lost from the list: release it and grab it again.
+        if gs.register(*sc).is_err() {
+            let _ = gs.unregister(*sc);
+            if gs.register(*sc).is_err() {
+                app.shortcuts.lock().unwrap().retain(|(s, a)| !(a.transient() && s.id() == sc.id()));
+                all = false;
+            }
+        }
+    }
+    all
+}
+
+/// A temporary key that ended a review or a recording stays grabbed until it is let go: released
+/// while still down, its auto-repeat would reach the app below (Enter sending a chat draft). On
+/// X11 the key's press also grabs the whole keyboard until its release, so a paste must wait for
+/// it (`wait_held_released`). At most `HOLD_MAX`, in case a release is never reported.
+static HELD: Mutex<Option<(u32, Instant)>> = Mutex::new(None);
+const HOLD_MAX: Duration = Duration::from_secs(2);
+
+fn held_key() -> Option<u32> {
+    HELD.lock().unwrap_or_else(|e| e.into_inner()).filter(|(_, until)| Instant::now() < *until).map(|(id, _)| id)
+}
+
+fn hold(app: &Arc<App>, id: u32) {
+    if held_key() == Some(id) {
+        return;
+    }
+    *HELD.lock().unwrap_or_else(|e| e.into_inner()) = Some((id, Instant::now() + HOLD_MAX));
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(HOLD_MAX);
+        set_cancel_key(&app, false);
+    });
+}
+
+fn release_held(app: &Arc<App>, id: u32) {
+    let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    if held.is_some_and(|(h, _)| h == id) {
+        *held = None;
+        drop(held);
+        set_cancel_key(app, false);
+    }
+}
+
+/// Blocks until the key that ended a review is let go (at most `HOLD_MAX`). Not on the main thread.
+pub fn wait_held_released() {
+    while held_key().is_some() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 pub fn handle(handle: &tauri::AppHandle, shortcut: &Shortcut, event: ShortcutEvent) {
@@ -186,6 +315,10 @@ pub fn handle(handle: &tauri::AppHandle, shortcut: &Shortcut, event: ShortcutEve
     let action = app.shortcuts.lock().unwrap().iter().find(|(s, _)| s.id() == shortcut.id()).map(|(_, a)| *a);
     log::debug!("shortcut {shortcut} {:?} -> {action:?}", event.state());
     let Some(action) = action else { return };
+    // Before acting: the action releases the temporary keys, and this one must stay grabbed.
+    if action.transient() && event.state() == ShortcutState::Pressed {
+        hold(&app, shortcut.id());
+    }
     // Shortcut callbacks run on the event loop; never block it.
     match (action, event.state()) {
         (Action::Dictate, ShortcutState::Pressed) => app.on_press(Mode::Dictate),
@@ -193,6 +326,13 @@ pub fn handle(handle: &tauri::AppHandle, shortcut: &Shortcut, event: ShortcutEve
         (Action::Dictate | Action::Command, ShortcutState::Released) => app.on_release(),
         (Action::Cancel, ShortcutState::Pressed) => app.cancel(),
         (Action::Fallback, ShortcutState::Pressed) => app.toggle(Mode::Dictate),
+        (Action::ReviewInsert, ShortcutState::Pressed) => {
+            app.decide_review(true);
+        }
+        (Action::ReviewDiscard, ShortcutState::Pressed) => {
+            app.decide_review(false);
+        }
+        (Action::Cancel | Action::ReviewInsert | Action::ReviewDiscard, ShortcutState::Released) => release_held(&app, shortcut.id()),
         (Action::PasteLast, ShortcutState::Pressed) => {
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = app.paste_last().await {
@@ -227,5 +367,56 @@ mod tests {
         for k in ["Fn", "RightCommand", "RightOption", "RightControl", "RightShift"] {
             assert!(parse(k).is_err(), "{k}");
         }
+    }
+
+    #[test]
+    fn transient_keys_follow_the_state() {
+        assert!(transient_keys(false, false).is_empty());
+        assert_eq!(transient_keys(true, false), &[("Escape", Action::Cancel)]);
+        assert_eq!(transient_keys(false, true), &[("Enter", Action::ReviewInsert), ("Escape", Action::ReviewDiscard)]);
+        assert_eq!(transient_keys(true, true), transient_keys(false, true), "a review owns Esc");
+        for (k, a) in transient_keys(false, true) {
+            assert!(parse(k).is_ok() && a.transient(), "{k}");
+        }
+        assert!(!Action::Dictate.transient() && !Action::Fallback.transient() && !Action::PasteLast.transient());
+    }
+
+    fn sc(k: &str) -> Shortcut {
+        parse(k).unwrap()
+    }
+
+    #[test]
+    fn configuring_shortcuts_keeps_temporary_keys() {
+        // Enter was grabbed for a review while `register` was registering the new configuration.
+        let mut list = vec![(sc("Ctrl+Shift+Space"), Action::Dictate), (sc("Escape"), Action::ReviewDiscard), (sc("Ctrl+Alt+V"), Action::PasteLast)];
+        list.push((sc("Enter"), Action::ReviewInsert));
+        with_configured(&mut list, vec![(sc("Ctrl+Alt+D"), Action::Dictate), (sc("Ctrl+Shift+Space"), Action::Fallback)]);
+        assert_eq!(list, vec![
+            (sc("Escape"), Action::ReviewDiscard), (sc("Enter"), Action::ReviewInsert),
+            (sc("Ctrl+Alt+D"), Action::Dictate), (sc("Ctrl+Shift+Space"), Action::Fallback),
+        ]);
+    }
+
+    #[test]
+    fn sync_plan() {
+        let configured = vec![(sc("Ctrl+Shift+Space"), Action::Dictate)];
+        let want = |recording, reviewing| transient_keys(recording, reviewing).iter().map(|(k, a)| (sc(k), *a)).collect::<Vec<_>>();
+        // Nothing wanted: both keys are released even when unlisted, which heals a lost grab.
+        let p = plan(&configured, &[], None);
+        assert_eq!((p.release, p.grab.len(), p.retag.len(), p.blocked), (vec![sc("Enter"), sc("Escape")], 0, 0, false));
+        // A review starts during a recording: Esc changes what it does, Enter is grabbed.
+        let recording = [configured.clone(), want(true, false)].concat();
+        let p = plan(&recording, &want(false, true), None);
+        assert_eq!((p.release, p.retag, p.grab), (vec![], vec![(sc("Escape"), Action::ReviewDiscard)], vec![(sc("Enter"), Action::ReviewInsert)]));
+        // Enter ended the review and is still down: it stays grabbed, Esc goes.
+        let reviewing = [configured.clone(), want(false, true)].concat();
+        let p = plan(&reviewing, &[], Some(sc("Enter").id()));
+        assert_eq!(p.release, vec![sc("Escape")]);
+        // Already as wanted: nothing to do.
+        assert_eq!(plan(&reviewing, &want(false, true), None), Plan { release: vec![], ..Default::default() });
+        // A hand-edited setting made Esc a configured shortcut: never taken or released.
+        let odd = vec![(sc("Escape"), Action::PasteLast)];
+        let p = plan(&odd, &want(true, false), None);
+        assert_eq!((p.release, p.grab.len(), p.blocked), (vec![sc("Enter")], 0, true));
     }
 }

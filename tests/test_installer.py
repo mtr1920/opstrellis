@@ -314,6 +314,18 @@ with open(sys.argv[2]+'.plist','rb') as f: print(plistlib.load(f)['CFBundleShort
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(r.stdout.startswith('opstrellis '), r.stdout)
 
+    def test_launcher_connects_subcommands_to_the_binary(self):
+        # `opstrellis mcp` speaks over stdin/stdout, so the launcher must exec the binary itself.
+        for mac in (False, True):
+            with self.subTest(mac=mac):
+                if mac: self.mac()
+                self.run_install()
+                executable(self.installed(), '#!/bin/sh\nprintf "args:%s\\n" "$*"\ncat\n')
+                executable(self.bin / 'open', '#!/bin/sh\necho opened\n')
+                for args in (['mcp'], ['history', '--search', 'a b']):
+                    r = subprocess.run([str(self.home / '.local/bin/opstrellis')] + args, input='{"id":1}\n', env=self.env, text=True, capture_output=True)
+                    self.assertEqual((r.returncode, r.stdout), (0, 'args:' + ' '.join(args) + '\n{"id":1}\n'), r.stderr)
+
     def test_no_modify_path(self):
         self.run_install(OPSTRELLIS_NO_MODIFY_PATH='1')
         self.assertFalse((self.home / '.bashrc').exists())

@@ -202,6 +202,7 @@ button:disabled { cursor: default; }
 .status-dot::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
 .status.recording .status-dot::before { background: var(--rec); animation: pulse 1.2s ease-in-out infinite; }
 .status.processing .status-dot::before { background: var(--muted); animation: pulse 0.8s ease-in-out infinite; }
+.status.review .status-dot::before { background: var(--muted); }
 .status-label { flex: none; margin-right: auto; white-space: nowrap; }
 .status kbd { display: block; min-width: 0; padding: 0 4px; overflow: hidden; text-overflow: ellipsis; line-height: 18px; background: transparent; }
 .status .icon { color: var(--muted); }
@@ -492,6 +493,9 @@ kbd {
 .row-title { font-weight: 500; }
 .row-title .meta { font-weight: 400; }
 .row-desc { margin-top: 2px; color: var(--muted); font-size: 12px; line-height: 16px; }
+.row-desc.ws-path { overflow-wrap: anywhere; }
+.row-desc.error { color: var(--danger-text); }
+.card.drop-over { outline: 2px solid var(--accent); outline-offset: -1px; }
 .row-control { flex: none; display: flex; align-items: center; gap: 8px; }
 .row-control select { width: 220px; }
 .row.column { flex-direction: column; align-items: stretch; gap: 8px; }
@@ -776,7 +780,7 @@ input.note-title:focus, textarea.note-body:focus { outline: none; }
 
 /* ============================== Dictation overlay pill ============================== */
 html.overlay-window, html.overlay-window body { background: transparent; }
-.overlay-wrap { height: 100vh; display: grid; place-items: center; }
+.overlay-wrap { height: 100vh; display: grid; place-items: end center; padding-bottom: 10px; box-sizing: border-box; }
 .pill {
   display: flex;
   align-items: center;
@@ -799,9 +803,14 @@ html.overlay-window, html.overlay-window body { background: transparent; }
 }
 .pill:not(:has(.pill-actions)) { padding-right: 16px; }
 .pill.hands-free { width: 280px; }
+/* A workspace chip gets its own room, so the live text keeps its width. */
+.pill.recording.has-ws { width: 304px; }
+.pill.recording.hands-free.has-ws { width: 344px; }
 .pill.processing { width: 200px; }
 .pill.outcome { width: auto; min-width: 160px; max-width: 344px; }
 .pill.outcome.ok { min-width: 0; }
+.pill.recording.answering { width: 320px; }
+.pill.recording.answering.hands-free, .pill.recording.answering.has-ws { width: 344px; }
 .pill-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--rec); animation: pulse 1.2s ease-in-out infinite; }
 .pill-dot.hollow { background: transparent; box-shadow: inset 0 0 0 1px var(--pill-dim); animation: none; }
 .pill-dot.still { animation: none; }
@@ -809,6 +818,7 @@ html.overlay-window, html.overlay-window body { background: transparent; }
 .pill-icon { flex: none; display: grid; color: var(--pill-fg); }
 .pill-time { margin-left: 4px; color: var(--pill-dim); }
 .pill-badge { flex: none; height: 16px; padding: 0 4px; border-radius: 4px; background: var(--pill-soft); font-size: 11px; line-height: 16px; font-weight: 600; letter-spacing: 0.04em; }
+.pill-ws { flex: none; max-width: 56px; height: 16px; padding: 0 4px; border-radius: var(--radius-xs); background: var(--pill-soft); color: var(--pill-dim); font-size: 11px; line-height: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pill-lock { flex: none; display: flex; align-items: center; color: var(--pill-dim); }
 .lattice { flex: 1; min-width: 0; display: flex; align-items: center; justify-content: center; gap: 2px; height: 20px; overflow: hidden; }
 .lattice.mini, .lattice.sweep { flex: none; }
@@ -823,6 +833,59 @@ html.overlay-window, html.overlay-window body { background: transparent; }
 .pill-btn { display: grid; place-items: center; width: 24px; height: 24px; padding: 0; border: 0; border-radius: 50%; background: var(--pill-soft); color: var(--pill-fg); }
 .pill-btn:hover:not(:disabled) { background: var(--pill-line); }
 .pill-btn:disabled { opacity: 0.4; }
+/* Command-mode review card: the pill grown upward, in a 436 × 280 window, bottom edge where the pill's is. */
+.overlay-wrap.review { place-items: end center; padding-bottom: 10px; box-sizing: border-box; }
+.review-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 420px;
+  max-height: 260px;
+  padding: 12px 16px;
+  border: 1px solid var(--pill-line);
+  border-radius: var(--radius);
+  background: var(--pill-bg);
+  -webkit-backdrop-filter: var(--blur);
+  backdrop-filter: var(--blur);
+  color: var(--pill-fg);
+  font-size: 12px;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  animation: fade 0.14s ease-out;
+}
+.review-head { flex: none; display: flex; align-items: center; gap: 8px; }
+.review-title { flex: 1; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.review-count { flex: none; color: var(--pill-dim); }
+.review-text {
+  min-height: 0;
+  font-size: 13px;
+  line-height: 20px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 9;
+  line-clamp: 9;
+}
+.review-keys { flex: none; display: flex; gap: 16px; color: var(--pill-dim); }
+.question-card .review-title { flex: none; }
+.question-outcome { flex: 1; min-width: 0; text-align: right; color: var(--pill-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.question-outcome.error, .question-outcome.warn { color: var(--pill-fg); }
+/* 300 characters of any script fit in 10 lines of the card's 388px; the clamp only guards the card's size. */
+.question-text {
+  min-height: 0;
+  font-size: 12px;
+  line-height: 18px;
+  overflow-wrap: anywhere;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 10;
+  line-clamp: 10;
+}
+.review-keys kbd { margin-right: 4px; border-color: var(--pill-line); background: var(--pill-soft); color: var(--pill-fg); }
 
 /* ============================== Motion ============================== */
 @keyframes pulse { 50% { opacity: 0.4; } }
@@ -896,3 +959,9 @@ html.overlay-window, html.overlay-window body { background: transparent; }
 .learned-note { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
 .link { background: none; border: 0; padding: 0; color: var(--accent-text); cursor: pointer; font-size: inherit; }
 .link:hover { text-decoration: underline; text-underline-offset: 2px; }
+
+/* ============================== Backup, updates ============================== */
+.check { display: inline-flex; align-items: center; gap: 8px; min-height: 24px; color: var(--text); cursor: pointer; }
+.check input { margin: 0; accent-color: var(--accent); }
+.code-row { display: flex; align-items: center; gap: 8px; }
+.code-line { flex: 1; min-width: 0; padding: 6px 8px; border-radius: var(--radius-sm); background: var(--surface-2); color: var(--text); overflow-wrap: anywhere; user-select: all; }

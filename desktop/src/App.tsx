@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, errMsg, useEvent, type DictationState, type Permissions, type Settings } from "./api";
+import { api, errMsg, useEvent, type DictationState, type Permissions, type Settings, type UpdateInfo } from "./api";
 import { Icon, Logo, type IconName } from "./icons";
 import { applyTheme, comboText, IS_MAC, isDarkTheme, PageGroup, Tabs, type SetSetting } from "./ui";
 import Home from "./pages/Home";
@@ -102,6 +102,30 @@ export default function App() {
 
   useEvent("dictation-state", setDictation);
   useEvent("dictation-error", (msg) => setToast(msg));
+  // A newer version found by the daily check. It is announced once per version, but only while the
+  // window is showing: otherwise nobody would see the toast, and the version would be used up.
+  const [update, setUpdate] = useState<UpdateInfo | null>(null);
+  useEvent("update-available", setUpdate);
+  useEffect(() => {
+    if (!update) return;
+    const announce = () => {
+      if (document.visibilityState !== "visible") return;
+      document.removeEventListener("visibilitychange", announce);
+      window.removeEventListener("focus", announce);
+      try {
+        if (localStorage.getItem("updateNotified") === update.latest) return;
+        localStorage.setItem("updateNotified", update.latest);
+      } catch {}
+      setToast(`OpsTrellis ${update.latest.replace(/^v/, "")} is available. See Settings → About.`);
+    };
+    announce();
+    document.addEventListener("visibilitychange", announce);
+    window.addEventListener("focus", announce);
+    return () => {
+      document.removeEventListener("visibilitychange", announce);
+      window.removeEventListener("focus", announce);
+    };
+  }, [update]);
   // Changed from the tray: take the backend's copy (edits typed here in the last moment are kept).
   useEvent("settings-changed", (s) => {
     backendVersion.current++;
@@ -162,7 +186,8 @@ export default function App() {
   const props = { settings, set };
   const dark = isDarkTheme(settings.theme);
   const statusLabel = dictation.status === "recording" ? (!dictation.micReady ? "Opening mic…" : dictation.mode === "command" ? "Command…" : "Listening…")
-    : dictation.status === "processing" ? (dictation.stage === "polishing" ? "Polishing…" : "Transcribing…") : "Ready";
+    : dictation.status === "processing" ? (dictation.stage === "polishing" ? "Polishing…" : dictation.stage === "inserting" ? "Inserting…" : "Transcribing…")
+    : dictation.status === "review" ? "Reviewing…" : "Ready";
 
   return (
     <div className="app">
@@ -192,8 +217,9 @@ export default function App() {
             </button>
           </div>
           <button className={"status " + dictation.status}
-            title={dictation.status === "idle" ? "Start dictation" : "Stop dictation"}
-            onClick={() => (dictation.status === "idle" ? api.startDictation() : api.stopDictation()).catch((e) => setToast(errMsg(e)))}>
+            title={dictation.status === "idle" ? "Start dictation" : dictation.status === "review" ? "Discard the rewrite" : "Stop dictation"}
+            onClick={() => (dictation.status === "idle" ? api.startDictation() : dictation.status === "review" ? api.cancelDictation() : api.stopDictation())
+              .catch((e) => setToast(errMsg(e)))}>
             <span className="status-dot" />
             <span className="status-label">{statusLabel}</span>
             {dictation.handsFree && dictation.status === "recording" && <Icon name="lock" size={12} />}
@@ -206,7 +232,7 @@ export default function App() {
           {page === "home" && <Home {...props} onSetup={() => setOnboarding(true)} />}
           {page === "insights" && <Insights />}
           {page === "style" && <Style {...props} />}
-          {page === "settings" && <SettingsPage {...props} saveError={saveError} saveNow={saveNow} />}
+          {page === "settings" && <SettingsPage {...props} saveError={saveError} saveNow={saveNow} update={update} />}
           {page in GROUPS && (
             <PageGroup.Provider value={{
               title: PAGES.find((p) => p.id === page)!.label,

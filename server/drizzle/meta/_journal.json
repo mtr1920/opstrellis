@@ -15,6 +15,27 @@
       "when": 1791976654243,
       "tag": "0001_stripe_event_order",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1794418795739,
+      "tag": "0002_teams",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1794420817270,
+      "tag": "0003_team_safety",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1794428071666,
+      "tag": "0004_library_size",
+      "breakpoints": true
     }
   ]
 }

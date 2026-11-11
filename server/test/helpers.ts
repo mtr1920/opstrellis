@@ -18,11 +18,9 @@ interface Opts {
 
 /** Calls the app in-process. Each call gets a fresh client IP unless one is given (rate limits). */
 export function req(path: string, o: Opts = {}) {
-  const headers: Record<string, string> = { 'x-forwarded-for': o.ip ?? `10.${rnd()}.${rnd()}.${rnd()}`, ...o.headers };
-  if (o.cookie) {
-    headers.cookie = o.cookie;
-    headers.origin ??= ORIGIN;
-  }
+  // Like a browser on the dashboard, every request carries our Origin unless a test overrides it ('' = none).
+  const headers: Record<string, string> = { 'x-forwarded-for': o.ip ?? `10.${rnd()}.${rnd()}.${rnd()}`, origin: ORIGIN, ...o.headers };
+  if (o.cookie) headers.cookie = o.cookie;
   if (o.token) headers.authorization = `Bearer ${o.token}`;
   let body = o.body;
   if (o.json !== undefined) {
@@ -57,7 +55,7 @@ export async function userWithToken(email?: string) {
 }
 
 export async function resetDb() {
-  await sql`truncate users, sessions, api_tokens, device_codes, usage_events, models, provider_keys cascade`;
+  await sql`truncate users, sessions, api_tokens, device_codes, usage_events, models, provider_keys, orgs cascade`;
   await seedCatalog();
 }
 

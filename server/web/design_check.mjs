@@ -25,7 +25,7 @@ const CHROMIUM = process.env.CHROMIUM || '/opt/pw-browsers/chromium_headless_she
 const OUT = process.argv[2] || 'design-check-out';
 mkdirSync(OUT, { recursive: true });
 
-const PAGES = ['/login', '/', '/billing', '/tokens', '/settings', '/device', '/admin', '/admin/users', '/admin/models', '/admin/providers'];
+const PAGES = ['/login', '/', '/billing', '/tokens', '/team', '/settings', '/device', '/admin', '/admin/users', '/admin/models', '/admin/providers'];
 const VIEWPORTS = { d: { width: 1440, height: 900 }, m: { width: 390, height: 844 } };
 const failures = [];
 

@@ -12,7 +12,7 @@ npm test        # builds the dashboard (pretest), then vitest
 | File | Covers |
 |---|---|
 | `test/billing.test.ts` | Included/overage split in integer ms, per-started-minute billing that sums to `ceil(total)`, plan/quota rules, billing periods, streak math |
-| `test/auth.test.ts` | Signup (first user / `ADMIN_EMAILS` admin), login, sessions, logout, CSRF origin check, login rate limit, disabled users, API tokens (create, use, revoke, isolation), device-code flow (pending 428, approve, one-time token, expiry 400, deny) |
+| `test/auth.test.ts` | Signup (first user admin, `ADMIN_EMAIL` startup admin, `ALLOW_SIGNUP`, global and per-IP daily caps), login, sessions, logout, password change, CSRF origin and JSON content-type checks, login rate limits (IP, IPv6 /64, account + IP, account ceiling), disabled users, API tokens (create, use, revoke, isolation), device-code flow (pending 428, approve, one-time token, expiry 400, deny) |
 | `test/usage.test.ts` | `/api/usage` idempotency and validation (text rejected, ≤500), stats (words, WPM, current/longest streak, time zones, app category, per model), catalog, preferences |
 | `test/gateway.test.ts` | `/v1/audio/transcriptions` with the real sherpa-onnx Moonshine model on `test_wavs/0.wav` ("yellow lamps"), response formats, `auto`, fallback (no key → skip; unreachable upstream → error event → local), 502 when all fail, free 402, Pro overage $0.02/min, concurrency under the advisory lock, validation, 25 MB limit, `/v1/models` |
 | `test/adapters.test.ts` | Each upstream adapter against a local fake provider (endpoint, auth header, params, vocabulary hints, response mapping); `/v1/chat/completions` OpenAI proxy and Anthropic translation with token metering |
@@ -92,6 +92,8 @@ Harder audio: 180 clips, 30 each from the Open ASR Leaderboard's AMI, Earnings-2
 LibriSpeech test-other, SPGISpeech and VoxPopuli test sets, on an Apple M3 Pro. The WER here uses the
 benchmark's simple normalizer, so compare rows with each other, not with leaderboard numbers.
 Run it with `OPSTRELLIS_BENCH_CLIPS=<dir with trans.txt and wavs>`.
+
+For how often developer terms come out exactly right, see the reproducible [developer-speech benchmark](BENCHMARK.md).
 
 | Model | WER | Real-time factor | Load |
 |---|---|---|---|

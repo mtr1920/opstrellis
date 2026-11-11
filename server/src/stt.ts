@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { config } from './config.js';
 import { parseWav, wavToMonoFloat } from './lib/audio.js';
+import { ApiError } from './lib/http.js';
 import { serial } from './lib/serial.js';
 import { baseUrl } from './providers.js';
 
@@ -218,17 +219,34 @@ function recognizer(dir: string): Promise<any> {
   return created;
 }
 
+/** Moonshine's memory grows with the square of the clip length, so longer audio is decoded in windows of this size. */
+export const LOCAL_WINDOW_SECONDS = 30;
+/** Local decodes running or waiting across all users; each waiting one holds its upload in memory. */
+export const MAX_LOCAL_JOBS = 4;
+
 async function local(r: SttRequest): Promise<SttResult> {
   const wav = parseWav(r.audio);
   if (!wav) throw new UpstreamError('local: requires WAV audio (16 kHz mono PCM16 recommended)');
   const rec = await recognizer(localModelDir(r.upstreamModel));
   // One decode at a time: each holds the resampled audio and model activations in memory.
-  return serial('local-stt', async () => {
-    const stream = rec.createStream();
-    stream.acceptWaveform({ samples: wavToMonoFloat(wav), sampleRate: wav.sampleRate });
-    const result = await rec.decodeAsync(stream);
-    return { text: String(result.text ?? '').trim(), language: 'en' };
-  });
+  return serial(
+    'local-stt',
+    async () => {
+      const samples = wavToMonoFloat(wav);
+      const size = LOCAL_WINDOW_SECONDS * wav.sampleRate;
+      const parts: string[] = [];
+      // Plain cuts at the window boundary: a word spoken across it may be split or lost.
+      for (let at = 0; at < samples.length; at += size) {
+        const stream = rec.createStream();
+        stream.acceptWaveform({ samples: samples.slice(at, at + size), sampleRate: wav.sampleRate });
+        const text = String((await rec.decodeAsync(stream)).text ?? '').trim();
+        if (text) parts.push(text);
+      }
+      return { text: parts.join(' '), language: 'en' };
+    },
+    MAX_LOCAL_JOBS,
+    () => new ApiError(503, 'local_model_busy', 'The self-hosted model is busy; try again shortly'),
+  );
 }
 
 export const STT_ADAPTERS: Record<string, (r: SttRequest) => Promise<SttResult>> = {

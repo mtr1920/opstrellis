@@ -1,6 +1,6 @@
 //! Google Cloud Speech-to-Text v1 `speech:recognize` (API key auth, synchronous, ≤ 60 s audio).
 
-use super::{check, pcm_bytes, Request, HTTP};
+use super::{check, pcm_bytes, send, Request, HTTP};
 use crate::audio::SAMPLE_RATE;
 use anyhow::Result;
 use base64::Engine;
@@ -23,7 +23,7 @@ pub async fn transcribe(key: &str, model: &str, req: &Request<'_>) -> Result<Str
         "config": config,
         "audio": { "content": base64::engine::general_purpose::STANDARD.encode(pcm_bytes(req.audio)) }
     });
-    let resp = HTTP.post("https://speech.googleapis.com/v1/speech:recognize").header("x-goog-api-key", key).json(&body).send().await?;
+    let resp = send(HTTP.post("https://speech.googleapis.com/v1/speech:recognize").header("x-goog-api-key", key).json(&body)).await?;
     let v: Value = check("google", resp).await?.json().await?;
     Ok(parse(&v))
 }

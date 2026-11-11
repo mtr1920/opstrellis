@@ -15,6 +15,8 @@ export default function Home({ settings, onSetup }: SettingsProps & { onSetup: (
   const [shown, setShown] = useState(PAGE_SIZE);
   const [original, setOriginal] = useState<number | null>(null);
   const [polishing, setPolishing] = useState<number | null>(null);
+  const [retrying, setRetrying] = useState<number | null>(null);
+  const [retryError, setRetryError] = useState<{ id: number; message: string } | null>(null);
   const request = useRef(0);
 
   const refresh = () => {
@@ -46,7 +48,7 @@ export default function Home({ settings, onSetup }: SettingsProps & { onSetup: (
       const result = await api.updateHistory(editing.id, editing.text);
       setItems((xs) => xs.map((x) => (x.id === editing.id ? { ...x, text: editing.text.trim() } : x)));
       setEditing(null);
-      setLearned(result.added.length || result.pending.length ? result : null);
+      setLearned(result.added.length || result.pending.length || result.full ? result : null);
     } catch (e) { setError(errMsg(e)); }
   }
   async function undoLearned() {
@@ -62,6 +64,16 @@ export default function Home({ settings, onSetup }: SettingsProps & { onSetup: (
       setItems((xs) => xs.map((x) => (x.id === item.id ? { ...x, text } : x)));
     } catch (e) { setError(errMsg(e)); }
     setPolishing(null);
+  }
+  /** Transcribes the kept recording again; the new text is also put on the clipboard. */
+  async function retranscribe(item: HistoryItem) {
+    setRetrying(item.id);
+    setRetryError(null);
+    try {
+      const text = await api.retranscribeHistory(item.id);
+      setItems((xs) => xs.map((x) => (x.id === item.id ? { ...x, status: "ok", error: null, text } : x)));
+    } catch (e) { setRetryError({ id: item.id, message: errMsg(e) }); }
+    setRetrying(null);
   }
   async function remove(id: number) {
     await api.deleteHistory(id).catch((e) => setError(errMsg(e)));
@@ -106,7 +118,8 @@ export default function Home({ settings, onSetup }: SettingsProps & { onSetup: (
           <div className="note learned-note">
             <span>
               {learned.added.length > 0 && <>Added to your dictionary: {learned.added.map(fmtFix).join(", ")}. </>}
-              {learned.pending.length > 0 && <>Make the same fix once more to learn {learned.pending.map(fmtFix).join(", ")}.</>}
+              {learned.pending.length > 0 && <>Make the same fix once more to learn {learned.pending.map(fmtFix).join(", ")}. </>}
+              {learned.full && <>The dictionary is full, so a fix wasn't learned. Delete some entries to make room.</>}
             </span>
             {learned.added.length > 0 && <button className="link" onClick={undoLearned}>Undo</button>}
             <button className="link" onClick={() => setLearned(null)}>Dismiss</button>
@@ -137,13 +150,14 @@ export default function Home({ settings, onSetup }: SettingsProps & { onSetup: (
                   <div className="li-main">
                     <div className={"li-title" + (item.status !== "ok" ? " dim" : "")}>
                       {item.status === "ok" ? item.text || <i>Empty</i>
-                        : item.status === "cancelled" ? "Cancelled" : item.error || "Failed"}
+                        : item.status === "cancelled" ? item.text || "Cancelled" : item.error || "Failed"}
                     </div>
                     {original === item.id && <div className="li-original" aria-label="Original transcript">{item.rawText}</div>}
                     <div className="li-meta">
                       {[item.appName,
                         item.mode === "command" ? "Command" : null,
                         item.status === "error" ? "Error" : null,
+                        item.status === "cancelled" && item.text ? "Discarded" : null,
                         item.status === "ok" && item.latencyMs > 0 ? `${item.latencyMs} ms` : null,
                       ].filter(Boolean).join(" · ")}
                       {item.status === "ok" && item.mode === "dictate" && item.rawText && item.rawText !== item.text && (
@@ -152,7 +166,11 @@ export default function Home({ settings, onSetup }: SettingsProps & { onSetup: (
                           {original === item.id ? "Hide original" : "Show original"}
                         </button>
                       )}
+                      {item.status === "error" && item.hasAudio && (retrying === item.id
+                        ? <span className="meta-link" role="status">Retrying…</span>
+                        : <button className="link meta-link" onClick={() => retranscribe(item)} disabled={retrying !== null}>Retry</button>)}
                     </div>
+                    {retryError?.id === item.id && <div className="li-meta"><span className="error">{retryError.message}</span></div>}
                   </div>
                   )}
                   <div className="li-actions">
@@ -167,7 +185,13 @@ export default function Home({ settings, onSetup }: SettingsProps & { onSetup: (
                         {polishing === item.id ? <span className="spinner" aria-hidden="true" /> : <Icon name="sparkle" />}
                       </button>
                     )}
-                    {item.status === "ok" && item.text && (
+                    {item.status === "ok" && item.hasAudio && editing?.id !== item.id && (
+                      <button className="icon-btn" onClick={() => retranscribe(item)} disabled={retrying !== null}
+                        title="Transcribe again" aria-label="Transcribe again">
+                        {retrying === item.id ? <span className="spinner" aria-hidden="true" /> : <Icon name="mic" />}
+                      </button>
+                    )}
+                    {(item.status === "ok" || item.status === "cancelled") && item.text && (
                       <button className="icon-btn" onClick={() => copy(item)} title="Copy" aria-label="Copy">
                         <Icon name={copied === item.id ? "check" : "copy"} />
                       </button>

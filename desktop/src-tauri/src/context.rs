@@ -166,7 +166,7 @@ fn user_category(hay: &str, overrides: &HashMap<String, String>) -> Option<&'sta
 }
 
 /// `needle` occurs in `hay` as a whole word ("word" in "Microsoft Word", not in "password").
-fn contains_word(hay: &str, needle: &str) -> bool {
+pub(crate) fn contains_word(hay: &str, needle: &str) -> bool {
     let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric());
     hay.match_indices(needle).any(|(i, m)| !word(hay[..i].chars().next_back()) && !word(hay[i + m.len()..].chars().next()))
 }

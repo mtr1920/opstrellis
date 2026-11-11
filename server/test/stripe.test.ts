@@ -1,6 +1,7 @@
 import { eq } from 'drizzle-orm';
 import Stripe from 'stripe';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { config } from '../src/config.js';
 import { users } from '../src/db/schema.js';
 import { db, req, resetDb, signup } from './helpers.js';
 
@@ -27,8 +28,11 @@ describe('Stripe webhook', () => {
 
   it('walks a user through checkout -> renewal -> payment failure -> cancellation', async () => {
     const { user, cookie } = await signup();
-    const start = Math.floor(Date.UTC(2026, 9, 3) / 1000);
-    const end = Math.floor(Date.UTC(2026, 10, 3) / 1000);
+    // A period around now: one that is already over falls back to the calendar month.
+    const start = Math.floor(Date.now() / 1000) - 10 * 86_400;
+    const end = start + 30 * 86_400;
+    const startIso = new Date(start * 1000).toISOString();
+    const endIso = new Date(end * 1000).toISOString();
 
     // 1. checkout completes -> Pro
     let res = await sendEvent('checkout.session.completed', { id: 'cs_1', object: 'checkout.session', mode: 'subscription', client_reference_id: user.id, customer: 'cus_123', subscription: 'sub_123' });
@@ -39,10 +43,10 @@ describe('Stripe webhook', () => {
     const sub = { id: 'sub_123', object: 'subscription', customer: 'cus_123', status: 'active', metadata: { user_id: user.id }, items: { data: [{ current_period_start: start, current_period_end: end }] } };
     expect((await sendEvent('customer.subscription.updated', sub)).status).toBe(200);
     const u = await userRow(user.id);
-    expect(u.periodStart?.toISOString()).toBe('2026-10-03T00:00:00.000Z');
-    expect(u.periodEnd?.toISOString()).toBe('2026-11-03T00:00:00.000Z');
+    expect(u.periodStart?.toISOString()).toBe(startIso);
+    expect(u.periodEnd?.toISOString()).toBe(endIso);
     const me = await (await req('/api/me', { cookie })).json();
-    expect(me.period).toEqual({ start: '2026-10-03T00:00:00.000Z', end: '2026-11-03T00:00:00.000Z' });
+    expect(me.period).toEqual({ start: startIso, end: endIso });
     expect(me.usage.included_minutes).toBe(600);
 
     // 3. payment fails -> past_due (still Pro, but overage is no longer allowed)
@@ -91,6 +95,118 @@ describe('Stripe webhook', () => {
     expect(await userRow(user.id)).toMatchObject({ plan: 'free', stripeCustomerId: 'cus_9' });
     expect((await sendEvent('invoice.payment_failed', { id: 'in_x', object: 'invoice', customer: 'cus_unknown' })).status).toBe(200);
     expect((await sendEvent('customer.created', { id: 'cus_z', object: 'customer' })).status).toBe(200);
+  });
+});
+
+describe('which subscriptions are Pro', () => {
+  const saved = { ...config.stripe };
+  afterEach(() => {
+    Object.assign(config.stripe, saved);
+  });
+  const sub = (userId: string, o: Record<string, unknown> = {}) => ({
+    id: `sub_${Math.random().toString(36).slice(2)}`,
+    object: 'subscription',
+    customer: `cus_${userId}`,
+    status: 'active',
+    metadata: { user_id: userId },
+    items: { data: [{ price: { id: 'price_pro' } }] },
+    ...o,
+  });
+  const t0 = Math.floor(Date.now() / 1000);
+
+  it('treats unpaid as Free but keeps it linked, so checkout sends the user to the portal; past_due keeps Pro', async () => {
+    const { user, cookie } = await signup();
+    const s = sub(user.id);
+    await sendEvent('customer.subscription.created', s, SECRET, t0);
+    expect((await userRow(user.id)).plan).toBe('pro');
+    await sendEvent('customer.subscription.updated', { ...s, status: 'past_due' }, SECRET, t0 + 1);
+    expect(await userRow(user.id)).toMatchObject({ plan: 'pro', planStatus: 'past_due' });
+    await sendEvent('customer.subscription.updated', { ...s, status: 'unpaid' }, SECRET, t0 + 2);
+    expect(await userRow(user.id)).toMatchObject({ plan: 'free', planStatus: 'unpaid', stripeSubscriptionId: s.id });
+
+    Object.assign(config.stripe, { secretKey: 'sk_test_unused', pricePro: 'price_pro' });
+    const res = await req('/api/billing/checkout', { cookie, method: 'POST' });
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe('already_subscribed');
+    // paying the unpaid invoice revives the same subscription
+    await sendEvent('customer.subscription.updated', s, SECRET, t0 + 3);
+    expect(await userRow(user.id)).toMatchObject({ plan: 'pro', planStatus: 'active', stripeSubscriptionId: s.id });
+  });
+
+  it('with STRIPE_PRICE_PRO set, only a subscription to that price is Pro, and checkout alone grants nothing', async () => {
+    config.stripe.pricePro = 'price_pro';
+    const { user } = await signup();
+    await sendEvent('checkout.session.completed', { id: 'cs_p', object: 'checkout.session', mode: 'subscription', client_reference_id: user.id, customer: `cus_${user.id}`, subscription: 'sub_other' }, SECRET, t0);
+    expect((await userRow(user.id)).plan).toBe('free');
+    await sendEvent('customer.subscription.created', sub(user.id, { id: 'sub_other', items: { data: [{ price: { id: 'price_cheap' } }] } }), SECRET, t0 + 1);
+    expect((await userRow(user.id)).plan).toBe('free');
+    const pro = sub(user.id, { items: { data: [{ price: { id: 'price_overage' } }, { price: { id: 'price_pro' } }] } });
+    await sendEvent('customer.subscription.created', pro, SECRET, t0 + 2);
+    expect(await userRow(user.id)).toMatchObject({ plan: 'pro', stripeSubscriptionId: pro.id });
+    // switching the tracked subscription to another price in the portal drops Pro
+    await sendEvent('customer.subscription.updated', { ...pro, items: { data: [{ price: { id: 'price_cheap' } }] } }, SECRET, t0 + 3);
+    expect((await userRow(user.id)).plan).toBe('free');
+  });
+
+  it('with STRIPE_PRICE_PRO set, a second subscription to another product leaves a Pro subscriber alone', async () => {
+    config.stripe.pricePro = 'price_pro';
+    const { user } = await signup();
+    const pro = sub(user.id);
+    await sendEvent('customer.subscription.created', pro, SECRET, t0);
+    const other = sub(user.id, { items: { data: [{ price: { id: 'price_cheap' } }] } });
+    for (const [type, status] of [['customer.subscription.created', 'active'], ['customer.subscription.updated', 'unpaid'], ['customer.subscription.deleted', 'canceled']] as const) {
+      await sendEvent(type, { ...other, status }, SECRET, t0 + 5);
+      expect(await userRow(user.id), type).toMatchObject({ plan: 'pro', planStatus: 'active', stripeSubscriptionId: pro.id });
+    }
+  });
+
+  it('a same-second payment failure does not hide the unpaid event that follows it', async () => {
+    const { user } = await signup();
+    const s = sub(user.id);
+    await sendEvent('customer.subscription.created', s, SECRET, t0);
+    await sendEvent('invoice.payment_failed', { id: 'in_w1', object: 'invoice', customer: s.customer }, SECRET, t0 + 1);
+    expect(await userRow(user.id)).toMatchObject({ plan: 'pro', planStatus: 'past_due' });
+    await sendEvent('customer.subscription.updated', { ...s, status: 'unpaid' }, SECRET, t0 + 1);
+    expect(await userRow(user.id)).toMatchObject({ plan: 'free', planStatus: 'unpaid' });
+  });
+
+  it('a second Pro subscription replaces the tracked one only once it is active', async () => {
+    const { user } = await signup();
+    const a = sub(user.id);
+    await sendEvent('customer.subscription.created', a, SECRET, t0);
+    // a second checkout tab whose payment failed
+    const b = sub(user.id);
+    await sendEvent('customer.subscription.created', { ...b, status: 'incomplete' }, SECRET, t0 + 1);
+    await sendEvent('customer.subscription.updated', { ...b, status: 'incomplete_expired' }, SECRET, t0 + 2);
+    expect(await userRow(user.id)).toMatchObject({ plan: 'pro', planStatus: 'active', stripeSubscriptionId: a.id });
+    // one that is paid takes over
+    const c = sub(user.id);
+    await sendEvent('customer.subscription.created', c, SECRET, t0 + 3);
+    expect(await userRow(user.id)).toMatchObject({ plan: 'pro', stripeSubscriptionId: c.id });
+  });
+
+  it('a same-second event cannot downgrade a Pro state of the same subscription', async () => {
+    const { user } = await signup();
+    const s = sub(user.id);
+    // "updated: active" processed before the "created: incomplete" Stripe sent in the same second
+    await sendEvent('customer.subscription.updated', s, SECRET, t0);
+    await sendEvent('customer.subscription.created', { ...s, status: 'incomplete' }, SECRET, t0);
+    expect(await userRow(user.id)).toMatchObject({ plan: 'pro', planStatus: 'active', stripeSubscriptionId: s.id });
+    // a strictly newer downgrade still applies, and a same-second deletion always does
+    await sendEvent('customer.subscription.updated', { ...s, status: 'incomplete_expired' }, SECRET, t0 + 1);
+    expect((await userRow(user.id)).plan).toBe('free');
+    const again = sub(user.id);
+    await sendEvent('customer.subscription.created', again, SECRET, t0 + 2);
+    await sendEvent('customer.subscription.deleted', { ...again, status: 'canceled' }, SECRET, t0 + 2);
+    expect(await userRow(user.id)).toMatchObject({ plan: 'free', planStatus: 'canceled' });
+  });
+});
+
+describe('webhook body limit', () => {
+  it('answers 413 (not 500) for a body over 1 MB', async () => {
+    const res = await req('/api/stripe/webhook', { method: 'POST', body: 'x'.repeat(1024 * 1024 + 1), headers: { 'stripe-signature': 't=1,v1=abc', 'content-type': 'application/json' } });
+    expect(res.status).toBe(413);
+    expect((await res.json()).error).toBe('payload_too_large');
   });
 });
 

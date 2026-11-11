@@ -13,7 +13,6 @@ export default defineConfig({
       PUBLIC_URL: 'http://localhost:8787',
       TRUST_PROXY: '1',
       MASTER_KEY: 'test-master-key',
-      ADMIN_EMAILS: 'boss@example.com', // no longer used; auth.test.ts checks it grants nothing
       STRIPE_WEBHOOK_SECRET: 'whsec_test_secret',
       STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY ?? '',
       LOCAL_MODEL_DIR: 'models',

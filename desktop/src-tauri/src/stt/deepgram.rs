@@ -2,7 +2,7 @@
 //! https://developers.deepgram.com/reference/speech-to-text-api/listen
 
 use super::ws::{self, Message, Ws};
-use super::{check, pcm_bytes, PartialFn, Request, HTTP};
+use super::{check, pcm_bytes, send, PartialFn, Request, HTTP};
 use crate::audio::{to_wav, SAMPLE_RATE};
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -36,14 +36,14 @@ fn params(model: &str, language: Option<&str>, vocabulary: &[String], streaming:
 }
 
 pub async fn transcribe(key: &str, model: &str, req: &Request<'_>) -> Result<String> {
-    let resp = HTTP
-        .post("https://api.deepgram.com/v1/listen")
-        .query(&params(model, req.language, req.vocabulary, false))
-        .header("Authorization", format!("Token {key}"))
-        .header("Content-Type", "audio/wav")
-        .body(to_wav(req.audio))
-        .send()
-        .await?;
+    let resp = send(
+        HTTP.post("https://api.deepgram.com/v1/listen")
+            .query(&params(model, req.language, req.vocabulary, false))
+            .header("Authorization", format!("Token {key}"))
+            .header("Content-Type", "audio/wav")
+            .body(to_wav(req.audio)),
+    )
+    .await?;
     let v: Value = check("deepgram", resp).await?.json().await?;
     parse_batch(&v)
 }
