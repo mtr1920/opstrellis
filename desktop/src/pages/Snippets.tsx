@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, errMsg, type Snippet } from "../api";
+import { api, errMsg, useEvent, type Snippet } from "../api";
 import { Icon } from "../icons";
 import { Empty, Modal, Page, Search, useSearch } from "../ui";
 
@@ -18,6 +18,7 @@ export default function Snippets() {
 
   const load = () => api.listSnippets().then(setSnippets, (e) => setError(errMsg(e)));
   useEffect(() => void load(), []);
+  useEvent("team-updated", () => void load());
 
   async function save() {
     if (!draft || !draft.trigger.trim() || !draft.expansion.trim()) return;
@@ -49,13 +50,16 @@ export default function Snippets() {
           {filtered.map((s) => (
             <div key={s.id} className="list-row">
               <div className="li-main">
-                <div className="li-title">“{s.trigger}”</div>
+                <div className="li-title">“{s.trigger}”{s.team && <span className="tag" title="From your team's library. Edit it in the team dashboard.">Team</span>}</div>
+                {s.unused && <div className="li-meta">{s.unused === "shadowed" ? "Yours is used" : "Not used: over the team snippet limit"}</div>}
                 <div className="li-meta clamp">{s.expansion}</div>
               </div>
-              <div className="li-actions">
-                <button className="icon-btn" title="Edit" aria-label="Edit" onClick={() => setDraft({ id: s.id, trigger: s.trigger, expansion: s.expansion })}><Icon name="edit" /></button>
-                <button className="icon-btn" title="Delete" aria-label="Delete" onClick={() => remove(s.id)}><Icon name="trash" /></button>
-              </div>
+              {!s.team && (
+                <div className="li-actions">
+                  <button className="icon-btn" title="Edit" aria-label="Edit" onClick={() => setDraft({ id: s.id, trigger: s.trigger, expansion: s.expansion })}><Icon name="edit" /></button>
+                  <button className="icon-btn" title="Delete" aria-label="Delete" onClick={() => remove(s.id)}><Icon name="trash" /></button>
+                </div>
+              )}
             </div>
           ))}
           {filtered.length === 0 && <div className="list-empty">No snippets match “{query}”.</div>}

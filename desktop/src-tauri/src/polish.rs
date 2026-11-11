@@ -76,7 +76,7 @@ pub async fn download(models_dir: &Path, progress: impl Fn(u64, u64)) -> Result<
     let tmp = dest.with_extension("gguf.part");
     crate::stt::local::fetch("huggingface", URL, &tmp, SIZE_MB, progress).await?;
     let file = tmp.clone();
-    let checked = tokio::task::spawn_blocking(move || verify(&file)).await.map_err(|e| anyhow!("{e}")).and_then(|r| r);
+    let checked = tokio::task::spawn_blocking(move || verify(&file, SHA256)).await.map_err(|e| anyhow!("{e}")).and_then(|r| r);
     if let Err(e) = checked {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
@@ -86,12 +86,15 @@ pub async fn download(models_dir: &Path, progress: impl Fn(u64, u64)) -> Result<
 }
 
 /// Anything but the exact pinned file (truncated, an error page, a changed upload) is rejected.
-fn verify(file: &Path) -> Result<()> {
+pub(crate) fn verify(file: &Path, sha256: &str) -> Result<()> {
+    if sha256_hex(file)? == sha256 { Ok(()) } else { Err(anyhow!("the downloaded model doesn't match the expected checksum; try again")) }
+}
+
+pub(crate) fn sha256_hex(file: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     std::io::copy(&mut std::fs::File::open(file)?, &mut hasher)?;
-    let digest: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    if digest == SHA256 { Ok(()) } else { Err(anyhow!("the downloaded model doesn't match the expected checksum; try again")) }
+    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 pub fn delete(models_dir: &Path) -> Result<()> {
@@ -297,10 +300,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let bad = dir.join("bad.gguf");
         std::fs::write(&bad, b"<!doctype html>Not found").unwrap();
-        assert!(verify(&bad).is_err(), "an error page saved as the model");
+        assert!(verify(&bad, SHA256).is_err(), "an error page saved as the model");
         std::fs::write(&bad, b"GGUF").unwrap();
-        assert!(verify(&bad).is_err(), "a GGUF header alone isn't the pinned model");
-        assert!(verify(&dir.join("missing")).is_err());
+        assert!(verify(&bad, SHA256).is_err(), "a GGUF header alone isn't the pinned model");
+        assert!(verify(&dir.join("missing"), SHA256).is_err());
         assert!(!is_installed(&dir));
         std::fs::create_dir_all(dir.join("polish")).unwrap();
         std::fs::write(path(&dir).with_extension("gguf.part"), b"partial").unwrap();

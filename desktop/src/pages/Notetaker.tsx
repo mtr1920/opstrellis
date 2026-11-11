@@ -110,7 +110,7 @@ export default function Notetaker({ settings }: { settings: Settings }) {
             {templates.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
           </select>
         </Row>
-        <Row title="Also record" desc="Mix in a second input to capture other participants, e.g. a “Monitor of …” device or BlackHole.">
+        <Row title="Also record" desc="Record a second input to capture other participants, e.g. a “Monitor of …” device or BlackHole. The transcript labels it “Them” and your microphone “Me”.">
           <select value={second} onChange={(e) => setSecond(e.target.value)} disabled={active}>
             <option value="">Microphone only</option>
             {devices.filter((d) => d !== settings.microphone).map((d) => <option key={d} value={d}>{d}</option>)}

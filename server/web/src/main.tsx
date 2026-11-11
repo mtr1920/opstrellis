@@ -4,6 +4,7 @@ import { createRoot } from 'react-dom/client';
 import { api, HttpError, type Me } from './api';
 import { AdminModels, AdminOverview, AdminProviders, AdminUsers } from './pages/admin';
 import { AuthPage } from './pages/auth';
+import { Team } from './pages/team';
 import { Billing, Device, Overview, Settings, Tokens } from './pages/user';
 import { Link, navigate, useLocation } from './router';
 import { Icon, Logo, Page, type IconName } from './ui';
@@ -14,6 +15,7 @@ const USER_NAV: readonly NavItem[] = [
   ['/', 'Overview', 'overview'],
   ['/billing', 'Plan & billing', 'billing'],
   ['/tokens', 'Devices & tokens', 'devices'],
+  ['/team', 'Team', 'team'],
   ['/settings', 'Settings', 'settings'],
 ];
 const ADMIN_NAV: readonly NavItem[] = [
@@ -67,6 +69,8 @@ function App() {
         return <Billing me={me} />;
       case '/tokens':
         return <Tokens />;
+      case '/team':
+        return <Team meId={me.user.id} />;
       case '/settings':
         return <Settings me={me} onSaved={refresh} />;
       case '/device':

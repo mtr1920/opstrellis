@@ -10,7 +10,7 @@ and no way to pick a theme.
 1. **No gradients, glows or decorative imagery.** `grep -riE "gradient" src/ --include=*.css --include=*.tsx`
    returns nothing. Glass means the window's native vibrancy plus a translucent toolbar, never blobs or
    orbs. Empty states are a short sentence plus one button.
-2. **One accent colour, used sparingly.** It appears only on the primary button, the focus ring, links,
+2. **One accent colour, used sparingly.** It appears only on the primary button, the focus ring (also outlining a drop target), links,
    toggles when on, the selected sidebar icon and selection tint, the chart fill, and the recording dot
    (`--rec`, red). Every other surface is neutral.
 3. **Native window and floating glass sidebar.**
@@ -155,8 +155,8 @@ Smooth, never showy. Everything uses `--ease`; nothing bounces.
   - Groups:
     - App: General (Appearance first)
     - Dictation: Shortcuts, Voice input, Text insertion, Permissions
-    - Speech & AI: Transcription, Local models, AI polish
-    - Account & privacy: Privacy, Account, About (with Logs)
+    - Speech & AI: Transcription, Local models, AI polish, Workspaces
+    - Account & privacy: Privacy, Agents, Backup, Account, About (with updates and Logs)
 - **Keyboard.**
   - ⌘1–⌘5 (Ctrl on Linux) open the sidebar pages, ⌘, opens Settings, and ⌘F focuses the page's search.
     They match physical keys, so they work on any layout, and they do nothing while a dialog is open.
@@ -172,6 +172,18 @@ Smooth, never showy. Everything uses `--ease`; nothing bounces.
     | Hands-free | 280 |
     | Transcribing | 200 |
     | Outcome | fits text, ≤ 344 |
+    | Recording with a workspace chip | + 64 (304 / 344) |
+    | Answering an agent's question | 320 (hands-free or with a chip: 344) |
+
+  - An agent's question uses the review card's window and look: "AGENT · Agent asks", the whole
+    question wrapped at 12/18 (up to 300 characters, 10 lines), the hint below; an outcome meanwhile
+    sits right-aligned in the card's head. Every overlay state is anchored 10px above the window's bottom.
 
   - The lattice is 2px dots on a 4px pitch. Only their opacity changes.
   - No colour other than the red dot.
+  - Workspace chip (recording in a workspace): the folder name in a quiet 16px chip like the CMD badge
+    (`--pill-soft` fill, `--pill-dim` text, 11px, at most 56px wide with an ellipsis). The pill grows by 64px
+    for it, so the live text keeps its room.
+  - Review card (command mode): the pill grown upward into a 420px card, up to 260px high, radius 12, with the same
+    glass and hairline. A CMD badge, "Replace selection?" and the length; the rewrite (13/20, at most 9 lines);
+    then "↵ Insert" and "Esc Discard" with kbd caps in pill colours.

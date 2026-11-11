@@ -2,7 +2,7 @@
 //! https://www.assemblyai.com/docs/api-reference/streaming-api/streaming-api
 
 use super::ws::{self, Message, Ws};
-use super::{check, pcm_bytes, PartialFn, Request, HTTP};
+use super::{check, pcm_bytes, send, PartialFn, Request, HTTP};
 use crate::audio::{to_wav, SAMPLE_RATE};
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -14,7 +14,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 const API: &str = "https://api.assemblyai.com/v2";
 
 pub async fn transcribe(key: &str, model: &str, req: &Request<'_>) -> Result<String> {
-    let up: Value = check("assemblyai", HTTP.post(format!("{API}/upload")).header("authorization", key).body(to_wav(req.audio)).send().await?)
+    let up: Value = check("assemblyai", send(HTTP.post(format!("{API}/upload")).header("authorization", key).body(to_wav(req.audio))).await?)
         .await?
         .json()
         .await?;
@@ -31,14 +31,14 @@ pub async fn transcribe(key: &str, model: &str, req: &Request<'_>) -> Result<Str
     if !req.vocabulary.is_empty() {
         body["keyterms_prompt"] = json!(req.vocabulary.iter().take(100).collect::<Vec<_>>());
     }
-    let t: Value = check("assemblyai", HTTP.post(format!("{API}/transcript")).header("authorization", key).json(&body).send().await?)
+    let t: Value = check("assemblyai", send(HTTP.post(format!("{API}/transcript")).header("authorization", key).json(&body)).await?)
         .await?
         .json()
         .await?;
     let id = t["id"].as_str().ok_or_else(|| anyhow!("assemblyai: no transcript id"))?;
     for _ in 0..240 {
         tokio::time::sleep(Duration::from_millis(250)).await;
-        let t: Value = check("assemblyai", HTTP.get(format!("{API}/transcript/{id}")).header("authorization", key).send().await?)
+        let t: Value = check("assemblyai", send(HTTP.get(format!("{API}/transcript/{id}")).header("authorization", key)).await?)
             .await?
             .json()
             .await?;

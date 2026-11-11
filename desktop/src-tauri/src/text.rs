@@ -31,6 +31,13 @@ pub struct Options<'a> {
     pub preserve_formatting: bool,
     /// Reads local text only when a matched snippet actually expands `{clipboard}`.
     pub clipboard: Option<&'a (dyn Fn() -> Option<String> + Sync)>,
+    /// The workspace in use (technical contexts and AI prompts only), for the two passes below.
+    pub workspace: Option<&'a crate::workspace::Index>,
+    /// The workspace's names said as words are written as code ("user session store" ->
+    /// UserSessionStore). Opt-in, editors and terminals only: it can rewrite ordinary phrases.
+    pub workspace_names: bool,
+    /// AI prompts: "at sign main.rs" or "@main.rs" becomes "@" and the workspace file's path.
+    pub mentions: bool,
 }
 
 impl Options<'_> {
@@ -131,6 +138,17 @@ pub fn process(raw: &str, o: &Options) -> Processed {
     };
     if o.voice_commands {
         text = spoken_symbols(&text, o.code, &owned);
+    }
+    // Before the term packs, so a longer repository name wins over a pack alias inside it.
+    if let Some(w) = o.workspace {
+        if o.workspace_names {
+            let (fixed, n) = w.fix(&text, &owned(&text));
+            text = fixed;
+            fixes += n;
+        }
+        if o.mentions {
+            text = w.mentions(&text);
+        }
     }
     if o.terms {
         let (fixed, n) = crate::terms::fix(&text, o.technical, &owned(&text));
@@ -233,6 +251,11 @@ fn output(e: &DictEntry) -> &str {
 /// Applies only the user's dictionary (meeting transcripts, spoken commands).
 pub fn apply_dictionary(text: &str, dictionary: &[DictEntry]) -> String {
     Dictionary::new(dictionary, true).map_or_else(|| text.to_string(), |d| d.apply(text, None).0)
+}
+
+/// Whether these entries build into one matcher (it fails past a size limit, and then none applies).
+pub fn dictionary_builds(dictionary: &[DictEntry]) -> bool {
+    Dictionary::new(dictionary, true).is_some() || dictionary.iter().all(|e| phrase_pattern(&e.phrase).is_none())
 }
 
 /// "quote hello world end quote" -> "hello world" in double quotes (also "unquote", "close quote").
@@ -614,7 +637,7 @@ mod tests {
     use super::*;
 
     fn opts<'a>(d: &'a [DictEntry], s: &'a [Snippet], tone: &'a str) -> Options<'a> {
-        Options { remove_fillers: true, voice_commands: true, dictionary: d, snippets: s, tone, english: true, technical: false, code: false, backticks: false, terms: false, preserve_formatting: false, clipboard: None }
+        Options { remove_fillers: true, voice_commands: true, dictionary: d, snippets: s, tone, english: true, technical: false, code: false, backticks: false, terms: false, preserve_formatting: false, clipboard: None, workspace: None, workspace_names: false, mentions: false }
     }
 
     #[test]
@@ -639,6 +662,28 @@ mod tests {
         let o = Options { terms: true, technical: true, ..opts(&[], &s, "none") };
         assert_eq!(process("type script", &o).text, "our TypeScript project instructions");
         assert_eq!(process("see type script here", &o).text, "see our TypeScript project instructions here");
+    }
+
+    #[test]
+    fn workspace_names_and_file_mentions() {
+        let v = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let scan = crate::workspace::Scan { files: v(&["desktop/src/pipeline.rs"]), identifiers: v(&["UserSessionStore", "PostgresPoolManager"]), sources: Vec::new() };
+        let ws = crate::workspace::Index::new(scan, crate::terms::SIZE_LIMIT);
+        let t = |s: &str, o: &Options| process(s, o).text;
+        let off = Options { workspace: Some(&ws), terms: true, mentions: true, ..code_opts(&[]) };
+        assert_eq!(t("fix the user session store in at sign pipeline dot rs", &off), "fix the user session store in @desktop/src/pipeline.rs", "names: off by default");
+        let o = Options { workspace: Some(&ws), workspace_names: true, terms: true, ..code_opts(&[]) };
+        assert_eq!(t("fix the user session store, then at sign pipeline dot rs", &o), "fix the UserSessionStore, then at sign pipeline.rs");
+        let prompt = Options { mentions: true, backticks: true, ..o };
+        assert_eq!(t("fix the user session store in at sign pipeline dot rs", &prompt), "fix the UserSessionStore in @desktop/src/pipeline.rs");
+        assert_eq!(t("look at pipeline dot rs", &prompt), "look at `pipeline.rs`", "only an explicit mention");
+        assert_eq!(t("tune the postgres pool manager", &o), "tune the PostgresPoolManager", "before the term packs");
+        assert_eq!(t("user session store", &Options { workspace: None, ..o }), "user session store");
+        // The user's dictionary and snippets win.
+        let d = [dict("user session store", Some("USS"))];
+        assert_eq!(t("open the user session store", &Options { dictionary: &d, ..o }), "open the USS");
+        let s = [Snippet { id: None, trigger: "user session store".into(), expansion: "the session cache".into(), created_at: None }];
+        assert_eq!(t("open the user session store", &Options { snippets: &s, ..o }), "open the the session cache");
     }
 
     #[test]
@@ -821,6 +866,57 @@ mod tests {
             std::hint::black_box(process(&text, &o));
         }
         println!("300 entries, {} words: {:?} per dictation", word_count(&text), t.elapsed() / 20);
+    }
+
+    /// Team library entries as the database hands them to dictation: the user's own always win.
+    #[test]
+    fn team_entries_never_beat_the_users_own() {
+        let dir = std::env::temp_dir().join(format!("opstrellis-text-team-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Db::open(&dir.join("t.db")).unwrap();
+        let own = |p: &str, r: Option<&str>| db.upsert_dictionary(dict(p, r)).unwrap();
+        own("post gress", Some("Postgres"));
+        own("kube", Some("Kubernetes"));
+        db.upsert_snippet(Snippet { id: None, trigger: "my sig".into(), expansion: "Mine".into(), created_at: None }).unwrap();
+        db.upsert_snippet(Snippet { id: None, trigger: "paste context".into(), expansion: "Context: {clipboard}".into(), created_at: None }).unwrap();
+        let word = |id: &str, p: &str, r: &str| serde_json::json!({ "id": id, "kind": "dictionary", "data": { "phrase": p, "replacement": r } });
+        let snip = |id: &str, t: &str, e: &str| serde_json::json!({ "id": id, "kind": "snippet", "data": { "trigger": t, "expansion": e } });
+        let page = crate::team::Page {
+            team: Some(crate::team::TeamRef { id: "t".into(), name: "T".into() }),
+            version: 5,
+            entries: vec![word("a", "post-gress", "PostgreSQL DB"), word("b", "Kubernetes", "K8s"), snip("c", "my  sig", "Team"), snip("d", "team intro", "Hi, paste context please")],
+            more: false,
+            reset: false,
+        };
+        crate::team::apply(&db, &crate::team::cursor(&db).unwrap(), &page).unwrap();
+        let (d, s) = (db.list_dictionary().unwrap(), db.list_snippets().unwrap());
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let read = || { reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst); Some("secret".into()) };
+        let o = Options { clipboard: Some(&read), ..opts(&d, &s, "none") };
+        assert_eq!(process("ask post-gress", &o).text, "Ask Postgres", "the same phrase as the matcher compares it");
+        assert_eq!(process("deploy to kube", &o).text, "Deploy to Kubernetes", "a team phrase can't rewrite the user's output");
+        assert_eq!(process("thanks, my sig", &o).text, "Thanks, Mine");
+        assert_eq!(process("so team intro", &o).text, "So Hi, paste context please", "a team expansion never triggers the user's snippet");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Snippets on the dictation path (team ones count, up to `db::TEAM_MAX_SNIPPETS`): cargo test --release snippet_speed -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn snippet_speed() {
+        let text = "Can you send me the deck before the review tomorrow, and add the latest numbers. ".repeat(6);
+        for n in [50, 100, 500, 1000] {
+            let s: Vec<Snippet> = (0..n).map(|i| Snippet { id: None, trigger: format!("trigger phrase {i}"), expansion: format!("expansion {i}"), created_at: None }).collect();
+            let o = opts(&[], &s, "none");
+            let t = std::time::Instant::now();
+            for _ in 0..10 {
+                std::hint::black_box(process(&text, &o));
+                std::hint::black_box(snippet_triggers_in(&text, &s));
+            }
+            println!("{n} snippets: {:?} per dictation (process + snippet_triggers_in)", t.elapsed() / 10);
+        }
     }
 
     #[test]

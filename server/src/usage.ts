@@ -2,6 +2,7 @@
 import { randomUUID } from 'node:crypto';
 import { and, eq, gte, lt, sql } from 'drizzle-orm';
 import { currentPeriod, PLANS, priceUsage, round6 } from './billing.js';
+import { config } from './config.js';
 import { db } from './db/index.js';
 import { usageEvents, users, type Model, type User } from './db/schema.js';
 
@@ -22,7 +23,7 @@ export async function managedSeconds(userId: string, p: Period, tx: Tx | typeof 
 
 export async function llmTokens(userId: string, p: Period): Promise<number> {
   const [r] = await db
-    .select({ t: sql<number>`coalesce(sum(${usageEvents.inputTokens} + ${usageEvents.outputTokens}), 0)::float8` })
+    .select({ t: sql<number>`coalesce(sum(${usageEvents.inputTokens}::int8 + ${usageEvents.outputTokens}), 0)::float8` })
     .from(usageEvents)
     .where(and(inPeriod(userId, p), eq(usageEvents.source, 'gateway'), eq(usageEvents.kind, 'llm')));
   return r?.t ?? 0;
@@ -91,9 +92,9 @@ export async function meSummary(user: User) {
   const [agg] = await db
     .select({
       managed: sql<number>`coalesce(sum(${usageEvents.audioSeconds}) filter (where ${usageEvents.source} = 'gateway' and ${usageEvents.kind} = 'stt' and ${usageEvents.status} = 'ok'), 0)::float8`,
-      words: sql<number>`coalesce(sum(${usageEvents.words}), 0)::int`,
+      words: sql<number>`coalesce(sum(${usageEvents.words}), 0)::float8`,
       billed: sql<number>`coalesce(sum(${usageEvents.billedUsd}), 0)::float8`,
-      overage: sql<number>`coalesce(sum(${usageEvents.overageMinutes}), 0)::int`,
+      overage: sql<number>`coalesce(sum(${usageEvents.overageMinutes}), 0)::float8`,
     })
     .from(usageEvents)
     .where(inPeriod(user.id, period));
@@ -111,7 +112,12 @@ export async function meSummary(user: User) {
       words: agg?.words ?? 0,
       cost_usd: round6(agg?.billed ?? 0),
     },
-    limits: { included_minutes: plan.includedMinutes, overage_per_min_usd: plan.overagePerMinUsd, llm_tokens: plan.llmTokensPerPeriod },
+    limits: {
+      included_minutes: plan.includedMinutes,
+      overage_per_min_usd: plan.overagePerMinUsd,
+      max_overage_minutes: plan.overagePerMinUsd > 0 ? config.maxOverageMinutes : 0,
+      llm_tokens: plan.llmTokensPerPeriod,
+    },
     preferred_model: user.preferredStt,
     preferred_llm: user.preferredLlm,
   };
@@ -157,9 +163,9 @@ export async function userStats(userId: string, tz = 'UTC', days = 90) {
   const categorized = and(mine, eq(usageEvents.status, 'ok'), eq(usageEvents.kind, 'stt'), eq(usageEvents.source, 'client'));
   const [totals] = await db
     .select({
-      words: sql<number>`coalesce(sum(${usageEvents.words}), 0)::int`,
+      words: sql<number>`coalesce(sum(${usageEvents.words}), 0)::float8`,
       seconds: sql<number>`coalesce(sum(${usageEvents.audioSeconds}) filter (where ${usageEvents.kind} = 'stt'), 0)::float8`,
-      sttWords: sql<number>`coalesce(sum(${usageEvents.words}) filter (where ${usageEvents.kind} = 'stt' and ${usageEvents.audioSeconds} > 0), 0)::int`,
+      sttWords: sql<number>`coalesce(sum(${usageEvents.words}) filter (where ${usageEvents.kind} = 'stt' and ${usageEvents.audioSeconds} > 0), 0)::float8`,
       dictations: sql<number>`count(*) filter (where ${usageEvents.kind} = 'stt')::int`,
       cost: sql<number>`coalesce(sum(${usageEvents.providerCostUsd}), 0)::float8`,
       billed: sql<number>`coalesce(sum(${usageEvents.billedUsd}), 0)::float8`,
@@ -175,14 +181,14 @@ export async function userStats(userId: string, tz = 'UTC', days = 90) {
   );
   const since = new Date(Date.now() - days * 86_400_000);
   const daily = await db
-    .select({ day: sql<string>`${day}`, words: sql<number>`sum(${usageEvents.words})::int`, seconds: sql<number>`sum(${usageEvents.audioSeconds})::float8` })
+    .select({ day: sql<string>`${day}`, words: sql<number>`sum(${usageEvents.words})::float8`, seconds: sql<number>`sum(${usageEvents.audioSeconds})::float8` })
     .from(usageEvents)
     .where(and(ok, gte(usageEvents.createdAt, since)))
     .groupBy(sql`1`) // by position: the tz parameter makes the expression differ textually
     .orderBy(sql`1`);
   const appCat = sql<string>`coalesce(${usageEvents.appCategory}, 'other')`;
   const byApp = await db
-    .select({ app_category: appCat, words: sql<number>`sum(${usageEvents.words})::int`, seconds: sql<number>`sum(${usageEvents.audioSeconds})::float8` })
+    .select({ app_category: appCat, words: sql<number>`sum(${usageEvents.words})::float8`, seconds: sql<number>`sum(${usageEvents.audioSeconds})::float8` })
     .from(usageEvents)
     .where(categorized)
     .groupBy(appCat)
@@ -194,8 +200,8 @@ export async function userStats(userId: string, tz = 'UTC', days = 90) {
       mode: usageEvents.mode,
       events: sql<number>`count(*)::int`,
       seconds: sql<number>`sum(${usageEvents.audioSeconds})::float8`,
-      words: sql<number>`sum(${usageEvents.words})::int`,
-      tokens: sql<number>`sum(${usageEvents.inputTokens} + ${usageEvents.outputTokens})::int`,
+      words: sql<number>`sum(${usageEvents.words})::float8`,
+      tokens: sql<number>`sum(${usageEvents.inputTokens}::int8 + ${usageEvents.outputTokens})::float8`,
       cost_usd: sql<number>`sum(${usageEvents.providerCostUsd})::float8`,
       billed_usd: sql<number>`sum(${usageEvents.billedUsd})::float8`,
     })
@@ -262,7 +268,7 @@ export async function adminStats(now = new Date()) {
       requests: sql<number>`count(*)::int`,
       errors: sql<number>`count(*) filter (where ${usageEvents.status} = 'error')::int`,
       seconds: sql<number>`sum(${usageEvents.audioSeconds})::float8`,
-      tokens: sql<number>`sum(${usageEvents.inputTokens} + ${usageEvents.outputTokens})::int`,
+      tokens: sql<number>`sum(${usageEvents.inputTokens}::int8 + ${usageEvents.outputTokens})::float8`,
       provider_cost_usd: sql<number>`sum(${usageEvents.providerCostUsd})::float8`,
       billed_usd: sql<number>`sum(${usageEvents.billedUsd})::float8`,
       avg_latency_ms: sql<number>`coalesce(avg(${usageEvents.latencyMs}) filter (where ${usageEvents.status} = 'ok'), 0)::int`,

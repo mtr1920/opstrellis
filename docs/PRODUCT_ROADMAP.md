@@ -1,7 +1,9 @@
 # OpsTrellis product roadmap: from dictation to a voice-first work assistant
 
-Status: proposal, nothing here is implemented yet. It's based on a full read of `desktop/`, `server/`
-and `docs/` as of v0.1.1 and on research into competing products.
+Status: written as a proposal against v0.1.1. Since then phases 1–2 and most of phase 3 have been
+built; [TASKS.md](TASKS.md) lists what is done. Still open from this document: signed macOS builds,
+learning from edits made in other apps, CRM/ATS integrations, calendar-aware meetings, Windows and
+mobile. The sections below are kept as written, so they describe the app as it was at v0.1.1.
 
 ## 1. Thesis
 

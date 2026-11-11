@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, errMsg, type Transform } from "../api";
+import { api, errMsg, useEvent, type Transform } from "../api";
 import { Icon } from "../icons";
 import { Keys, Modal, Page, type SettingsProps } from "../ui";
 
@@ -12,6 +12,7 @@ export default function Transforms({ settings, set }: SettingsProps) {
 
   const load = () => api.listTransforms().then(setItems, (e) => setError(errMsg(e)));
   useEffect(() => void load(), []);
+  useEvent("team-updated", () => void load());
 
   async function save() {
     if (!draft || !draft.name.trim() || !draft.prompt.trim()) return;
@@ -45,13 +46,16 @@ export default function Transforms({ settings, set }: SettingsProps) {
         {items.map((t) => (
           <div key={t.id} className="list-row">
             <div className="li-main">
-              <div className="li-title">{t.name}{t.builtin && <span className="tag">Built-in</span>}{t.output === "copy" && <span className="tag">Copies result</span>}</div>
+              <div className="li-title">{t.name}{t.builtin && <span className="tag">Built-in</span>}{t.team && <span className="tag" title="From your team's library. Edit it in the team dashboard. Runs when you say exactly its name in command mode; never an auto action.">Team</span>}{t.output === "copy" && <span className="tag">Copies result</span>}</div>
+              {t.unused && <div className="li-meta">{t.unused === "shadowed" ? "Yours is used" : "Not used: over the team action limit"}</div>}
               <div className="li-meta clamp">{t.prompt}</div>
             </div>
-            <div className="li-actions">
-              <button className="icon-btn" title="Edit" aria-label="Edit" onClick={() => setDraft({ id: t.id, name: t.name, prompt: t.prompt, output: t.output })}><Icon name="edit" /></button>
-              {!t.builtin && <button className="icon-btn" title="Delete" aria-label="Delete" onClick={() => remove(t.id)}><Icon name="trash" /></button>}
-            </div>
+            {!t.team && (
+              <div className="li-actions">
+                <button className="icon-btn" title="Edit" aria-label="Edit" onClick={() => setDraft({ id: t.id, name: t.name, prompt: t.prompt, output: t.output })}><Icon name="edit" /></button>
+                {!t.builtin && <button className="icon-btn" title="Delete" aria-label="Delete" onClick={() => remove(t.id)}><Icon name="trash" /></button>}
+              </div>
+            )}
           </div>
         ))}
         {items.length === 0 && <div className="list-empty">No actions yet.</div>}

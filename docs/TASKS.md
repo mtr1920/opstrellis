@@ -59,3 +59,19 @@
 - [x] Snippet placeholders `{date}` `{weekday}` `{time}` `{clipboard}`
 - [x] Meeting templates (General, Sales call, Interview, 1:1, Standup), follow-up email and CRM note drafts, copy action items
 - [x] Navigation 9 → 6 (Notes and Library tabs), AI setup in Settings → AI with Test, History original/polish again/show more, tray (copy last, AI polish, meeting), onboarding teaches command mode
+
+## Recovery, repo-aware dictation, agents, teams and a security pass
+- [x] Never lose a dictation: a failed recording is kept in memory and retried from History or the tray (in parts of at most 30 s); optional on-disk retention for 24 hours ("failed" or "all"), with interrupted dictations recovered at launch
+- [x] Meetings: "Me / Them" labels when a second input is recorded; auto-stop after 15 minutes without transcribed speech or at 4 hours
+- [x] Review card before a long command-mode rewrite replaces the selection (Enter inserts, Esc discards)
+- [x] Write in another language than the one spoken, per style category (needs a cloud or OpenAI-compatible AI provider)
+- [x] Workspaces: file and identifier names from chosen folders as hints, spoken names written as identifiers, `@file` mentions in AI prompts
+- [x] Term packs: three more built-in packs (off by default) and imported packs with a preview
+- [x] Agent access (off by default): MCP server and CLI over dictations, notes and the dictionary; an agent can ask a question the user answers by voice
+- [x] Team library: teams, invite codes and a shared library on OpsTrellis Cloud; read-only sync on the desktop
+- [x] Backup, restore and dictionary list import; opt-in update check
+- [x] Security review of the desktop app, installer, CI and server, with fixes
+- [x] Developer-speech benchmark ([BENCHMARK.md](BENCHMARK.md))
+
+Not run in this round: the Linux end-to-end suites (`desktop/e2e`). The review card, voice answers,
+the tray items and folder drag-and-drop were not exercised in the running app.

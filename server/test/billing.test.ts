@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { currentPeriod, priceUsage, quotaError, splitUsage } from '../src/billing.js';
+import { currentPeriod, priceUsage, quotaError, quotaMessage, splitUsage } from '../src/billing.js';
 import { streaks } from '../src/usage.js';
 
 const pro = { plan: 'pro' as const, planStatus: 'active', periodStart: null, periodEnd: null };
@@ -63,8 +63,25 @@ describe('priceUsage and quota', () => {
   it('blocks free users once the allowance is used', () => {
     expect(quotaError(free, 14.9 * 60)).toBeNull();
     expect(quotaError(free, 15 * 60)).toBe('quota_exceeded');
-    expect(quotaError(pro, 10_000 * 60)).toBeNull();
+    expect(quotaError(pro, 3000 * 60)).toBeNull();
     expect(quotaError({ ...pro, planStatus: 'past_due' }, 600 * 60)).toBe('quota_exceeded');
+  });
+
+  it('caps Pro overage per period (MAX_OVERAGE_MINUTES, default 3000)', () => {
+    const cap = (600 + 3000) * 60;
+    expect(quotaError(pro, cap - 10, 10)).toBeNull();
+    expect(quotaError(pro, cap - 10, 11)).toBe('overage_cap_reached');
+    expect(quotaError(pro, cap)).toBe('overage_cap_reached');
+    expect(quotaError(pro, 700 * 60, 0, 50)).toBe('overage_cap_reached');
+    expect(quotaError(pro, 649 * 60, 60, 50)).toBeNull();
+    expect(quotaMessage('overage_cap_reached', 50)).toMatch(/50 minutes/);
+    expect(quotaMessage('quota_exceeded')).toMatch(/upgrade/);
+  });
+
+  it('MAX_OVERAGE_MINUTES=0 disables overage: Pro stops at its included minutes', () => {
+    expect(quotaError(pro, 600 * 60, 0, 0)).toBe('quota_exceeded');
+    expect(quotaError(pro, 599 * 60, 60, 0)).toBeNull();
+    expect(quotaError(pro, 599 * 60, 61, 0)).toBe('quota_exceeded');
   });
 });
 

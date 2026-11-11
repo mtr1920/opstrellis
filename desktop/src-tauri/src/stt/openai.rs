@@ -3,7 +3,7 @@
 //! OpenAI Realtime transcription sessions.
 
 use super::ws::{self, Message, Ws};
-use super::{check, PartialFn, Request, HTTP};
+use super::{check, send, PartialFn, Request, HTTP};
 use crate::audio::{to_wav, Resampler, SAMPLE_RATE};
 use anyhow::{anyhow, Result};
 use base64::Engine;
@@ -33,6 +33,7 @@ fn hint_prompt(vocabulary: &[String], model: &str) -> String {
 
 pub async fn transcribe(base: Option<&str>, key: Option<&str>, model: &str, req: &Request<'_>) -> Result<String> {
     let base = base.filter(|b| !b.trim().is_empty()).unwrap_or(DEFAULT_BASE).trim_end_matches('/');
+    crate::endpoint::check(base)?;
     let file = reqwest::multipart::Part::bytes(to_wav(req.audio)).file_name("audio.wav").mime_str("audio/wav")?;
     let mut form = reqwest::multipart::Form::new().part("file", file).text("model", model.to_string()).text("response_format", "json");
     if let Some(l) = req.language {
@@ -46,7 +47,7 @@ pub async fn transcribe(base: Option<&str>, key: Option<&str>, model: &str, req:
     if let Some(k) = key.filter(|k| !k.is_empty()) {
         rb = rb.bearer_auth(k);
     }
-    let v: Value = check(&host(base), rb.send().await?).await?.json().await?;
+    let v: Value = check(&host(base), send(rb).await?).await?.json().await?;
     v["text"].as_str().map(String::from).ok_or_else(|| anyhow!("{}: response has no text", host(base)))
 }
 
@@ -58,7 +59,9 @@ const REALTIME_RATE: u32 = 24_000;
 
 pub async fn connect_realtime(base: Option<&str>, key: &str, model: &str, language: Option<&str>, vocabulary: &[String]) -> Result<Ws> {
     let http_base = base.filter(|b| !b.trim().is_empty()).unwrap_or(DEFAULT_BASE).trim_end_matches('/');
-    let url = format!("{}/realtime?intent=transcription", http_base.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1));
+    let mut ws_base = crate::endpoint::check(http_base)?;
+    let _ = ws_base.set_scheme(if ws_base.scheme() == "https" { "wss" } else { "ws" });
+    let url = format!("{}/realtime?intent=transcription", ws_base.as_str().trim_end_matches('/'));
     let mut ws = ws::connect(&url, &[("Authorization", &format!("Bearer {key}"))]).await?;
     let mut transcription = json!({ "model": model });
     if let Some(l) = language {
@@ -137,6 +140,16 @@ mod tests {
     fn host_names() {
         assert_eq!(host("https://api.groq.com/openai/v1"), "api.groq.com");
         assert_eq!(host("http://localhost:8000/v1"), "localhost:8000");
+    }
+
+    #[tokio::test]
+    async fn insecure_base_url_is_refused_before_sending() {
+        let audio = [1i16; 1600];
+        let req = Request { audio: &audio, language: None, vocabulary: &[] };
+        let e = transcribe(Some("http://stt.example.com/v1"), Some("k"), "whisper-1", &req).await.unwrap_err();
+        assert!(e.to_string().contains("isn't encrypted"), "{e}");
+        let e = connect_realtime(Some("http://stt.example.com/v1"), "k", "gpt-4o-transcribe", None, &[]).await.unwrap_err();
+        assert!(e.to_string().contains("isn't encrypted"), "{e}");
     }
 
     #[tokio::test]

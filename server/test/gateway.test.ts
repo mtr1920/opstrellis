@@ -2,12 +2,13 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { and, eq, ne } from 'drizzle-orm';
-import { afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { config } from '../src/config.js';
 import { models, providerKeys, usageEvents, users } from '../src/db/schema.js';
 import { parseWav } from '../src/lib/audio.js';
 import { deleteProviderKey, setProviderKey } from '../src/providers.js';
-import { STT_ADAPTERS } from '../src/stt.js';
-import { db, fmtChunk, req, resetDb, riffChunk, riffWave, userWithToken } from './helpers.js';
+import { LOCAL_WINDOW_SECONDS, MAX_LOCAL_JOBS, STT_ADAPTERS } from '../src/stt.js';
+import { app, db, fmtChunk, ORIGIN, req, resetDb, riffChunk, riffWave, userWithToken } from './helpers.js';
 
 const WAV_PATH = 'models/sherpa-onnx-moonshine-tiny-en-int8/test_wavs/0.wav';
 const WAV_SECONDS = 6.625;
@@ -79,6 +80,171 @@ describe('POST /v1/audio/transcriptions with the self-hosted model', () => {
   });
 });
 
+/** Replaces the recognizer's decodeAsync for the duration of `fn`. */
+async function withDecode(wrap: (original: (...a: unknown[]) => Promise<unknown>) => (this: unknown, ...a: unknown[]) => Promise<unknown>, fn: () => Promise<void>) {
+  const proto = createRequire(import.meta.url)('sherpa-onnx-node').OfflineRecognizer.prototype;
+  const original = proto.decodeAsync;
+  proto.decodeAsync = wrap(original);
+  try {
+    await fn();
+  } finally {
+    proto.decodeAsync = original;
+  }
+}
+
+describe('long audio on the self-hosted model', () => {
+  it('decodes clips over 30 s in windows and joins the text of every window', async () => {
+    // The clip, padded with silence to exactly one window, then the clip again: 36.6 s, two windows.
+    const window = Buffer.alloc(LOCAL_WINDOW_SECONDS * 16000 * 2);
+    pcm.copy(window);
+    const long = riffWave(fmtChunk(16000), riffChunk('data', Buffer.concat([window, pcm])));
+    let decodes = 0;
+    await withDecode(
+      (original) =>
+        function (this: unknown, ...args: unknown[]) {
+          decodes++;
+          return original.apply(this, args);
+        },
+      async () => {
+        const { token, user } = await userWithToken();
+        const res = await transcribe(token, { model: 'local/moonshine-tiny-en' }, new Blob([long], { type: 'audio/wav' }));
+        expect(res.status).toBe(200);
+        const text = ((await res.json()).text as string).toLowerCase();
+        expect(text.match(/yellow lamps/g)).toHaveLength(2);
+        expect((await eventsOf(user.id))[0]!.audioSeconds).toBeCloseTo(LOCAL_WINDOW_SECONDS + WAV_SECONDS, 3);
+      },
+    );
+    expect(decodes).toBe(2);
+  });
+
+  it('refuses with 503 when too many local decodes are waiting', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    await withDecode(
+      (original) =>
+        async function (this: unknown, ...args: unknown[]) {
+          await gate;
+          return original.apply(this, args);
+        },
+      async () => {
+        const run = () => STT_ADAPTERS.local!({ audio: wav, filename: 'a.wav', mimeType: 'audio/wav', upstreamModel: 'sherpa-onnx-moonshine-tiny-en-int8', key: null });
+        const queued = Array.from({ length: MAX_LOCAL_JOBS }, run);
+        await new Promise((r) => setTimeout(r, 50));
+        await expect(run()).rejects.toMatchObject({ status: 503, code: 'local_model_busy' });
+        // through the gateway the same rejection reaches the client as is (local is the last model in the chain)
+        const { token, user } = await userWithToken();
+        const res = await transcribe(token, { model: 'local/moonshine-tiny-en' });
+        expect(res.status).toBe(503);
+        expect((await res.json()).error.type).toBe('local_model_busy');
+        expect(await eventsOf(user.id)).toHaveLength(0);
+        release();
+        expect((await Promise.all(queued)).every((r) => r.text.toLowerCase().includes('yellow lamps'))).toBe(true);
+      },
+    );
+  });
+});
+
+/** A multipart upload whose body never finishes until `end()` is called. */
+function stalledUpload(token: string) {
+  let controller!: ReadableStreamDefaultController<Uint8Array>;
+  const body = new ReadableStream<Uint8Array>({ start: (c) => void (controller = c) });
+  const res = app.request('/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'multipart/form-data; boundary=xyz', origin: ORIGIN, 'x-forwarded-for': '10.9.9.9' },
+    body,
+    duplex: 'half',
+  } as RequestInit);
+  return { res: Promise.resolve(res), end: () => controller.close() };
+}
+
+describe('admission before the upload is read', () => {
+  it('takes the in-flight slot before reading the body', async () => {
+    const { token } = await userWithToken();
+    const stalled = [stalledUpload(token), stalledUpload(token), stalledUpload(token)];
+    await new Promise((r) => setTimeout(r, 50));
+    const res = await transcribe(token, { model: 'local/moonshine-tiny-en' });
+    expect(res.status).toBe(429);
+    for (const s of stalled) s.end();
+    expect((await Promise.all(stalled.map((s) => s.res))).map((r) => r.status)).toEqual([400, 400, 400]);
+    expect((await transcribe(token, { model: 'local/moonshine-tiny-en' })).status).toBe(200);
+  });
+
+  it('drains a stalled early-rejected upload only until the deadline, and at most 3 at a time per user', async () => {
+    const saved = config.uploadDrainMs;
+    config.uploadDrainMs = 600;
+    try {
+      const { token, user } = await userWithToken();
+      await seedManaged(user.id, 15 * 60);
+      const t0 = Date.now();
+      const stalled = [stalledUpload(token), stalledUpload(token), stalledUpload(token)];
+      await new Promise((r) => setTimeout(r, 50));
+      // a fourth is answered at once, without draining
+      const fourth = stalledUpload(token);
+      expect((await fourth.res).status).toBe(402);
+      expect(Date.now() - t0).toBeLessThan(400);
+      // the three that declared a body and sent nothing are answered at the deadline
+      expect((await Promise.all(stalled.map((s) => s.res))).map((r) => r.status)).toEqual([402, 402, 402]);
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(550);
+    } finally {
+      config.uploadDrainMs = saved;
+    }
+  });
+
+  it('rejects an exhausted quota before parsing the body', async () => {
+    const { token, user } = await userWithToken();
+    await seedManaged(user.id, 15 * 60);
+    const s = stalledUpload(token);
+    s.end(); // an empty, unparsable multipart body: a 400 if it were parsed first
+    expect((await s.res).status).toBe(402);
+  });
+
+  it('reads and drops the upload of an early rejection, so a real client still sending gets the JSON error', async () => {
+    const { serve } = await import('@hono/node-server');
+    const http = await import('node:http');
+    const server = serve({ fetch: app.fetch, port: 0, hostname: '127.0.0.1' });
+    await new Promise<void>((r) => server.once('listening', () => r()));
+    const { port } = server.address() as { port: number };
+    let serverClosedSocket = false;
+    server.on('connection', (socket) => socket.on('close', () => (serverClosedSocket = true)));
+    try {
+      const { token, user } = await userWithToken();
+      await seedManaged(user.id, 15 * 60);
+      // 8 MB sent in 64 KB chunks over about a second: longer than Hono's 500 ms drain before it resets the socket
+      const chunk = Buffer.alloc(64 * 1024, 1);
+      const chunks = 128;
+      let uploaded!: Promise<boolean>;
+      const result = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const r = http.request(
+          { host: '127.0.0.1', port, method: 'POST', path: '/v1/audio/transcriptions', headers: { authorization: `Bearer ${token}`, 'content-type': 'multipart/form-data; boundary=xyz', 'content-length': chunk.length * chunks } },
+          (res) => {
+            let body = '';
+            res.on('data', (d) => (body += d));
+            res.on('end', () => resolve({ status: res.statusCode!, body }));
+          },
+        );
+        r.on('error', reject);
+        uploaded = new Promise((done, fail) => {
+          r.on('finish', () => done(serverClosedSocket));
+          r.on('error', fail);
+        });
+        let sent = 0;
+        const next = () => {
+          if (sent === chunks) return void r.end();
+          sent++;
+          r.write(chunk, () => setTimeout(next, 8));
+        };
+        next();
+      });
+      // Without draining, the server dropped the connection about 500 ms in, while the client was still sending.
+      expect(await uploaded).toBe(false);
+      expect(result.status).toBe(402);
+      expect(JSON.parse(result.body).error.type).toBe('quota_exceeded');
+    } finally {
+      server.close();
+    }
+  });
+});
+
 describe('fallback', () => {
   it('skips an upstream with no key configured and falls back to local', async () => {
     const { token, user } = await userWithToken();
@@ -114,16 +280,39 @@ describe('fallback', () => {
     expect(res.headers.get('x-opstrellis-model')).toBe('local/moonshine-tiny-en');
   });
 
-  it('returns 502 when every model in the chain fails', async () => {
+  it('returns 502 when every model in the chain fails, logging "stt failed" only', async () => {
     await setProviderKey('openai', 'sk-test-not-a-real-key');
     process.env.OPENAI_BASE_URL = 'http://127.0.0.1:9/v1';
     await db.update(models).set({ enabled: false }).where(and(eq(models.kind, 'stt'), ne(models.provider, 'openai')));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       const { token } = await userWithToken();
       const res = await transcribe(token, { model: 'openai/whisper-1' });
       expect(res.status).toBe(502);
       expect((await res.json()).error.type).toBe('upstream_error');
+      const lines = warn.mock.calls.map((c) => String(c[0]));
+      expect(lines.filter((l) => l.startsWith('stt failed:'))).toHaveLength(1);
+      expect(lines.some((l) => l.startsWith('llm failed:'))).toBe(false);
     } finally {
+      warn.mockRestore();
+      await db.update(models).set({ enabled: true });
+    }
+  });
+
+  it('logs "llm failed" when every chat model fails', async () => {
+    await setProviderKey('openai', 'sk-test-not-a-real-key');
+    process.env.OPENAI_BASE_URL = 'http://127.0.0.1:9/v1';
+    await db.update(models).set({ enabled: false }).where(and(eq(models.kind, 'llm'), ne(models.provider, 'openai')));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { token } = await userWithToken();
+      const res = await req('/v1/chat/completions', { token, json: { model: 'openai/gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }] } });
+      expect(res.status).toBe(502);
+      const lines = warn.mock.calls.map((c) => String(c[0]));
+      expect(lines.filter((l) => l.startsWith('llm failed:'))).toHaveLength(1);
+      expect(lines.some((l) => l.startsWith('stt failed:'))).toBe(false);
+    } finally {
+      warn.mockRestore();
       await db.update(models).set({ enabled: true });
     }
   });
@@ -184,6 +373,25 @@ describe('quota and billing', () => {
     const me = await (await req('/api/me', { token })).json();
     expect(me.plan).toBe('pro');
     expect(me.usage).toMatchObject({ included_minutes: 600, overage_minutes: 1, cost_usd: 0.02 });
+  });
+
+  it('stops Pro overage at MAX_OVERAGE_MINUTES with its own error', async () => {
+    const saved = config.maxOverageMinutes;
+    config.maxOverageMinutes = 2;
+    try {
+      const { token, user } = await userWithToken();
+      await db.update(users).set({ plan: 'pro' }).where(eq(users.id, user.id));
+      await seedManaged(user.id, 602 * 60 - 3); // 3 s left before the cap
+      const res = await transcribe(token, { model: 'local/moonshine-tiny-en' });
+      expect(res.status).toBe(402);
+      const { error } = await res.json();
+      expect(error.type).toBe('overage_cap_reached');
+      expect(error.message).toMatch(/2 minutes/);
+      expect((await (await req('/api/me', { token })).json()).limits.max_overage_minutes).toBe(2);
+      expect((await (await req('/api/billing', { token })).json()).max_overage_minutes).toBe(2);
+    } finally {
+      config.maxOverageMinutes = saved;
+    }
   });
 
   it('never double-counts included minutes under concurrent requests', async () => {

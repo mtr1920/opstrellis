@@ -13,6 +13,7 @@ export default function Overlay() {
   const [levels, setLevels] = useState(empty);
   const [partial, setPartial] = useState("");
   const [outcome, setOutcome] = useState<Outcome | null>(null);
+  const [question, setQuestion] = useState<string | null>(null);
   const [slowMic, setSlowMic] = useState(false);
   const [since, setSince] = useState(0); // when hands-free recording started
   const [now, setNow] = useState(Date.now());
@@ -29,19 +30,21 @@ export default function Overlay() {
 
   useEvent("dictation-state", (s) => {
     const p = prev.current;
+    if (s.status === "review") setOutcome(null);
     if (s.status === "recording" && p.status === "idle") {
       setOutcome(null);
       api.getSettings().then((st) => { sounds.current = st.sounds; }).catch(() => {});
     }
     // The start cue plays once the mic delivers audio: speaking at the cue loses no words.
     if (s.status === "recording" && s.micReady && !(p.status === "recording" && p.micReady) && sounds.current) beep(880);
-    if (s.status === "processing" && p.status !== "processing" && sounds.current) beep(520);
+    if (s.status === "processing" && p.status !== "processing" && p.status !== "review" && sounds.current) beep(520);
     if (s.handsFree && !p.handsFree) setSince(Date.now());
     prev.current = s;
     setState(s);
     if (s.status === "idle") { setLevels(empty()); setPartial(""); }
   });
   useEvent("dictation-outcome", setOutcome);
+  useEvent("agent-question", setQuestion);
   useEvent("audio-level", (l) => setLevels((prev) => [...prev.slice(1), Math.max(0, Math.min(1, l))]));
   useEvent("partial-transcript", setPartial);
 
@@ -66,7 +69,16 @@ export default function Overlay() {
     return () => clearTimeout(t);
   }, [outcome]);
 
+  // The backend counts a question as seen (answerable) only while this page actually draws it.
+  const drawn = state.status === "idle" ? question : null;
+  useEffect(() => { api.questionShown(drawn).catch(() => {}); }, [drawn]);
+
+  if (state.status === "review") return <ReviewCard text={state.text ?? ""} />;
+
   if (state.status === "idle") {
+    // While a question waits the window has the card's size (backend `emit_dictation`), so an
+    // outcome is shown in the card rather than as a pill.
+    if (question) return <QuestionCard question={question} outcome={outcome} />;
     if (!outcome) return null;
     return (
       <div className="overlay-wrap">
@@ -79,15 +91,20 @@ export default function Overlay() {
   }
 
   const processing = state.status === "processing";
-  const stage = state.stage === "polishing" ? (state.mode === "command" ? "Rewriting…" : "Polishing…") : "Transcribing…";
+  const workspace = state.status === "recording" ? state.workspace : null;
+  const answering = state.status === "recording" && !!state.answering;
+  const stage = state.stage === "polishing" ? (state.mode === "command" ? "Rewriting…" : "Polishing…")
+    : state.stage === "inserting" ? "Inserting…" : "Transcribing…";
   const elapsed = Math.max(0, Math.floor((now - since) / 1000));
 
   return (
     <div className="overlay-wrap">
-      <div className={"pill " + state.status + (state.handsFree ? " hands-free" : "")} role="status" aria-live="polite"
-        aria-label={processing ? stage : state.micReady ? "Listening" : "Opening microphone"}>
+      <div className={"pill " + state.status + (state.handsFree ? " hands-free" : "") + (workspace ? " has-ws" : "") + (answering ? " answering" : "")} role="status" aria-live="polite"
+        aria-label={processing ? stage : answering ? "Answering the agent" : state.micReady ? "Listening" : "Opening microphone"}>
         <span className={"pill-dot" + (waiting ? " hollow" : "")} />
         {state.mode === "command" && <span className="pill-badge">CMD</span>}
+        {answering && <span className="pill-badge" title="This dictation goes to the agent that asked, not into an app">Answering the agent</span>}
+        {workspace && <span className="pill-ws" title={`Workspace: ${workspace}`}>{workspace}</span>}
         {timing && <span className="pill-lock"><Icon name="lock" size={12} /><span className="pill-time">{fmtClock(elapsed)}</span></span>}
         {processing ? (
           <>
@@ -112,6 +129,50 @@ export default function Overlay() {
             </button>
           </span>
         )}
+      </div>
+    </div>
+  );
+}
+
+/** An agent's question, until it is answered, declined or times out. Nothing records until the
+ * user dictates with their own shortcut. */
+function QuestionCard({ question, outcome }: { question: string; outcome: Outcome | null }) {
+  return (
+    <div className="overlay-wrap review">
+      <div className="review-card question-card" role="status" aria-live="polite">
+        <div className="review-head">
+          <span className="pill-badge">AGENT</span>
+          <span className="review-title">Agent asks</span>
+          {outcome && <span className={"question-outcome " + outcome.kind} title={outcome.message}>{outcome.message}</span>}
+        </div>
+        <div className="question-text">{question}</div>
+        <div className="review-keys">Dictate your answer, or ignore it</div>
+      </div>
+    </div>
+  );
+}
+
+/** Longest part of a rewrite put in the card; the card shows what fits and says how long it is. */
+const REVIEW_SHOWN = 1200;
+
+/** A command's rewrite before it replaces the selection. The window can't take focus, so the
+ * backend grabs Enter and Esc while this is shown. */
+function ReviewCard({ text }: { text: string }) {
+  const total = [...text].length;
+  const shown = total > REVIEW_SHOWN ? [...text].slice(0, REVIEW_SHOWN).join("") + "…" : text;
+  return (
+    <div className="overlay-wrap review">
+      <div className="review-card" role="status" aria-live="polite" aria-label="Rewrite ready. Enter inserts it, Escape discards it.">
+        <div className="review-head">
+          <span className="pill-badge">CMD</span>
+          <span className="review-title">Replace selection?</span>
+          <span className="review-count">{total.toLocaleString()} characters</span>
+        </div>
+        <div className="review-text">{shown}</div>
+        <div className="review-keys">
+          <span><kbd>↵</kbd> Insert</span>
+          <span><kbd>Esc</kbd> Discard</span>
+        </div>
       </div>
     </div>
   );

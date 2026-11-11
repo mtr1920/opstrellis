@@ -1,6 +1,6 @@
 //! ElevenLabs Scribe batch speech-to-text.
 
-use super::{check, Request, HTTP};
+use super::{check, send, Request, HTTP};
 use crate::audio::to_wav;
 use anyhow::{anyhow, Result};
 use serde_json::Value;
@@ -14,7 +14,7 @@ pub async fn transcribe(key: &str, model: &str, req: &Request<'_>) -> Result<Str
     if let Some(l) = req.language {
         form = form.text("language_code", l.to_string());
     }
-    let resp = HTTP.post("https://api.elevenlabs.io/v1/speech-to-text").header("xi-api-key", key).multipart(form).send().await?;
+    let resp = send(HTTP.post("https://api.elevenlabs.io/v1/speech-to-text").header("xi-api-key", key).multipart(form)).await?;
     let v: Value = check("elevenlabs", resp).await?.json().await?;
     v["text"].as_str().map(String::from).ok_or_else(|| anyhow!("elevenlabs: response has no text"))
 }

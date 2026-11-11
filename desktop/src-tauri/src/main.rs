@@ -7,5 +7,10 @@ fn main() {
         println!("opstrellis {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    // `mcp`, the agent-access commands and --help also run without starting the app.
+    let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+    if let Some(code) = opstrellis_lib::cli::dispatch(&args) {
+        std::process::exit(code);
+    }
     opstrellis_lib::run()
 }

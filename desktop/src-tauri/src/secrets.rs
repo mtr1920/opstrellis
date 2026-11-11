@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const SERVICE: &str = "app.opstrellis.desktop";
@@ -76,15 +76,76 @@ impl Secrets {
     }
 }
 
-fn write_private(path: &PathBuf, bytes: &[u8]) -> Result<()> {
+/// Replaces `path` with `bytes`, readable only by the user (0600): written to a fresh temporary
+/// file and renamed, so a crash never leaves a half-written file and an older, looser file's mode
+/// doesn't carry over.
+pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    let tmp = path.with_file_name(name);
+    let _ = std::fs::remove_file(&tmp);
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let written = opts.open(&tmp).and_then(|mut f| {
+        f.write_all(bytes)?;
+        f.sync_all()
+    });
+    let result = written.and_then(|_| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(result?)
+}
+
+/// Creates `dir` if needed and makes it private to the user (0700), also when it already existed.
+/// Only creating it can fail: some filesystems refuse permission changes, and the app must still start.
+pub fn private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+            log::warn!("couldn't make {} private: {e}", dir.display());
+        }
     }
-    opts.open(path)?.write_all(bytes)?;
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(p: &Path) -> u32 {
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn files_and_folders_are_private() {
+        let dir = std::env::temp_dir().join(format!("opstrellis-secrets-{}", uuid::Uuid::new_v4())).join("data");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        private_dir(&dir).unwrap();
+        assert_eq!(mode(&dir), 0o700, "an existing folder is tightened");
+        private_dir(&dir.join("logs")).unwrap();
+        assert_eq!(mode(&dir.join("logs")), 0o700);
+
+        let file = dir.join("secrets.json");
+        std::fs::write(&file, b"old").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(&file, b"{}").unwrap();
+        assert_eq!((mode(&file), std::fs::read(&file).unwrap()), (0o600, b"{}".to_vec()), "an existing file is replaced and tightened");
+        assert!(!dir.join("secrets.json.tmp").exists());
+
+        let secrets = Secrets { fallback_path: file.clone(), lock: Mutex::new(()) };
+        secrets.update_file(|m| {
+            m.insert("test".into(), "value".into());
+        })
+        .unwrap();
+        assert_eq!((mode(&file), secrets.read_file().get("test").map(String::as_str)), (0o600, Some("value")));
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
 }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 
 /** Loads data on mount (and whenever deps change); `reload` refetches. */
@@ -45,6 +45,15 @@ const ICONS = {
     <>
       <circle cx="9" cy="8" r="3.5" />
       <path d="M2.5 20v-1a5 5 0 0 1 5-5h3a5 5 0 0 1 5 5v1M16 4.5a3.5 3.5 0 0 1 0 7M21.5 20v-1a5 5 0 0 0-3.5-4.8" />
+    </>
+  ),
+  team: (
+    <>
+      <circle cx="12" cy="7.5" r="3" />
+      <path d="M6.5 20v-1.5a5.5 5.5 0 0 1 11 0V20" />
+      <circle cx="5" cy="10" r="2" />
+      <circle cx="19" cy="10" r="2" />
+      <path d="M2 18.5V18a3.5 3.5 0 0 1 3-3.46M22 18.5V18a3.5 3.5 0 0 0-3-3.46" />
     </>
   ),
   models: <path d="M12 2.5l9.5 4.75L12 12 2.5 7.25zM2.5 12L12 16.75 21.5 12M2.5 16.75L12 21.5l9.5-4.75" />,
@@ -258,5 +267,37 @@ export function Modal({ title, onClose, children }: { title: string; onClose: ()
       </div>
     </div>,
     document.body,
+  );
+}
+
+/** A secret shown once, with Copy. Without the Clipboard API (plain-HTTP origins) the text is selected for manual copying. */
+export function SecretCopy({ value, noun = 'code' }: { value: string; noun?: string }) {
+  const ref = useRef<HTMLElement>(null);
+  const [state, setState] = useState<'idle' | 'copied' | 'manual'>('idle');
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setState('copied');
+    } catch {
+      const range = document.createRange();
+      range.selectNodeContents(ref.current!);
+      getSelection()?.removeAllRanges();
+      getSelection()?.addRange(range);
+      setState('manual');
+    }
+  };
+  return (
+    <>
+      <div className="row">
+        <code ref={ref} className="secret">
+          {value}
+        </code>
+        <button onClick={copy}>
+          <Icon name={state === 'copied' ? 'check' : 'copy'} size={16} />
+          {state === 'copied' ? 'Copied' : 'Copy'}
+        </button>
+      </div>
+      {state === 'manual' && <p className="muted small">Select and copy the {noun}.</p>}
+    </>
   );
 }

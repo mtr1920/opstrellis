@@ -1,13 +1,17 @@
 import {
+  bigint,
   boolean,
   doublePrecision,
   index,
   integer,
+  jsonb,
   pgTable,
   text,
+  uniqueIndex,
   timestamp,
   uuid,
 } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
 
 const createdAt = () => timestamp('created_at', { withTimezone: true }).notNull().defaultNow();
 
@@ -126,6 +130,71 @@ export const providerKeys = pgTable('provider_keys', {
   last4: text('last4').notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
+
+export const orgs = pgTable('orgs', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  name: text('name').notNull(),
+  /** Incremented by every library write (with the row locked); entries carry the version that last changed them. */
+  libraryVersion: bigint('library_version', { mode: 'number' }).notNull().default(0),
+  /** Highest version of a purged tombstone: a sync from below it may have missed deletes and must restart. */
+  tombstoneFloor: bigint('tombstone_floor', { mode: 'number' }).notNull().default(0),
+  createdAt: createdAt(),
+});
+
+export const orgMembers = pgTable(
+  'org_members',
+  {
+    /** The primary key: a user is in at most one team. */
+    userId: uuid('user_id')
+      .primaryKey()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    orgId: uuid('org_id')
+      .notNull()
+      .references(() => orgs.id, { onDelete: 'cascade' }),
+    role: text('role', { enum: ['admin', 'member'] }).notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [index('org_members_org_idx').on(t.orgId)],
+);
+
+export const orgInvites = pgTable('org_invites', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  orgId: uuid('org_id')
+    .notNull()
+    .references(() => orgs.id, { onDelete: 'cascade' }),
+  /** sha256 of the invite code; the code is shown once and never stored. */
+  codeHash: text('code_hash').notNull().unique(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  createdBy: uuid('created_by')
+    .notNull()
+    .references(() => users.id, { onDelete: 'cascade' }),
+  createdAt: createdAt(),
+});
+
+export const orgLibrary = pgTable(
+  'org_library',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    orgId: uuid('org_id')
+      .notNull()
+      .references(() => orgs.id, { onDelete: 'cascade' }),
+    kind: text('kind', { enum: ['dictionary', 'snippet', 'action'] }).notNull(),
+    data: jsonb('data').$type<Record<string, unknown>>().notNull(),
+    /** The entry's unique field, NFKC-normalised and lowercased in JS; null for tombstones. */
+    key: text('key'),
+    /** UTF-8 bytes of JSON.stringify(data) for live entries (0 for tombstones); bounds the full-sync response. */
+    size: integer('size').notNull().default(0),
+    version: bigint('version', { mode: 'number' }).notNull(),
+    /** Tombstone (data emptied) so desktops that sync later learn about the delete. */
+    deleted: boolean('deleted').notNull().default(false),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedBy: uuid('updated_by').references(() => users.id, { onDelete: 'set null' }),
+  },
+  (t) => [
+    index('org_library_org_version_idx').on(t.orgId, t.version),
+    uniqueIndex('org_library_live_key_idx').on(t.orgId, t.kind, t.key).where(sql`not ${t.deleted}`),
+  ],
+);
 
 export type User = typeof users.$inferSelect;
 export type Model = typeof models.$inferSelect;

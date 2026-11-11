@@ -1,4 +1,5 @@
 // Plans, billing periods and the included/overage split. Pure functions; unit-tested precisely.
+import { config } from './config.js';
 import type { User } from './db/schema.js';
 
 export const PLANS = {
@@ -19,9 +20,9 @@ export function currentPeriod(user: BillingUser, now = new Date()): { start: Dat
   return { start, end };
 }
 
-/** Overage is only allowed on a Pro plan in good standing. */
-export function allowsOverage(user: BillingUser): boolean {
-  return user.plan === 'pro' && (user.planStatus === 'active' || user.planStatus === 'trialing');
+/** Overage is only allowed on a Pro plan in good standing, and not at all when the cap is 0. */
+export function allowsOverage(user: BillingUser, maxOverageMinutes = config.maxOverageMinutes): boolean {
+  return maxOverageMinutes > 0 && user.plan === 'pro' && (user.planStatus === 'active' || user.planStatus === 'trialing');
 }
 
 /**
@@ -53,11 +54,20 @@ export function priceUsage(user: BillingUser, usedSeconds: number, eventSeconds:
   return { ...split, overageMinutes, billedUsd: round6(overageMinutes * plan.overagePerMinUsd) };
 }
 
+export type QuotaError = 'quota_exceeded' | 'overage_cap_reached';
+
 /** null when the user may run a managed transcription of `requestSeconds`, else the reason. */
-export function quotaError(user: BillingUser, usedSeconds: number, requestSeconds = 0): string | null {
-  if (allowsOverage(user)) return null;
-  const included = PLANS[user.plan].includedMinutes * 60;
-  return usedSeconds >= included || usedSeconds + requestSeconds > included ? 'quota_exceeded' : null;
+export function quotaError(user: BillingUser, usedSeconds: number, requestSeconds = 0, maxOverageMinutes = config.maxOverageMinutes): QuotaError | null {
+  const overage = allowsOverage(user, maxOverageMinutes);
+  const limit = (PLANS[user.plan].includedMinutes + (overage ? maxOverageMinutes : 0)) * 60;
+  if (usedSeconds < limit && usedSeconds + requestSeconds <= limit) return null;
+  return overage ? 'overage_cap_reached' : 'quota_exceeded';
+}
+
+export function quotaMessage(code: QuotaError, maxOverageMinutes = config.maxOverageMinutes): string {
+  return code === 'overage_cap_reached'
+    ? `This period's overage limit of ${maxOverageMinutes} minutes is reached; it resets next period, or use your own key`
+    : 'Not enough managed minutes left this period; upgrade to Pro or use your own key';
 }
 
 export const round6 = (n: number) => Math.round(n * 1e6) / 1e6;

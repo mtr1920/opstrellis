@@ -1,7 +1,8 @@
-//! OpsTrellis Cloud: device-code sign-in and usage metadata sync. The API token is stored in the
-//! keychain as secret "cloud" and doubles as the key for the Cloud STT/LLM providers.
+//! OpsTrellis Cloud: device-code sign-in, usage metadata sync and the team library sync loop
+//! (`team.rs`). The API token is stored in the keychain as secret "cloud" and doubles as the key
+//! for the Cloud STT/LLM providers.
 
-use crate::stt::{check, HTTP};
+use crate::stt::{check, send, HTTP};
 use crate::App;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -29,13 +30,16 @@ pub struct LoginStart {
 
 static LOGIN_ATTEMPT: AtomicU64 = AtomicU64::new(0);
 
-fn base(app: &App) -> String {
-    app.settings().cloud.base_url.trim_end_matches('/').to_string()
+/// The configured server, refused when the token would travel unencrypted.
+pub(crate) fn base(app: &App) -> Result<String> {
+    let base = base_of(&app.settings().cloud.base_url).to_string();
+    crate::endpoint::check(&base)?;
+    Ok(base)
 }
 
 pub async fn login(app: Arc<App>) -> Result<LoginStart> {
-    let base = base(&app);
-    let v: Value = check("cloud", HTTP.post(format!("{base}/api/device/start")).json(&json!({ "device_name": device_name() })).send().await?)
+    let base = base(&app)?;
+    let v: Value = check("cloud", send(HTTP.post(format!("{base}/api/device/start")).json(&json!({ "device_name": device_name() }))).await?)
         .await?
         .json()
         .await?;
@@ -62,13 +66,17 @@ pub async fn login(app: Arc<App>) -> Result<LoginStart> {
             if LOGIN_ATTEMPT.load(Ordering::SeqCst) != attempt {
                 return;
             }
-            let resp = match HTTP.post(format!("{base}/api/device/poll")).json(&json!({ "device_code": device_code })).send().await {
+            let resp = match send(HTTP.post(format!("{base}/api/device/poll")).json(&json!({ "device_code": device_code }))).await {
                 Ok(r) => r,
                 Err(_) => continue,
             };
             match resp.status().as_u16() {
                 200 => {
                     let token = resp.json::<Value>().await.ok().and_then(|v| v["token"].as_str().map(String::from));
+                    // The token belongs to the server that issued it, never to one configured since.
+                    if base_of(&app.settings().cloud.base_url) != base {
+                        return;
+                    }
                     if let Some(token) = token {
                         if let Err(e) = app.secrets.set("cloud", &token) {
                             app.toast_error(&format!("Could not store the cloud token: {e:#}"));
@@ -77,6 +85,7 @@ pub async fn login(app: Arc<App>) -> Result<LoginStart> {
                         let st = status(&app).await;
                         let _ = app.update_settings(|s| s.cloud.email = st.email.clone());
                         let _ = app.handle.emit("cloud-status", st);
+                        let _ = crate::team::sync(&app).await;
                     }
                     return;
                 }
@@ -93,7 +102,10 @@ pub async fn login(app: Arc<App>) -> Result<LoginStart> {
 
 pub async fn status(app: &App) -> CloudStatus {
     let Some(token) = app.secrets.get("cloud") else { return CloudStatus::default() };
-    let resp = HTTP.get(format!("{}/api/me", base(app))).bearer_auth(token).timeout(Duration::from_secs(10)).send().await;
+    let resp = match base(app) {
+        Ok(base) => send(HTTP.get(format!("{base}/api/me")).bearer_auth(token).timeout(Duration::from_secs(10))).await,
+        Err(e) => Err(e),
+    };
     match resp {
         Ok(r) if r.status().is_success() => {
             let v: Value = r.json().await.unwrap_or_default();
@@ -106,6 +118,7 @@ pub async fn status(app: &App) -> CloudStatus {
         }
         Ok(r) if r.status().as_u16() == 401 => {
             let _ = app.secrets.delete("cloud");
+            let _ = crate::team::clear(app);
             CloudStatus::default()
         }
         // Offline: still signed in, details unknown.
@@ -114,20 +127,38 @@ pub async fn status(app: &App) -> CloudStatus {
 }
 
 pub fn logout(app: &App) -> Result<()> {
-    app.secrets.delete("cloud")?;
+    forget_account(app)?;
     app.update_settings(|s| s.cloud.email = None)?;
     Ok(())
 }
 
+/// Signed out (or moved to another server): the token, a sign-in still waiting for approval,
+/// usage not yet sent and the team library all belonged to the old account. The caller clears the email.
+pub fn forget_account(app: &App) -> Result<()> {
+    LOGIN_ATTEMPT.fetch_add(1, Ordering::SeqCst);
+    app.secrets.delete("cloud")?;
+    app.db.clear_usage()?;
+    crate::team::clear(app)?;
+    Ok(())
+}
+
+/// The server part of a configured Server URL, as requests use it.
+pub fn base_of(url: &str) -> &str {
+    url.trim().trim_end_matches('/')
+}
+
 /// Sends queued usage metadata (never transcript text). Returns the number of events accepted.
 pub async fn flush_usage(app: &App) -> Result<usize> {
+    if !app.settings().privacy.sync_usage {
+        return Ok(0);
+    }
     let Some(token) = app.secrets.get("cloud") else { return Ok(0) };
     let pending = app.db.pending_usage(500)?;
     if pending.is_empty() {
         return Ok(0);
     }
     let (ids, events): (Vec<String>, Vec<Value>) = pending.into_iter().unzip();
-    let resp = HTTP.post(format!("{}/api/usage", base(app))).bearer_auth(token).json(&json!({ "events": events })).send().await?;
+    let resp = send(HTTP.post(format!("{}/api/usage", base(app)?)).bearer_auth(token).json(&json!({ "events": events }))).await?;
     check("cloud", resp).await?;
     app.db.ack_usage(&ids)?;
     Ok(ids.len())
@@ -135,9 +166,14 @@ pub async fn flush_usage(app: &App) -> Result<usize> {
 
 pub fn spawn_sync_loop(app: Arc<App>) {
     tauri::async_runtime::spawn(async move {
+        let (mut team_due, mut team_wait) = (std::time::Instant::now(), crate::team::INTERVAL);
         loop {
             if let Err(e) = flush_usage(&app).await {
                 log::debug!("usage sync failed: {e:#}");
+            }
+            if std::time::Instant::now() >= team_due {
+                team_wait = crate::team::next_wait(team_wait, &crate::team::sync(&app).await);
+                team_due = std::time::Instant::now() + team_wait;
             }
             tokio::time::sleep(Duration::from_secs(60)).await;
         }

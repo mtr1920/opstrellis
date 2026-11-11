@@ -43,6 +43,63 @@ describe('POST /api/usage', () => {
   });
 });
 
+describe('POST /api/usage limits', () => {
+  it('rejects integers beyond int4 with a 400 instead of failing the insert', async () => {
+    const { token } = await userWithToken();
+    for (const field of ['input_tokens', 'output_tokens']) {
+      const res = await req('/api/usage', { token, json: { events: [event({ kind: 'llm', [field]: 2 ** 31 })] } });
+      expect(res.status, field).toBe(400);
+      expect((await res.json()).error).toBe('invalid_request');
+    }
+    expect((await req('/api/usage', { token, json: { events: [event({ kind: 'llm', input_tokens: 2 ** 31 - 1, output_tokens: 2 ** 31 - 1 })] } })).status).toBe(200);
+    // the per-model token sum adds two int4 columns: still no overflow
+    const stats = await (await req('/api/stats', { token })).json();
+    expect(stats.by_model.find((m: any) => m.tokens > 0).tokens).toBe(2 * (2 ** 31 - 1));
+  });
+
+  it('keeps /api/me and /api/stats working when sums exceed int4', async () => {
+    const { token } = await userWithToken();
+    for (let i = 0; i < 5; i++) {
+      const events = Array.from({ length: 500 }, () => event({ words: 1_000_000 }));
+      expect((await req('/api/usage', { token, json: { events } })).status).toBe(200);
+    }
+    const me = await req('/api/me', { token });
+    expect(me.status).toBe(200);
+    expect((await me.json()).usage.words).toBe(2_500_000_000);
+    const stats = await req('/api/stats', { token });
+    expect(stats.status).toBe(200);
+    const body = await stats.json();
+    expect(body.totals.words).toBe(2_500_000_000);
+    expect(body.daily[0].words).toBe(2_500_000_000);
+    expect(body.by_app_category[0].words).toBe(2_500_000_000);
+  });
+
+  it('rejects NUL characters in text fields with a 400', async () => {
+    const { token } = await userWithToken();
+    for (const field of ['name', 'preferred_model', 'preferred_llm']) {
+      expect((await req('/api/me', { token, method: 'PATCH', json: { [field]: 'x\u0000' } })).status, field).toBe(400);
+    }
+    expect((await req('/api/usage', { token, json: { events: [event({ model: 'nova\u0000' })] } })).status).toBe(400);
+    expect((await req('/api/usage', { token, json: { events: [event({ app_category: 'a\u0000' })] } })).status).toBe(400);
+  });
+
+  it('is rate limited per user', async () => {
+    const { token } = await userWithToken();
+    const statuses = [];
+    for (let i = 0; i < 31; i++) statuses.push((await req('/api/usage', { token, json: { events: [] } })).status);
+    expect(statuses.slice(0, 30).every((s) => s === 200)).toBe(true);
+    expect(statuses[30]).toBe(429);
+    expect((await req('/api/usage', { token: (await userWithToken()).token, json: { events: [] } })).status).toBe(200);
+  });
+
+  it('answers 413 (not 500) for a body over 1 MB', async () => {
+    const { token } = await userWithToken();
+    const res = await req('/api/usage', { token, body: JSON.stringify({ events: [], pad: 'x'.repeat(1024 * 1024) }), headers: { 'content-type': 'application/json' } });
+    expect(res.status).toBe(413);
+    expect((await res.json()).error).toBe('payload_too_large');
+  });
+});
+
 describe('stats', () => {
   it('computes words, WPM, streaks and breakdowns', async () => {
     const { token } = await userWithToken();
