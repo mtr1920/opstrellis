@@ -25,7 +25,7 @@ opstrellis --version
 4. On every PR and tag build, each native desktop runner first installs and reruns its actual bundle
    through a fixture GitHub transport, checks CLI versions and runs installer failure regressions.
    Publication waits for these checks. The `install-test` job then installs the published release with `install.sh` on Ubuntu 22.04 and
-   macOS 14, runs it a second time, and checks `opstrellis --version`.
+   macOS 15, runs it a second time, and checks `opstrellis --version`.
 
 `install.sh` installs the latest release, which GitHub defines as the newest one that isn't a draft
 or a pre-release. Tags containing a prerelease suffix (such as `v0.2.0-beta.1`) are published as

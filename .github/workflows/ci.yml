@@ -39,7 +39,7 @@ jobs:
           - os: ubuntu-22.04
             bundles: deb,appimage
             target: linux-x86_64
-          - os: macos-14
+          - os: macos-15
             bundles: app,dmg
             target: macos-aarch64
     runs-on: ${{ matrix.os }}
@@ -164,7 +164,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-14]
+        os: [ubuntu-22.04, macos-15]
     runs-on: ${{ matrix.os }}
     env:
       GITHUB_TOKEN: ${{ github.token }}
