@@ -3,7 +3,7 @@ import {
   api, errMsg, useEvent, type CloudStatus, type LocalModel, type Permissions, type PolishModel, type WaylandShortcuts, type ProviderKind, type Settings, type SttEntry,
 } from "../api";
 import { Icon } from "../icons";
-import { IS_MAC, Keys, isSingleKey, Modal, Page, Progress, Row, Section, Toggle, comboText, useModelDownloads, type SettingsProps } from "../ui";
+import { IS_MAC, Keys, isSingleKey, Modal, Page, Progress, Row, Search, Section, Toggle, comboText, useModelDownloads, type SettingsProps } from "../ui";
 
 export const PROVIDERS: Record<ProviderKind, string> = {
   local: "Local model (offline)", openai: "OpenAI-compatible", deepgram: "Deepgram", assemblyai: "AssemblyAI",
@@ -120,11 +120,11 @@ export default function SettingsPage(props: Props) {
           <SettingsSection title="Permissions"><PermissionsInfo shortcuts={settings.hotkeys.dictate + " " + settings.hotkeys.command} withShortcutSetup={false} /></SettingsSection>
 
           <SettingsSection title="Transcription" desc="OpsTrellis uses the first enabled provider. If it fails, the next one takes over.">
-            <Providers {...props} localIds={models.filter((m) => m.installed).map((m) => m.id)} />
+            <Providers {...props} localModels={models} />
           </SettingsSection>
 
           <SettingsSection title="Local models" desc="Run speech recognition on this computer. Nothing leaves your device.">
-            <LocalModels models={models} reload={loadModels} />
+            <LocalModels models={models} reload={loadModels} settings={settings} set={set} />
           </SettingsSection>
 
           <SettingsSection title="AI polish" desc="AI polish cleans up dictations, runs transforms and command mode, and summarizes meetings.">
@@ -443,7 +443,7 @@ function Microphone({ settings, set }: SettingsProps) {
 
 // ---------- Transcription providers ----------
 
-function Providers({ settings, set, saveNow, localIds }: Props & { localIds: string[] }) {
+function Providers({ settings, set, saveNow, localModels }: Props & { localModels: LocalModel[] }) {
   const chain = settings.sttChain;
   const [secrets, setSecrets] = useState<string[]>([]);
   const loadSecrets = () => api.hasSecrets().then(setSecrets, () => {});
@@ -467,7 +467,7 @@ function Providers({ settings, set, saveNow, localIds }: Props & { localIds: str
     <>
       {chain.length === 0 && <div className="list-empty">No providers yet. Add one, or download a local model below.</div>}
       {chain.map((entry, i) => (
-        <ProviderEntry key={entry.id} entry={entry} index={i} count={chain.length} localIds={localIds}
+        <ProviderEntry key={entry.id} entry={entry} index={i} count={chain.length} localModels={localModels}
           hasKey={secrets.includes(`stt:${entry.id}`)} onKeySaved={loadSecrets} saveNow={saveNow}
           update={(p) => update(entry.id, p)} move={(d) => move(i, d)} remove={() => remove(entry.id)}
           primary={chain.findIndex((e) => e.enabled) === i} />
@@ -478,15 +478,15 @@ function Providers({ settings, set, saveNow, localIds }: Props & { localIds: str
 }
 
 interface EntryProps {
-  entry: SttEntry; index: number; count: number; primary: boolean; localIds: string[]; hasKey: boolean;
+  entry: SttEntry; index: number; count: number; primary: boolean; localModels: LocalModel[]; hasKey: boolean;
   update: (p: Partial<SttEntry>) => void; move: (d: number) => void; remove: () => void;
   onKeySaved: () => void; saveNow: () => Promise<void>;
 }
 
-function ProviderEntry({ entry, index, count, primary, localIds, hasKey, update, move, remove, onKeySaved, saveNow }: EntryProps) {
+function ProviderEntry({ entry, index, count, primary, localModels, hasKey, update, move, remove, onKeySaved, saveNow }: EntryProps) {
   const [key, setKey] = useState("");
   const [test, setTest] = useState<{ busy?: boolean; text?: string; latencyMs?: number; error?: string } | null>(null);
-  const suggestions = entry.provider === "local" ? localIds : MODELS[entry.provider];
+  const installed = localModels.filter((m) => m.installed);
   const needsKey = entry.provider !== "local";
 
   async function saveKey() {
@@ -519,7 +519,7 @@ function ProviderEntry({ entry, index, count, primary, localIds, hasKey, update,
           <span>Provider</span>
           <select value={entry.provider} onChange={(e) => {
             const provider = e.target.value as ProviderKind;
-            const model = provider === "local" ? localIds[0] ?? "moonshine-tiny-en" : MODELS[provider][0];
+            const model = provider === "local" ? installed[0]?.id ?? "moonshine-tiny-en" : MODELS[provider][0];
             update({ provider, model, streaming: STREAMING.includes(provider) && entry.streaming });
           }}>
             {Object.entries(PROVIDERS).map(([id, label]) => <option key={id} value={id}>{label}</option>)}
@@ -527,8 +527,21 @@ function ProviderEntry({ entry, index, count, primary, localIds, hasKey, update,
         </label>
         <label className="field">
           <span>Model</span>
-          <input list={`models-${entry.id}`} value={entry.model} onChange={(e) => update({ model: e.target.value })} />
-          <datalist id={`models-${entry.id}`}>{suggestions.map((m) => <option key={m} value={m} />)}</datalist>
+          {entry.provider === "local" ? (
+            <select value={entry.model} onChange={(e) => update({ model: e.target.value })}>
+              {!installed.some((m) => m.id === entry.model) && (
+                <option value={entry.model}>
+                  {localModels.find((m) => m.id === entry.model)?.name ?? entry.model}{localModels.length ? " (not downloaded)" : ""}
+                </option>
+              )}
+              {installed.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+            </select>
+          ) : (
+            <>
+              <input list={`models-${entry.id}`} value={entry.model} onChange={(e) => update({ model: e.target.value })} />
+              <datalist id={`models-${entry.id}`}>{MODELS[entry.provider].map((m) => <option key={m} value={m} />)}</datalist>
+            </>
+          )}
         </label>
         {(entry.provider === "openai" || entry.provider === "cloud") && (
           <label className="field span2">
@@ -573,40 +586,127 @@ function ProviderEntry({ entry, index, count, primary, localIds, hasKey, update,
 
 // ---------- Local models ----------
 
-function LocalModels({ models, reload }: { models: LocalModel[]; reload: () => void }) {
-  const progress = useModelDownloads(() => reload());
+type ModelSort = "recommended" | "size" | "name";
+const MODEL_SORTS: [ModelSort, string][] = [["recommended", "Recommended"], ["size", "Smallest download"], ["name", "Name"]];
+const languageNames = (() => {
+  try { return new Intl.DisplayNames(["en"], { type: "language" }); } catch { return null; }
+})();
+/** "de" → "German". Whisper still uses "jw" for Javanese. */
+const languageName = (code: string) => languageNames?.of(code === "jw" ? "jv" : code) ?? code;
+
+/** Where a local model sits in the provider chain: the first enabled local entry using it, if any. */
+function chainRole(chain: SttEntry[], id: string): "Primary" | "Fallback" | null {
+  const i = chain.findIndex((e) => e.enabled && e.provider === "local" && e.model === id);
+  if (i < 0) return null;
+  return chain.findIndex((e) => e.enabled) === i ? "Primary" : "Fallback";
+}
+
+/** A searchable catalog of on-device models: filter by language, download, cancel, use and delete. */
+function LocalModels({ models, reload, settings, set }: SettingsProps & { models: LocalModel[]; reload: () => void }) {
+  const [pending, setPending] = useState<Set<string>>(new Set());
+  const settle = (id: string) => setPending((prev) => { const next = new Set(prev); next.delete(id); return next; });
+  const progress = useModelDownloads((id) => { settle(id); reload(); });
   const [error, setError] = useState<string | null>(null);
-  const failed = models.map((m) => progress[m.id]).find((p) => p?.error);
+  const [query, setQuery] = useState("");
+  const [lang, setLang] = useState(settings.language === "auto" ? "all" : settings.language);
+  const [sort, setSort] = useState<ModelSort>("recommended");
+  const [downloadedOnly, setDownloadedOnly] = useState(false);
+  const failed = models.filter((m) => !pending.has(m.id)).map((m) => progress[m.id]).find((p) => p?.error);
+  const chain = settings.sttChain;
+
+  const languages = [...new Set(models.flatMap((m) => m.langs))]
+    .map((code) => [code, languageName(code)] as const)
+    .sort((a, b) => a[1].localeCompare(b[1]));
+  const busy = (m: LocalModel) => {
+    const p = progress[m.id];
+    return pending.has(m.id) || (p ? !p.error && !p.done : m.downloading);
+  };
+  const rank = (m: LocalModel) => chainRole(chain, m.id) ? 0 : m.installed ? 1 : busy(m) ? 2 : m.recommended ? 3 : 4;
+  const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const shown = models
+    .map((m, order) => ({ m, order, text: [m.name, m.description, m.languages, ...m.langs.map(languageName)].join(" ").toLowerCase() }))
+    .filter(({ m, text }) => (lang === "all" || m.langs.includes(lang)) && (!downloadedOnly || m.installed) && words.every((w) => text.includes(w)))
+    .sort((a, b) =>
+      sort === "size" ? a.m.sizeMb - b.m.sizeMb || a.order - b.order
+        : sort === "name" ? a.m.name.localeCompare(b.m.name)
+          : rank(a.m) - rank(b.m) || a.order - b.order)
+    .map(({ m }) => m);
+  const filtered = !!words.length || lang !== "all" || downloadedOnly;
+
+  function download(id: string) {
+    setError(null);
+    setPending((prev) => new Set(prev).add(id));
+    api.downloadLocalModel(id).then(() => settle(id), (e) => { settle(id); setError(errMsg(e)); });
+  }
+  /** Points the enabled local provider at this model, keeping its place in the chain. Otherwise a
+   * local entry goes last, so it never takes over from a provider the user has on. */
+  function use(id: string) {
+    const on = chain.findIndex((e) => e.enabled && e.provider === "local");
+    if (on >= 0) return set("sttChain", chain.map((e, j) => (j === on ? { ...e, model: id } : e)));
+    const off = chain.find((e) => e.provider === "local");
+    const entry: SttEntry = off
+      ? { ...off, model: id, enabled: true }
+      : { id: crypto.randomUUID(), provider: "local", model: id, baseUrl: null, region: null, streaming: true, enabled: true };
+    set("sttChain", [...chain.filter((e) => e !== off), entry]);
+  }
 
   return (
     <>
-      {models.map((m) => {
+      <div className="model-tools">
+        <Search value={query} onChange={setQuery} placeholder="Search models or languages" />
+        <select value={lang} onChange={(e) => setLang(e.target.value)} aria-label="Language">
+          <option value="all">All languages</option>
+          {languages.map(([code, name]) => <option key={code} value={code}>{name}</option>)}
+        </select>
+        <select value={sort} onChange={(e) => setSort(e.target.value as ModelSort)} aria-label="Sort by">
+          {MODEL_SORTS.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
+        </select>
+        <label className="toggle-label">
+          <Toggle checked={downloadedOnly} onChange={setDownloadedOnly} label="Downloaded only" />Downloaded only
+        </label>
+        <span className="meta model-count">{shown.length === models.length ? `${models.length} models` : `${shown.length} of ${models.length}`}</span>
+      </div>
+      {shown.map((m) => {
         const p = progress[m.id];
+        const role = chainRole(chain, m.id);
+        const downloading = busy(m);
+        const pct = p?.total && !p.done ? Math.min(100, Math.floor((p.downloaded / p.total) * 100)) : null;
         return (
-          <div key={m.id} className="row">
+          <div key={m.id} className="row model-row">
             <div className="row-text">
-              <div className="row-title">{m.name} <span className="meta">· {m.languages} · {m.sizeMb} MB</span></div>
+              <div className="row-title">{m.name}{m.recommended && <span className="tag" title="A good default for the languages it covers.">Recommended</span>}</div>
               <div className="row-desc">{m.description}</div>
-              {p && !p.error && <Progress value={p.total ? p.downloaded / p.total : 0} />}
+              <div className="row-desc model-facts">{m.languages} · {m.sizeMb >= 1000 ? `${(m.sizeMb / 1000).toFixed(1)} GB` : `${m.sizeMb} MB`}</div>
+              {downloading && <Progress value={pct === null ? 0 : pct / 100} />}
             </div>
             <div className="row-control">
-              {m.installed ? (
+              {downloading && pct === 100 ? (
+                <span className="meta">Installing…</span>
+              ) : downloading ? (
                 <>
-                  <span className="tag ok">Installed</span>
-                  <button className="icon-btn" title="Delete model"
+                  <span className="meta model-pct">{pct === null ? "Starting…" : `${pct}%`}</span>
+                  <button className="icon-btn" title="Cancel download" aria-label={`Cancel ${m.name} download`}
+                    onClick={() => api.cancelLocalDownload(m.id).catch((e) => setError(errMsg(e)))}><Icon name="x" /></button>
+                </>
+              ) : !m.installed ? (
+                <button className="btn" onClick={() => download(m.id)}>Download</button>
+              ) : (
+                <>
+                  {role
+                    ? <span className="tag ok" title={role === "Primary" ? "Dictation uses this model." : "Used when the providers above it fail."}>{role === "Primary" ? "In use" : "Fallback"}</span>
+                    : <button className="btn" onClick={() => use(m.id)}>Use model</button>}
+                  <button className="icon-btn" title="Delete model" aria-label={`Delete ${m.name}`}
                     onClick={() => api.deleteLocalModel(m.id).then(reload, (e) => setError(errMsg(e)))}><Icon name="trash" /></button>
                 </>
-              ) : (
-                <button className="btn" disabled={(!!p && !p.error) || m.downloading}
-                  onClick={() => api.downloadLocalModel(m.id).catch((e) => setError(errMsg(e)))}>
-                  {p && !p.error ? `${Math.round((p.downloaded / (p.total || 1)) * 100)}%` : m.downloading ? "Downloading…" : "Download"}
-                </button>
               )}
             </div>
           </div>
         );
       })}
       {models.length === 0 && <div className="list-empty">No local models available.</div>}
+      {models.length > 0 && shown.length === 0 && (
+        <div className="list-empty">No models match.{filtered && <> <button className="link" onClick={() => { setQuery(""); setLang("all"); setDownloadedOnly(false); }}>Clear filters</button></>}</div>
+      )}
       {(error || failed) && <div className="error">{error ?? `Download failed: ${failed!.error}`}</div>}
     </>
   );

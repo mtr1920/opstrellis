@@ -71,7 +71,10 @@ export interface Snippet { id: number; trigger: string; expansion: string; creat
 /** output: "replace" the selection (or insert at the cursor), or "copy" the result to the clipboard. */
 export interface Transform { id: number; name: string; prompt: string; builtin: boolean; output: "replace" | "copy" }
 export interface Note { id: number; title: string; body: string; updatedAt: string; kind: "note" | "meeting" }
-export interface LocalModel { id: string; name: string; languages: string; sizeMb: number; installed: boolean; downloading: boolean; description: string }
+export interface LocalModel {
+  id: string; name: string; languages: string; sizeMb: number; installed: boolean; downloading: boolean; description: string;
+  langs: string[]; recommended: boolean;
+}
 export interface CloudStatus { signedIn: boolean; email: string | null; plan: string | null; usage: any | null }
 export interface DictationState {
   status: "idle" | "recording" | "processing"; mode: "dictate" | "command"; handsFree: boolean;
@@ -105,7 +108,7 @@ export interface WaylandShortcuts {
 }
 export interface InsertionStatus { ready: "wtype" | "ydotool" | null; problem: string | null; fix: string | null }
 export interface PolishModel { name: string; sizeMb: number; installed: boolean; downloading: boolean }
-export interface ModelDownload { id: string; downloaded: number; total: number; done: boolean; error: string | null }
+export interface ModelDownload { id: string; downloaded: number; total: number; done: boolean; error: string | null; cancelled?: boolean }
 
 export type Theme = "system" | "light" | "dark";
 
@@ -182,6 +185,7 @@ export const api = {
 
   listLocalModels: () => call<LocalModel[]>("list_local_models"),
   downloadLocalModel: (id: string) => call<void>("download_local_model", { id }),
+  cancelLocalDownload: (id: string) => call<void>("cancel_local_download", { id }),
   deleteLocalModel: (id: string) => call<void>("delete_local_model", { id }),
   polishModelStatus: () => call<PolishModel>("polish_model_status"),
   downloadPolishModel: () => call<void>("download_polish_model"),

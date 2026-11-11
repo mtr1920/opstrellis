@@ -354,12 +354,21 @@ async fn download_local_model(app: State<'_>, id: String) -> Res<()> {
         let _ = h.emit("model-download", json!({ "id": id2, "downloaded": downloaded, "total": total, "done": false, "error": null }));
     })
     .await;
-    let error = r.as_ref().err().map(|e| format!("{e:#}"));
-    let _ = app.handle.emit("model-download", json!({ "id": id, "downloaded": 0, "total": 0, "done": true, "error": error }));
+    let cancelled = r.as_ref().is_err_and(|e| e.is::<stt::local::Cancelled>());
+    let error = r.as_ref().err().filter(|_| !cancelled).map(|e| format!("{e:#}"));
+    let _ = app.handle.emit("model-download", json!({ "id": id, "downloaded": 0, "total": 0, "done": true, "error": error, "cancelled": cancelled }));
+    if cancelled {
+        return Ok(());
+    }
     if r.is_ok() {
         warm_up(&app);
     }
     r.map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn cancel_local_download(id: String) {
+    stt::local::cancel_download(&id);
 }
 
 #[tauri::command]
@@ -887,7 +896,7 @@ pub fn run() {
             list_history, update_history, repolish_history, undo_learned, delete_history, clear_history, get_stats, list_apps,
             list_dictionary, upsert_dictionary, delete_dictionary, list_snippets, upsert_snippet, delete_snippet,
             list_transforms, upsert_transform, delete_transform, list_notes, upsert_note, delete_note,
-            list_local_models, download_local_model, delete_local_model, polish_model_status, download_polish_model, delete_polish_model, test_stt, test_llm,
+            list_local_models, download_local_model, cancel_local_download, delete_local_model, polish_model_status, download_polish_model, delete_polish_model, test_stt, test_llm,
             start_dictation, stop_dictation, cancel_dictation, paste_last,
             cloud_login, cloud_logout, cloud_status, permissions, request_accessibility, request_input_monitoring, open_logs,
             rebind_wayland_shortcuts, add_gnome_shortcuts,

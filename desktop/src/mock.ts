@@ -80,12 +80,23 @@ let notes: Note[] = [
   { id: 3, title: "Meeting · Oct 14, 10:00", body: "## Summary\nWeekly sync on the launch.\n\n## Action items\n- [ ] Sam: send the pricing draft\n\n## Transcript (12 min)\nOk let's start…", updatedAt: iso(D), kind: "meeting" },
 ];
 const polishModel: PolishModel = { name: "S1-mini by Superwhisper", sizeMb: 484, installed: false, downloading: false };
+const EU = ["bg","hr","cs","da","nl","en","et","fi","fr","de","el","hu","it","lv","lt","mt","pl","pt","ro","sk","sl","es","sv","ru","uk"];
+const WHISPER = ["en","zh","de","es","ru","ko","fr","ja","pt","tr","pl","ca","nl","ar","sv","it","id","hi","fi","vi","he","uk","el","ms","cs","ro","da","hu","ta","no","th","ur"];
+const m = (id: string, name: string, languages: string, sizeMb: number, langs: string[], recommended: boolean, description: string, installed = false): LocalModel =>
+  ({ id, name, languages, sizeMb, langs, recommended, description, installed, downloading: false });
 const models: LocalModel[] = [
-  { id: "moonshine-tiny-en", name: "Moonshine Tiny", languages: "English", sizeMb: 103, installed: true, downloading: false, description: "Fast and small. Great default for English." },
-  { id: "moonshine-base-en", name: "Moonshine Base", languages: "English", sizeMb: 250, installed: false, downloading: false, description: "More accurate English model." },
-  { id: "whisper-small", name: "Whisper Small", languages: "99 languages", sizeMb: 610, installed: false, downloading: false, description: "Multilingual, slower on CPU." },
-  { id: "sensevoice-small", name: "SenseVoice Small", languages: "zh, en, ja, ko, yue", sizeMb: 240, installed: false, downloading: false, description: "Fast multilingual model." },
+  m("moonshine-tiny-en", "Moonshine Tiny", "English", 103, ["en"], false, "Fastest. Good for short English dictation on any CPU.", true),
+  m("moonshine-base-en", "Moonshine Base", "English", 251, ["en"], false, "More accurate English, still faster than real time on laptops."),
+  m("parakeet-v2-en", "Parakeet TDT 0.6B v2", "English", 482, ["en"], false, "Very accurate English with punctuation and capitalization."),
+  m("parakeet-unified-en", "Parakeet Unified 0.6B", "English", 501, ["en"], true, "Newest NVIDIA English model (2026): best English accuracy, with punctuation and capitalization."),
+  m("parakeet-v3", "Parakeet TDT 0.6B v3", "25 European languages", 487, EU, false, "Multilingual European model with automatic language detection."),
+  m("parakeet-ultra", "Parakeet Ultra 0.6B", "25 European languages", 487, EU, true, "Moondream's retrained Parakeet v3 (2026): more accurate than v3 in every language tested."),
+  m("whisper-base", "Whisper Base", "99 languages", 208, WHISPER, false, "Multilingual Whisper, small and quick."),
+  m("whisper-small", "Whisper Small", "99 languages", 639, WHISPER, false, "Multilingual Whisper with better accuracy."),
+  m("whisper-turbo", "Whisper Large v3 Turbo", "99 languages", 564, WHISPER, true, "Highest multilingual accuracy; needs a fast CPU."),
+  m("sense-voice", "SenseVoice Small", "Chinese, English, Japanese, Korean, Cantonese", 163, ["zh", "en", "ja", "ko", "yue"], true, "Very fast multilingual model for East Asian languages."),
 ];
+const downloads = new Map<string, { timer: ReturnType<typeof setInterval>; finish: () => void }>();
 
 function upsert<T extends { id: number }>(list: T[], item: Partial<T>, fill: Partial<T>): [T[], T] {
   const existing = list.find((x) => x.id === item.id);
@@ -147,16 +158,28 @@ const handlers: Record<string, (a: any) => unknown> = {
   upsert_note: ({ note }) => { let e; [notes, e] = upsert(notes, note, { updatedAt: iso(0), kind: "note" }); e.updatedAt = iso(0); return e; },
   delete_note: ({ id }) => void (notes = notes.filter((x) => x.id !== id)),
   list_local_models: () => structuredClone(models),
-  download_local_model: ({ id }) => {
+  download_local_model: ({ id }) => new Promise<void>((finish) => {
     const m = models.find((x) => x.id === id)!;
     const total = m.sizeMb * 1e6;
     let downloaded = 0;
-    const t = setInterval(() => {
-      downloaded = Math.min(total, downloaded + total / 12);
-      const done = downloaded >= total;
-      if (done) { clearInterval(t); m.installed = true; }
-      emit("model-download", { id, downloaded, total, done, error: null });
+    m.downloading = true;
+    const timer = setInterval(() => {
+      downloaded = Math.min(total, downloaded + total / 40);
+      if (downloaded < total) return emit("model-download", { id, downloaded, total, done: false, error: null });
+      clearInterval(timer); downloads.delete(id); m.installed = true; m.downloading = false;
+      emit("model-download", { id, downloaded: 0, total: 0, done: true, error: null, cancelled: false });
+      finish();
     }, 250);
+    downloads.set(id, { timer, finish });
+  }),
+  cancel_local_download: ({ id }) => {
+    const d = downloads.get(id);
+    if (!d) return;
+    clearInterval(d.timer);
+    downloads.delete(id);
+    models.find((x) => x.id === id)!.downloading = false;
+    emit("model-download", { id, downloaded: 0, total: 0, done: true, error: null, cancelled: true });
+    d.finish();
   },
   polish_model_status: () => ({ ...polishModel }),
   download_polish_model: () => {

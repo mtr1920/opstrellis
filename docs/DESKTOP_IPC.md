@@ -56,7 +56,7 @@ interface Snippet { id: number; trigger: string; expansion: string; createdAt: s
 interface Transform { id: number; name: string; prompt: string; builtin: boolean; output: "replace" | "copy" }   // command mode: replace the selection, or copy the result
 interface Note { id: number; title: string; body: string; updatedAt: string; kind: "note" | "meeting" }
 interface AppUse { appName: string; category: string; count: number }
-interface LocalModel { id: string; name: string; languages: string; sizeMb: number; installed: boolean; description: string }
+interface LocalModel { id: string; name: string; languages: string; sizeMb: number; installed: boolean; downloading: boolean; description: string; langs: string[]; recommended: boolean }
 interface CloudStatus { signedIn: boolean; email: string | null; plan: string | null; usage: any | null }
 type DictationState = {
   status: "idle" | "recording" | "processing"; mode: "dictate" | "command"; handsFree: boolean;
@@ -89,6 +89,7 @@ type Outcome = { kind: "ok" | "warn" | "error"; message: string };   // how a di
 | `list_notes` / `upsert_note` / `delete_note` | `{ kind?: "note" \| "meeting" }` / `{ note: {id?, title, body} }` / `{ id }` | same pattern |
 | `list_local_models` | – | `LocalModel[]` |
 | `download_local_model` / `delete_local_model` | `{ id }` | – (progress via events) |
+| `cancel_local_download` | `{ id }` | – (the download ends with `done: true, error: null, cancelled: true`) |
 | `test_stt` | `{ entryId }` | `{ text: string, latencyMs: number }` (transcribes a bundled sample) |
 | `test_llm` | – | `{ text: string, latencyMs: number }` (cleans up a sample sentence with the saved AI settings) |
 | `meeting_start` / `meeting_stop` / `meeting_status` | `{ secondDevice?, template? }` / – / – | – / – / `MeetingStatus` |
@@ -121,7 +122,7 @@ type Outcome = { kind: "ok" | "warn" | "error"; message: string };   // how a di
 | `permissions-changed` | – (something `permissions` reports changed, e.g. the desktop bound the Wayland shortcuts) |
 | `shortcut-captured` | `string` (a single key such as `"Fn"` or `"RightOption"`, pressed on its own while the recorder is open; macOS) |
 | `history-updated` | – |
-| `model-download` | `{ id: string, downloaded: number, total: number, done: boolean, error: string \| null }` |
+| `model-download` | `{ id: string, downloaded: number, total: number, done: boolean, error: string \| null, cancelled?: boolean }` |
 | `cloud-status` | `CloudStatus` |
 
 ## Windows

@@ -74,7 +74,7 @@ function ChooseProvider({ settings, set, onReady }: SettingsProps & { onReady: (
 
   const loadModel = () => api.listLocalModels().then((ms) => setModel(ms.find((m) => m.id === DEFAULT_LOCAL) ?? null), () => {});
   useEffect(() => void loadModel(), []);
-  const progress = useModelDownloads((id) => { if (id === DEFAULT_LOCAL) { loadModel(); choose({ provider: "local", model: DEFAULT_LOCAL, streaming: true }); } });
+  const progress = useModelDownloads((id, cancelled) => { if (id === DEFAULT_LOCAL && !cancelled) { loadModel(); choose({ provider: "local", model: DEFAULT_LOCAL, streaming: true }); } });
   const p = progress[DEFAULT_LOCAL];
 
   /** Put the chosen provider first in the chain (reusing a matching entry). */

@@ -604,6 +604,15 @@ kbd {
 .btn.use-fn { color: var(--muted); font-size: 12px; font-weight: 400; }
 .btn.use-fn:hover:not(:disabled) { color: var(--text-2); }
 
+/* Local models: a filter bar over the catalog. The search field grows; everything wraps on narrow cards. */
+.model-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 12px 16px; }
+.model-tools .search { flex: 1 1 200px; width: auto; max-width: 320px; }
+.model-tools select { width: 168px; }
+.model-tools .toggle-label { white-space: nowrap; }
+.model-count { margin-left: auto; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.model-row .row-title { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.model-facts { font-variant-numeric: tabular-nums; }
+.model-pct { min-width: 40px; text-align: right; font-variant-numeric: tabular-nums; }
 .provider { display: flex; flex-direction: column; gap: 12px; padding: 16px; }
 .provider .form-grid { padding: 0; }
 .provider.disabled .form-grid, .provider.disabled .provider-foot { opacity: 0.56; }
