@@ -236,7 +236,16 @@ export function LlmSection({ settings, set, saveNow }: SettingsProps & { saveNow
             <select value={service.id} onChange={(e) => {
               const next = LLM_SERVICES.find((s) => s.id === e.target.value)!;
               setPickedOther(next.id === OTHER_SERVICE);
-              update({ provider: next.provider, model: next.defaultModel, baseUrl: next.baseUrl });
+              const patch = { provider: next.provider, model: next.defaultModel, baseUrl: next.baseUrl };
+              update(patch);
+              // On this device: keep a model that is already downloaded rather than one that isn't.
+              if (next.provider === "local") {
+                api.polishModels().then((list) => {
+                  const have = list.filter((m) => m.installed);
+                  const pick = have.find((m) => m.id === llm.model) ?? have.find((m) => m.kind === "cleanup") ?? have[0];
+                  if (pick && pick.id !== patch.model) set("llm", { ...llm, ...patch, model: pick.id });
+                }, () => {});
+              }
               setTest({}); setKey(""); setMsg(null); setHasKey(false);
               void refreshKey();
             }}>
@@ -302,7 +311,11 @@ function LocalPolish({ settings, set }: SettingsProps) {
   const [error, setError] = useState<string | null>(null);
   const load = () => api.polishModels().then(setModels, (e) => setError(errMsg(e)));
   useEffect(() => void load(), []);
-  const progress = useModelDownloads(() => void load());
+  // A finished download is used when the chosen model isn't downloaded.
+  const progress = useModelDownloads((id) => {
+    void load();
+    if (models.some((m) => m.id === id) && !chosen?.installed) update({ model: id });
+  });
   // Retrying hides that model's last error until the new attempt reports progress.
   const [retried, setRetried] = useState<Record<string, unknown>>({});
   const chosen = models.find((m) => m.id === llm.model) ?? models.find((m) => m.id === "s1-mini");

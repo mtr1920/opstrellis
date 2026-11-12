@@ -504,8 +504,8 @@ impl App {
         }
         if mode == Mode::Command && settings.llm.provider == crate::polish::PROVIDER && crate::polish::instruct_model(&settings, &self.models_dir).is_none() {
             return Err(anyhow!(
-                "Command mode needs an AI that follows instructions; {} only cleans up dictation. Download a local instruction model or choose a cloud provider in Settings → AI polish.",
-                crate::polish::selected(&settings).name
+                "Command mode needs an AI that follows instructions; {}. Download a local instruction model or choose a cloud provider in Settings → AI polish.",
+                crate::polish::no_instruct_reason(&settings)
             ));
         }
         // A dictation started after an agent's question appeared answers it (`ask.rs`).
@@ -999,8 +999,18 @@ impl App {
                 pre.text.clone()
             }
         };
+        // Once per run of the app for each action and kind of app: it's a setting, not a failure.
+        static TOLD: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
         if let Some(name) = skipped_action.filter(|_| warning.is_none()) {
-            warning = Some(format!("“{name}” needs an AI that follows instructions; {} only cleaned up the text. Add a local instruction model or a cloud provider in Settings → AI polish.", crate::polish::selected(settings).name));
+            let key = format!("{name}\u{0}{}", ctx.style_category());
+            let mut told = TOLD.lock().unwrap_or_else(|e| e.into_inner());
+            if !told.contains(&key) {
+                told.push(key);
+                warning = Some(format!(
+                    "“{name}” needs an AI that follows instructions, and {}: the text was only cleaned up. Add a local instruction model or a cloud provider in Settings → AI polish.",
+                    crate::polish::no_instruct_reason(settings)
+                ));
+            }
         }
         let cleaned = if warning.is_none() && !ctx.allows_rewrite() { llm::limit_breaks(&pre.text, &cleaned) } else { cleaned };
         // A rewritten text keeps the action's formatting rather than the category's tone rules.

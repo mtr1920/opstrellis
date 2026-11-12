@@ -162,7 +162,7 @@ are kept. To check the installed version, run `opstrellis --version` or open Set
 | Real-time | Streams audio to Deepgram, AssemblyAI or OpenAI Realtime while you speak, with live text in the pill. Local models show live text too. The final text is inserted once, on release. |
 | Cleanup | Removes fillers, handles voice commands, applies your dictionary (`nest dev → feature/nest_dev`) and snippets. Dictionary entries keep their exact spelling through capitalization, tone and AI (`kubectl` stays lowercase at a sentence start). Spoken symbols become characters where they're clearly code: file and domain names everywhere (`main dot rs` → `main.rs`), identifiers, paths and flags in editors, terminals and AI prompts (`src slash app`, `user underscore id`, `dash dash watch`), never next to ordinary words ("the dot product"). |
 | AI polish | Optional: grammar, self-corrections ("2pm, actually 3pm"), lists, while keeping code identifiers intact in editors and terminals. Use any OpenAI-compatible endpoint, Anthropic, OpsTrellis Cloud, or the offline model below. Your dictionary is respected: cloud models are told your terms, and if any AI (cloud or offline) rewords or drops a dictionary word you said, your plain text is inserted instead. |
-| Offline AI polish | **S1-mini by Superwhisper**, a small model trained only to clean up transcripts, runs on your computer with llama.cpp. Downloaded on demand (484 MB, pinned and checksum-verified), about 1 GB of memory while selected, English only. Code editors, terminals and other languages keep the rule-based text. If it's slow (10 s cap) or returns something implausible, the rule-based text is inserted and the pill says why. |
+| Offline AI polish | Models that run on your computer with llama.cpp, downloaded on demand (pinned and checksum-verified). **Spokenly Cleanup 1** (639 MB, 7 languages) and **S1-mini by Superwhisper** (484 MB, English) only clean up dictation, fast; **Qwen3.5 4B** (2.7 GB) follows instructions, so auto actions such as Prompt engineer, command mode, translation and meeting summaries work offline too, alone or paired with a cleanup model. Code editors and terminals keep the rule-based text with a cleanup model. If a model is slow (10 s cap) or returns something implausible, the rule-based text is inserted and the pill says why. |
 | Style per app | Personal, work, email, AI prompts and other categories, each formal, casual, very casual or excited, with optional "how you write here" notes for AI polish. The category comes from the focused app and window title; Style → Apps lets you correct it. |
 | AI prompts | Dictating to ChatGPT, Claude, Cursor or an AI agent in a terminal (Claude Code, Codex, Aider, Gemini CLI) gets prompt cleanup: instructions kept, file names, paths and flags written as code, and optional light structure (Goal, Context, Constraints) for long prompts. |
 | Auto action | Optional, per app category: run an action such as "Polish" or "Make formal" on every dictation before it's inserted. Off by default; never in a plain terminal shell. |
@@ -195,8 +195,9 @@ are kept. To check the installed version, run `opstrellis --version` or open Set
 - Providers form an ordered **fallback chain**: if one fails, the next one takes over, and a
   failed live stream falls back to sending the recording in one piece.
 - Your dictionary is passed to each provider as vocabulary hints.
-- **AI polish / command mode:** any OpenAI-compatible endpoint (OpenAI, Groq, OpenRouter, Ollama,
-  LM Studio, vLLM), Anthropic, OpsTrellis Cloud, or offline S1-mini.
+- **AI polish / command mode:** OpenAI, Anthropic, Google Gemini, Groq, OpenRouter, Mistral,
+  DeepSeek, xAI, Together AI, Fireworks, Cerebras, Ollama, LM Studio, any other OpenAI-compatible
+  endpoint, OpsTrellis Cloud, or a model on your computer. Each service keeps its own saved key.
 - API keys are stored in the macOS Keychain or the Linux Secret Service.
 
 </details>

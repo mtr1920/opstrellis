@@ -457,8 +457,8 @@ async fn finish_note(app: &App, transcript: &str, started_at: &str, total_ms: i6
     let mut body = String::new();
     if settings.llm.enabled && settings.llm.provider == crate::polish::PROVIDER && crate::polish::instruct_model(&settings, &app.models_dir).is_none() {
         body.push_str(&format!(
-            "_No summary: {} only cleans up dictation. Add a local instruction model or choose a cloud provider in Settings → AI polish to summarize meetings._\n\n",
-            crate::polish::selected(&settings).name
+            "_No summary: {}. Add a local instruction model or choose a cloud provider in Settings → AI polish to summarize meetings._\n\n",
+            crate::polish::no_instruct_reason(&settings)
         ));
     } else if settings.llm.enabled {
         match app.llm_client(&settings).complete(&summary_prompt(template, labelled), &format!("<transcript>\n{transcript}\n</transcript>")).await {

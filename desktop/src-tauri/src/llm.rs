@@ -51,7 +51,22 @@ pub fn key_id(settings: &Settings) -> Option<String> {
 /// `temperature`, some refuse `reasoning_effort`): a 400 naming one of them is retried without.
 fn rejected_option(e: &anyhow::Error) -> bool {
     let msg = format!("{e:#}").to_lowercase();
-    msg.contains(" 400:") && ["temperature", "reasoning", "thinking", "unsupported", "not supported", "unknown parameter", "unrecognized"].iter().any(|w| msg.contains(w))
+    (msg.contains(" 400:") || msg.contains(" 422:")) && ["temperature", "reasoning", "thinking", "unsupported", "not supported", "unknown parameter", "unrecognized"].iter().any(|w| msg.contains(w))
+}
+
+/// Server and model pairs that refused an optional setting: later requests go without, in one try.
+static REFUSES_OPTIONS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn refuses_options(server: &str, model: &str) -> bool {
+    REFUSES_OPTIONS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|k| *k == format!("{server} {model}"))
+}
+
+fn remember_refusal(server: &str, model: &str) {
+    let mut list = REFUSES_OPTIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let key = format!("{server} {model}");
+    if !list.contains(&key) {
+        list.push(key);
+    }
 }
 
 /// Moves the key saved before keys were kept per server ("llm") to the current server's id. With no
@@ -102,9 +117,17 @@ impl Client {
             }
             async move { check("llm", send(rb).await?).await?.json::<Value>().await.map_err(anyhow::Error::from) }
         };
-        let v = match post(&body).await {
-            Err(e) if rejected_option(&e) => post(&json!({ "model": self.model, "messages": messages })).await?,
-            r => r?,
+        let bare = json!({ "model": self.model, "messages": messages });
+        let v = if refuses_options(base, &self.model) {
+            post(&bare).await?
+        } else {
+            match post(&body).await {
+                Err(e) if rejected_option(&e) => {
+                    remember_refusal(base, &self.model);
+                    post(&bare).await?
+                }
+                r => r?,
+            }
         };
         v.pointer("/choices/0/message/content").and_then(Value::as_str).map(String::from).ok_or_else(|| anyhow!("llm: empty response"))
     }
@@ -130,9 +153,17 @@ impl Client {
             async move { check("anthropic", send(rb).await?).await?.json::<Value>().await.map_err(anyhow::Error::from) }
         };
         // Newer models refuse sampling settings.
-        let v = match post(json!({ "model": self.model, "max_tokens": 4096, "temperature": 0.2, "system": system, "messages": messages })).await {
-            Err(e) if rejected_option(&e) => post(json!({ "model": self.model, "max_tokens": 4096, "system": system, "messages": messages })).await?,
-            r => r?,
+        let bare = json!({ "model": self.model, "max_tokens": 4096, "system": system, "messages": messages });
+        let v = if refuses_options(base, &self.model) {
+            post(bare).await?
+        } else {
+            match post(json!({ "model": self.model, "max_tokens": 4096, "temperature": 0.2, "system": system, "messages": messages })).await {
+                Err(e) if rejected_option(&e) => {
+                    remember_refusal(base, &self.model);
+                    post(bare).await?
+                }
+                r => r?,
+            }
         };
         anthropic_text(&v).ok_or_else(|| anyhow!("anthropic: empty response"))
     }
@@ -460,6 +491,10 @@ mod tests {
         assert!(!rejected_option(&e("llm 401: Incorrect API key provided")), "not a setting");
         assert!(!rejected_option(&e("llm 400: model not found")));
         assert!(!rejected_option(&e("llm 500: temperature sensor offline")), "only a refused request");
+        assert!(rejected_option(&e("llm 422: Unsupported parameter: thinking")), "DeepSeek refuses with 422");
+        assert!(!refuses_options("https://srv.example/v1", "m1"));
+        remember_refusal("https://srv.example/v1", "m1");
+        assert!(refuses_options("https://srv.example/v1", "m1") && !refuses_options("https://srv.example/v1", "m2"));
         let thinking_first = json!({ "content": [{ "type": "thinking", "thinking": "hm" }, { "type": "text", "text": "Meet at 3." }] });
         assert_eq!(anthropic_text(&thinking_first).as_deref(), Some("Meet at 3."));
         assert_eq!(anthropic_text(&json!({ "content": [] })), None);

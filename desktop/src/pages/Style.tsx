@@ -244,7 +244,7 @@ function AppAi({ settings, set, tab, label }: SettingsProps & { tab: Category; l
       desc={ai ? "Applied by AI polish, in the same request as the cleanup." : "Turn on AI polish below to use these."}>
       <div className="card">
         <Row title="Auto action" desc={ai && !follows
-          ? "The on-device cleanup model can't run actions: dictations here are cleaned up only. Add a local instruction model or choose a cloud provider in Settings → AI polish."
+          ? `${chosenLocal?.kind === "instruct" ? `${chosenLocal.name} isn't downloaded yet` : "The on-device cleanup model can't run actions"}: dictations here are cleaned up only. Add a local instruction model or choose a cloud provider in Settings → AI polish.`
           : `Rewrite every dictation here with an action from Library → Actions before it's inserted.${tab === "other" ? " Never in a plain terminal." : ""}`}>
           <select value={current ?? ""} disabled={!ai} aria-label={`Auto action for ${label}`} onChange={(e) => choose(e.target.value)}>
             <option value="">Off</option>
