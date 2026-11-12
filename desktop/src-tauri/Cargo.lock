@@ -3765,7 +3765,7 @@ dependencies = [
 
 [[package]]
 name = "opstrellis"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "active-win-pos-rs",
  "anyhow",
