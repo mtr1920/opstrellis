@@ -43,10 +43,12 @@ pub struct Hotkeys {
 #[serde(rename_all = "camelCase", default)]
 pub struct Llm {
     pub enabled: bool,
-    /// "openai" (any OpenAI-compatible endpoint), "anthropic" or "cloud".
+    /// "openai" (any OpenAI-compatible endpoint), "anthropic", "cloud" or "local" (`polish.rs`).
     pub provider: String,
     pub base_url: Option<String>,
     pub model: String,
+    /// With a local cleanup model: the local instruction model for actions, commands and summaries.
+    pub local_rewrite: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,6 +242,7 @@ impl Default for Settings {
                 provider: "openai".into(),
                 base_url: None,
                 model: "gpt-4o-mini".into(),
+                local_rewrite: None,
             },
             cleanup: Cleanup { remove_fillers: true, voice_commands: true, auto_learn: false, tech_terms: true, term_packs: Vec::new() },
             auto_transforms: HashMap::new(),

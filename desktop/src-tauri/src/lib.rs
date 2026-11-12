@@ -526,36 +526,51 @@ fn delete_local_model(app: State, id: String) -> Res<()> {
     stt::local::delete(&app.models_dir, &id).map_err(err)
 }
 
+/// The chosen local polish model (S1-mini when none is chosen).
 #[tauri::command]
 fn polish_model_status(app: State) -> polish::Status {
-    polish::status(&app.models_dir)
+    polish::status(&app.models_dir, polish::selected(&app.settings()))
 }
 
-/// Progress arrives as `model-download` events with the id "s1-mini".
+/// Every local polish model.
 #[tauri::command]
-async fn download_polish_model(app: State<'_>) -> Res<()> {
+fn polish_models(app: State) -> Vec<polish::Status> {
+    polish::list(&app.models_dir)
+}
+
+/// Progress arrives as `model-download` events with the model's id (S1-mini's is "s1-mini").
+#[tauri::command]
+async fn download_polish_model(app: State<'_>, id: Option<String>) -> Res<()> {
     let app = app.inner().clone();
+    let id = id.unwrap_or_else(|| polish::DEFAULT.into());
     let h = app.handle.clone();
-    let r = polish::download(&app.models_dir, move |downloaded, total| {
-        let _ = h.emit("model-download", json!({ "id": "s1-mini", "downloaded": downloaded, "total": total, "done": false, "error": null }));
+    let event_id = id.clone();
+    let r = polish::download(&app.models_dir, &id, move |downloaded, total| {
+        let _ = h.emit("model-download", json!({ "id": event_id, "downloaded": downloaded, "total": total, "done": false, "error": null }));
     })
     .await;
     let error = r.as_ref().err().map(|e| format!("{e:#}"));
-    let _ = app.handle.emit("model-download", json!({ "id": "s1-mini", "downloaded": 0, "total": 0, "done": true, "error": error }));
+    let _ = app.handle.emit("model-download", json!({ "id": id, "downloaded": 0, "total": 0, "done": true, "error": error }));
     sync_polish(&app);
     r.map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
-fn delete_polish_model(app: State) -> Res<()> {
-    polish::delete(&app.models_dir).map_err(err)
+fn delete_polish_model(app: State, id: Option<String>) -> Res<()> {
+    polish::delete(&app.models_dir, id.as_deref().unwrap_or(polish::DEFAULT)).map_err(err)
 }
 
-/// Keeps the local polish model loaded only while it is the AI provider in use.
+/// Keeps the local polish models loaded only while local AI is in use: the chosen one and the
+/// instruction model paired with it.
 fn sync_polish(app: &App) {
     let s = app.settings();
     if s.llm.enabled && s.llm.provider == polish::PROVIDER {
-        polish::warm(&app.models_dir);
+        let chosen = polish::selected(&s);
+        let mut ids = vec![chosen.id];
+        if let Some(m) = polish::instruct_model(&s, &app.models_dir).filter(|m| m.id != chosen.id) {
+            ids.push(m.id);
+        }
+        polish::warm(&app.models_dir, &ids);
     } else {
         polish::unload();
     }
@@ -587,13 +602,15 @@ async fn test_llm(app: State<'_>) -> Res<Value> {
     let settings = app.settings();
     let sample = "um so lets meet at two actually three pm on friday";
     let started = std::time::Instant::now();
-    if settings.llm.provider == polish::PROVIDER {
+    let chosen = polish::selected(&settings);
+    if settings.llm.provider == polish::PROVIDER && chosen.kind == polish::Kind::Cleanup {
         let (dir, deadline) = (app.models_dir.clone(), started + std::time::Duration::from_secs(30));
-        let control = polish::control_line("casual", "work");
-        let text = tokio::task::spawn_blocking(move || polish::polish_blocking(&dir, sample, &control, deadline))
-            .await
-            .map_err(err)?
-            .map_err(|e| format!("{e:#}"))?;
+        let text = tokio::task::spawn_blocking(move || {
+            polish::cleanup_blocking(&dir, chosen, sample, &polish::Hints { tone: "casual", style_category: "work", app: Some("Slack") }, deadline)
+        })
+        .await
+        .map_err(err)?
+        .map_err(|e| format!("{e:#}"))?;
         return Ok(json!({ "text": text, "latencyMs": started.elapsed().as_millis() as u64 }));
     }
     let ctx = context::classify(Some("Slack".into()), None);
@@ -1261,7 +1278,7 @@ pub fn run() {
             retranscribe_history,
             list_dictionary, upsert_dictionary, delete_dictionary, list_snippets, upsert_snippet, delete_snippet,
             list_transforms, upsert_transform, delete_transform, list_notes, upsert_note, delete_note,
-            list_local_models, download_local_model, cancel_local_download, delete_local_model, polish_model_status, download_polish_model, delete_polish_model, test_stt, test_llm,
+            list_local_models, download_local_model, cancel_local_download, delete_local_model, polish_model_status, polish_models, download_polish_model, delete_polish_model, test_stt, test_llm,
             start_dictation, stop_dictation, cancel_dictation, paste_last,
             cloud_login, cloud_logout, cloud_status, team_status, team_sync_now, permissions, request_accessibility, request_input_monitoring, open_logs,
             rebind_wayland_shortcuts, add_gnome_shortcuts,

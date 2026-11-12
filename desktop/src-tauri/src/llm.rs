@@ -1,6 +1,7 @@
 //! LLM post-processing: transcript clean-up (grammar, self-corrections, lists, tone) and command
 //! mode (rewrite selected text from a spoken instruction). Works with any OpenAI-compatible chat
-//! endpoint (OpenAI, Groq, OpenRouter, Ollama, LM Studio, vLLM, OpsTrellis Cloud) and Anthropic.
+//! endpoint (OpenAI, Groq, OpenRouter, Ollama, LM Studio, vLLM, OpsTrellis Cloud), Anthropic, and a
+//! local instruction model (`polish.rs`).
 
 use crate::context::AppContext;
 use crate::stt::{check, send, HTTP};
@@ -8,11 +9,14 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::time::Duration;
 
+#[derive(Default)]
 pub struct Client {
     pub provider: String,
     pub base_url: Option<String>,
     pub model: String,
     pub key: Option<String>,
+    /// For a local model (`polish.rs`): the models folder.
+    pub local_dir: Option<std::path::PathBuf>,
 }
 
 /// Dictation cleanup is on the critical path: past this, the rule-based text is inserted instead.
@@ -27,7 +31,7 @@ impl Client {
 
     pub async fn complete_within(&self, system: &str, user: &str, timeout: Duration) -> Result<String> {
         if self.provider == crate::polish::PROVIDER {
-            return Err(anyhow!("{} only polishes dictation; commands, actions and summaries need a cloud or OpenAI-compatible AI provider", crate::polish::NAME));
+            return self.local(system, user, timeout).await;
         }
         let text = if self.provider == "anthropic" { self.anthropic(system, user, timeout).await? } else { self.openai(system, user, timeout).await? };
         Ok(strip_controls(&strip_wrapping(&text)))
@@ -47,6 +51,17 @@ impl Client {
         }
         let v: Value = check("llm", send(rb).await?).await?.json().await?;
         v.pointer("/choices/0/message/content").and_then(Value::as_str).map(String::from).ok_or_else(|| anyhow!("llm: empty response"))
+    }
+
+    /// A local instruction model. A cleanup model (or none downloaded) can't do this.
+    async fn local(&self, system: &str, user: &str, timeout: Duration) -> Result<String> {
+        let m = crate::polish::info(&self.model).filter(|m| m.kind == crate::polish::Kind::Instruct);
+        let (Some(m), Some(dir)) = (m, self.local_dir.clone()) else {
+            return Err(anyhow!("Actions, commands and summaries need a local instruction model or a cloud provider: choose one in Settings → AI polish"));
+        };
+        let (system, user, deadline) = (system.to_string(), user.to_string(), std::time::Instant::now() + timeout);
+        let text = tokio::task::spawn_blocking(move || crate::polish::chat_blocking(&dir, m, &system, &user, deadline)).await??;
+        Ok(strip_controls(&strip_wrapping(&text)))
     }
 
     async fn anthropic(&self, system: &str, user: &str, timeout: Duration) -> Result<String> {
@@ -112,10 +127,11 @@ pub const OUTPUT_LANGUAGES: &[(&str, &str)] = &[
 ];
 
 /// The language AI polish writes this dictation in, as (code, name): only with a provider that
-/// follows instructions (not the offline polish model), and never in a shell, where commands stay
-/// verbatim. Unknown codes are ignored.
-pub fn output_language(settings: &crate::settings::Settings, ctx: &AppContext) -> Option<(&'static str, &'static str)> {
-    if !settings.llm.enabled || settings.llm.provider == crate::polish::PROVIDER || !ctx.allows_rewrite() {
+/// follows instructions (not a local cleanup model alone), and never in a shell, where commands
+/// stay verbatim. Unknown codes are ignored.
+pub fn output_language(settings: &crate::settings::Settings, ctx: &AppContext, models_dir: &std::path::Path) -> Option<(&'static str, &'static str)> {
+    let follows = settings.llm.provider != crate::polish::PROVIDER || crate::polish::instruct_model(settings, models_dir).is_some();
+    if !settings.llm.enabled || !follows || !ctx.allows_rewrite() {
         return None;
     }
     let code = settings.output_languages.get(ctx.style_category())?;
@@ -362,7 +378,7 @@ mod tests {
     #[tokio::test]
     async fn insecure_base_url_is_refused_before_sending() {
         for provider in ["openai", "anthropic"] {
-            let c = Client { provider: provider.into(), base_url: Some("http://llm.example.com/v1".into()), model: "m".into(), key: Some("k".into()) };
+            let c = Client { provider: provider.into(), base_url: Some("http://llm.example.com/v1".into()), model: "m".into(), key: Some("k".into()), ..Default::default() };
             let e = c.complete_within("s", "u", Duration::from_secs(1)).await.unwrap_err().to_string();
             assert!(e.contains("isn't encrypted"), "{provider}: {e}");
         }
@@ -404,23 +420,24 @@ mod tests {
         assert!(p.contains("Never translate names, code identifiers") && p.contains("Spell these terms exactly as written: Karol") && p.contains("Casual"));
         assert!(!p.contains("Do not summarize, translate"));
 
+        let dir = std::env::temp_dir().join("no-local-models");
         let mut s = crate::settings::Settings::default();
         s.output_languages.insert("work".into(), "en".into());
         s.output_languages.insert("other".into(), "en".into());
-        assert_eq!(output_language(&s, &slack), None, "AI polish off");
+        assert_eq!(output_language(&s, &slack, &dir), None, "AI polish off");
         s.llm.enabled = true;
-        assert_eq!(output_language(&s, &slack), Some(("en", "English")));
+        assert_eq!(output_language(&s, &slack, &dir), Some(("en", "English")));
         let shell = crate::context::classify(Some("Alacritty".into()), None);
         assert_eq!(shell.style_category(), "other");
-        assert_eq!(output_language(&s, &shell), None, "a shell keeps commands verbatim");
+        assert_eq!(output_language(&s, &shell, &dir), None, "a shell keeps commands verbatim");
         let agent = crate::context::classify(Some("kitty".into()), Some("\u{2733} Claude Code".into()));
         s.output_languages.insert("ai".into(), "hi".into());
-        assert_eq!(output_language(&s, &agent), Some(("hi", "Hindi")), "an agent in a terminal may be translated");
+        assert_eq!(output_language(&s, &agent, &dir), Some(("hi", "Hindi")), "an agent in a terminal may be translated");
         s.output_languages.insert("work".into(), "xx".into());
-        assert_eq!(output_language(&s, &slack), None, "unknown code");
+        assert_eq!(output_language(&s, &slack, &dir), None, "unknown code");
         s.output_languages.insert("work".into(), "en".into());
         s.llm.provider = crate::polish::PROVIDER.into();
-        assert_eq!(output_language(&s, &slack), None, "the offline model can't translate");
+        assert_eq!(output_language(&s, &slack, &dir), None, "a local cleanup model alone can't translate");
         assert!(OUTPUT_LANGUAGES.iter().all(|(c, n)| !c.is_empty() && !n.is_empty()) && OUTPUT_LANGUAGES.len() >= 25);
 
         // Translation changes the length a lot (English to Chinese); judged like a rewrite.
@@ -459,7 +476,7 @@ mod tests {
             sock.write_all(resp.as_bytes()).await.unwrap();
             String::from_utf8_lossy(&buf).to_string()
         });
-        let c = Client { provider: "openai".into(), base_url: Some(base), model: "test-model".into(), key: Some("k".into()) };
+        let c = Client { provider: "openai".into(), base_url: Some(base), model: "test-model".into(), key: Some("k".into()), ..Default::default() };
         let text = "hey sam thanks for the update";
         let out = c.complete(&command_prompt(Some(text)), &command_input(Some(text), "Make it formal.")).await.unwrap();
         assert_eq!(out, "Hi Sam, thanks for the update.");
@@ -488,7 +505,7 @@ mod tests {
                 let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                 next.write_all(response.as_bytes()).await.unwrap();
             });
-            let client = Client { provider: provider.into(), base_url: Some(base), model: "test".into(), key: Some("test".into()) };
+            let client = Client { provider: provider.into(), base_url: Some(base), model: "test".into(), key: Some("test".into()), ..Default::default() };
             let failed = client.complete_within("cleanup", "text", Duration::from_millis(50)).await.unwrap_err();
             assert!(failed.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout), "{provider}: {failed}");
             assert_eq!(client.complete_within("cleanup", "next text", Duration::from_secs(2)).await.unwrap(), "Recovered");
@@ -505,6 +522,7 @@ mod tests {
             base_url: std::env::var("LLM_BASE_URL").ok(),
             model: std::env::var("LLM_MODEL").unwrap_or("gpt-4o-mini".into()),
             key: std::env::var("LLM_API_KEY").ok(),
+            ..Default::default()
         };
         let ctx = crate::context::classify(Some("Slack".into()), None);
         let raw = "um so let's meet at two pm actually three pm on friday";
