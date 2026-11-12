@@ -455,10 +455,10 @@ async fn finish_note(app: &App, transcript: &str, started_at: &str, total_ms: i6
     let when = chrono::DateTime::parse_from_rfc3339(started_at).map(|d| d.format("%b %-d, %H:%M").to_string()).unwrap_or_default();
     let minutes = (total_ms as f64 / 60_000.0).round().max(1.0);
     let mut body = String::new();
-    if settings.llm.enabled && settings.llm.provider == crate::polish::PROVIDER {
+    if settings.llm.enabled && settings.llm.provider == crate::polish::PROVIDER && crate::polish::instruct_model(&settings, &app.models_dir).is_none() {
         body.push_str(&format!(
-            "_No summary: {} only polishes dictation. Choose another AI provider in Settings to summarize meetings._\n\n",
-            crate::polish::NAME
+            "_No summary: {}. Add a local instruction model or choose a cloud provider in Settings → AI polish to summarize meetings._\n\n",
+            crate::polish::no_instruct_reason(&settings)
         ));
     } else if settings.llm.enabled {
         match app.llm_client(&settings).complete(&summary_prompt(template, labelled), &format!("<transcript>\n{transcript}\n</transcript>")).await {

@@ -25,8 +25,10 @@ export interface Settings {
   microphone: string | null;
   language: string;
   sttChain: SttEntry[];
-  /** "local" = S1-mini by Superwhisper on this device (polish only). */
-  llm: { enabled: boolean; provider: "openai" | "anthropic" | "cloud" | "local"; baseUrl: string | null; model: string };
+  /** "local" = a model on this device (polish.rs): `model` is its id; cleanup models only clean up. */
+  llm: { enabled: boolean; provider: "openai" | "anthropic" | "cloud" | "local"; baseUrl: string | null; model: string;
+    /** With a local cleanup model: the local instruction model for actions, commands and summaries. */
+    localRewrite?: string | null };
   /** termPacks: ids of the term packs in use besides tech terms (built-in or imported). */
   cleanup: { removeFillers: boolean; voiceCommands: boolean; autoLearn: boolean; techTerms: boolean; termPacks: string[] };
   styles: Record<Category, Tone>;
@@ -150,7 +152,11 @@ export interface WaylandShortcuts {
   gnomeShortcuts: boolean;
 }
 export interface InsertionStatus { ready: "wtype" | "ydotool" | null; problem: string | null; fix: string | null }
-export interface PolishModel { name: string; sizeMb: number; installed: boolean; downloading: boolean }
+/** A local AI polish model. "cleanup" models only clean up dictation; "instruct" models also run actions, commands, translation and summaries. */
+export interface PolishModel {
+  id: string; name: string; sizeMb: number; installed: boolean; downloading: boolean;
+  kind: "cleanup" | "instruct"; languages: string[]; license: string; description: string;
+}
 export interface ModelDownload { id: string; downloaded: number; total: number; done: boolean; error: string | null; cancelled?: boolean; changed?: boolean }   // changed: the file isn't the one this version pinned
 
 export type Theme = "system" | "light" | "dark";
@@ -262,8 +268,9 @@ export const api = {
   cancelLocalDownload: (id: string) => call<void>("cancel_local_download", { id }),
   deleteLocalModel: (id: string) => call<void>("delete_local_model", { id }),
   polishModelStatus: () => call<PolishModel>("polish_model_status"),
-  downloadPolishModel: () => call<void>("download_polish_model"),
-  deletePolishModel: () => call<void>("delete_polish_model"),
+  polishModels: () => call<PolishModel[]>("polish_models"),
+  downloadPolishModel: (id?: string) => call<void>("download_polish_model", { id: id ?? null }),
+  deletePolishModel: (id?: string) => call<void>("delete_polish_model", { id: id ?? null }),
   testStt: (entryId: string) => call<{ text: string; latencyMs: number }>("test_stt", { entryId }),
   testLlm: () => call<{ text: string; latencyMs: number }>("test_llm"),
 

@@ -32,6 +32,8 @@ OPSTRELLIS_BENCH_DOWNLOAD=1 cargo test --release bench_local_models -- --ignored
 cargo test --release terms_speed -- --ignored --nocapture   # cost of the tech-term pass per dictation
 # Offline AI polish with the real model (download s1-mini-q4_k_m.gguf into <dir>/polish/): output and speed
 OPSTRELLIS_POLISH_MODELS=<dir> cargo test --release polish_live -- --ignored --nocapture
+# Local polish bake-off: every installed model in <dir>/polish/ on desktop/bench/polish/cases.tsv (below)
+OPSTRELLIS_POLISH_MODELS=<dir> [OPSTRELLIS_POLISH_ONLY=id,id] [OPSTRELLIS_POLISH_OUT=<file>] cargo test --release bench_polish -- --ignored --nocapture
 # Engine plumbing with any small Qwen3 GGUF, random weights are fine (load, prompt, token and time caps)
 OPSTRELLIS_POLISH_GGUF=<file.gguf> cargo test polish_engine -- --ignored --nocapture
 # Re-mine tech-term aliases (Kokoro/Piper TTS from the sherpa-onnx tts-models release + the local STT models); review the output, then edit src-tauri/terms/tech.json
@@ -178,3 +180,37 @@ that. There, at 1.0, the vocabulary took WER after rules from 4.8% to 3.0% and t
 
 These are synthetic voices (macOS `say`), so pauses and pronunciation are cleaner than people's;
 compare rows with each other.
+
+### Local AI polish models (bake-off)
+
+`bench_polish` runs [`desktop/bench/polish/cases.tsv`](../desktop/bench/polish/cases.tsv) through
+each on-device model as the app does: cleanup models with the prompt they were trained on,
+instruction models with the cloud cleanup prompt (and an action's prompt for the action cases). The
+36 cleanup cases are Parakeet-style text after the rule pass: self-corrections, repeats, lists,
+numbers, emails, grammar, AI prompts with code names, questions and instructions that must not be
+answered, and text that is already right and must come back unchanged ("left alone"). The 9 action
+cases (Prompt engineer, Make formal, Shorten, Bullet points) are scored on the facts they must keep;
+their outputs were also read by hand. Apple M-series Mac, Metal, Q4_K_M or Q8_0 files.
+
+| Model | Kind | Exact | WER as written | WER | Left alone | Words lost | Action facts kept | Median / p95 |
+|---|---|---|---|---|---|---|---|---|
+| **Spokenly Cleanup 1** (shipped, recommended) | cleanup | 57% | 16% | 8% | 100% | 5 | - | 70 / 221 ms |
+| **S1-mini** (shipped) | cleanup | 51% | 13% | 7% | 70% | 9 | - | 88 / 190 ms |
+| SpeakoFlow Mini 0.8B | cleanup | 41% | 20% | 11% | 70% | 8 | - | 276 / 678 ms |
+| **Qwen3.5 4B** (shipped, recommended for actions) | instruction | 49% | 15% | 9% | 60% | 6 | 90% | 1112 / 2727 ms |
+| Qwen3.5 2B | instruction | 32% | 28% | 22% | 80% | 13 | 90% | 499 / 1246 ms |
+| Qwen3.5 0.8B | instruction | 27% | 33% | 26% | 70% | 23 | 87% | 258 / 1017 ms |
+| Ministral 3 3B | instruction | 11% | 49% | 50% | 20% | 43 | 81% | 769 / 7463 ms |
+
+- S1-mini dropped "Translate this to French." (it acted on the text), turned a plain list of four
+  items into bullets and added line breaks to short emails. Spokenly Cleanup 1 changed nothing that
+  was right, but leaves spoken symbols ("dot ts") to the rule pass after it.
+- Qwen3.5 4B rewords correct text when only cleaning up ("has been moved"), but is the only model
+  that ran the actions properly: a structured prompt from rambling speech, a formal rewrite, a real
+  shortening, real bullet points. Qwen3.5 2B mostly just cleaned up the action cases; Ministral 3 3B
+  added content ("use pg_dump") and commentary.
+- Granite 4.0 1B outputs only "!" on Metal with this llama.cpp (fine on the CPU), so it isn't offered.
+- Prompt-lookup drafting gave the same outputs byte for byte and cut S1-mini from 122 to 88 ms and
+  Spokenly Cleanup 1 from 126 to 70 ms at the median (p95 311 → 190 ms and 401 → 221 ms). Qwen3.5 is
+  a hybrid model whose cache can't be trimmed, so it decodes without drafts.
+

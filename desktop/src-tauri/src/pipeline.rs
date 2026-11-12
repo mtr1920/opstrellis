@@ -502,8 +502,11 @@ impl App {
         if mode == Mode::Command && !settings.llm.enabled {
             return Err(anyhow!("Command mode needs AI. Turn on AI polish in Settings → AI polish."));
         }
-        if mode == Mode::Command && settings.llm.provider == crate::polish::PROVIDER {
-            return Err(anyhow!("Command mode needs a cloud or OpenAI-compatible AI provider; {} only polishes dictation.", crate::polish::NAME));
+        if mode == Mode::Command && settings.llm.provider == crate::polish::PROVIDER && crate::polish::instruct_model(&settings, &self.models_dir).is_none() {
+            return Err(anyhow!(
+                "Command mode needs an AI that follows instructions; {}. Download a local instruction model or choose a cloud provider in Settings → AI polish.",
+                crate::polish::no_instruct_reason(&settings)
+            ));
         }
         // A dictation started after an agent's question appeared answers it (`ask.rs`).
         let answers = crate::ask::QUESTIONS.answered_by(mode == Mode::Dictate, pressed_at);
@@ -896,9 +899,21 @@ impl App {
             workspace_names: crate::workspace::replaces_names(settings.workspace_replace, ctx),
             mentions: ctx.category == "ai_prompts",
         };
-        // Local polish skips code editors, terminals and other languages: the rules alone, as with AI off.
         let local = settings.llm.provider == crate::polish::PROVIDER;
-        if !settings.llm.enabled || (local && !crate::polish::applies(ctx, &settings.language, raw)) {
+        // A local cleanup model can't follow an action's instructions: a paired instruction model does.
+        let instruct = if local { crate::polish::instruct_model(settings, &self.models_dir) } else { None };
+        let action = self.auto_transform(ctx, settings);
+        let output = llm::output_language(settings, ctx, &self.models_dir);
+        // The local model that runs: the instruction model for an action or a translation, else the chosen one.
+        let local_model = local.then(|| match instruct {
+            Some(m) if action.is_some() || output.is_some() => m,
+            _ => crate::polish::selected(settings),
+        });
+        let skipped_action = action.as_ref().filter(|_| local_model.is_some_and(|m| m.kind == crate::polish::Kind::Cleanup)).map(|t| t.name.clone());
+        let action = if skipped_action.is_some() { None } else { action };
+        let cleanup_model = local_model.is_some_and(|m| m.kind == crate::polish::Kind::Cleanup);
+        // A local cleanup model skips code editors, terminals and other languages: the rules alone, as with AI off.
+        if !settings.llm.enabled || local_model.is_some_and(|m| !crate::polish::applies(m, ctx, &settings.language, raw)) {
             let p = text::process(raw, &full);
             return Ok(Cleaned::from(p));
         }
@@ -913,8 +928,6 @@ impl App {
         if let Some(s) = text::whole_snippet(&pre.text, &snippets) {
             return Ok(Cleaned { text: full.expand_snippet(&s.expansion), fixes: pre.fixes, press_enter: pre.press_enter, used: pre.used, ..Default::default() });
         }
-        // The local model only cleans up; it can't follow an action's instructions.
-        let action = if local { None } else { self.auto_transform(ctx, settings) };
         let rewrite = action.as_ref().map(|t| t.prompt.as_str());
         // A rewrite must not reword the snippet triggers it's given, or they wouldn't expand.
         let mut keep = vocabulary.to_vec();
@@ -927,7 +940,6 @@ impl App {
             keep.extend(text::snippet_triggers_in(&pre.text, &snippets));
         }
         let mut warning = None;
-        let output = llm::output_language(settings, ctx);
         let plain = if output.is_some() { "Inserted plain text, not translated." } else { "Inserted plain text." };
         let system = llm::cleanup_prompt(
             ctx,
@@ -941,16 +953,21 @@ impl App {
                 code_names: &code_names,
             },
         );
-        let request = if local {
-            let (dir, input, control) = (self.models_dir.clone(), pre.text.clone(), crate::polish::control_line(&tone, ctx.style_category()));
-            let deadline = Instant::now() + llm::CLEANUP_TIMEOUT;
-            tokio::task::spawn_blocking(move || crate::polish::polish_blocking(&dir, &input, &control, deadline))
+        let request = match local_model {
+            Some(m) if m.kind == crate::polish::Kind::Cleanup => {
+                let (dir, input, tone, category, app) = (self.models_dir.clone(), pre.text.clone(), tone.clone(), ctx.style_category().to_string(), ctx.app_name.clone());
+                let deadline = Instant::now() + llm::CLEANUP_TIMEOUT;
+                tokio::task::spawn_blocking(move || {
+                    let hints = crate::polish::Hints { tone: &tone, style_category: &category, app: app.as_deref() };
+                    crate::polish::cleanup_blocking(&dir, m, &input, &hints, deadline)
+                })
                 .await
                 .map_err(anyhow::Error::from)
                 .and_then(|r| r)
                 .map(|t| llm::strip_controls(&t))
-        } else {
-            self.llm_client(settings).complete_within(&system, &llm::wrap_dictation(&pre.text), llm::CLEANUP_TIMEOUT).await
+            }
+            Some(m) => self.local_client(m).complete_within(&system, &llm::wrap_dictation(&pre.text), llm::CLEANUP_TIMEOUT).await,
+            None => self.llm_client(settings).complete_within(&system, &llm::wrap_dictation(&pre.text), llm::CLEANUP_TIMEOUT).await,
         };
         // A cleanup (not a rewrite action) must keep every dictionary term that was said, offline
         // or cloud: the local model can't be told the user's words, so this is how it respects them.
@@ -982,6 +999,19 @@ impl App {
                 pre.text.clone()
             }
         };
+        // Once per run of the app for each action and kind of app: it's a setting, not a failure.
+        static TOLD: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        if let Some(name) = skipped_action.filter(|_| warning.is_none()) {
+            let key = format!("{name}\u{0}{}", ctx.style_category());
+            let mut told = TOLD.lock().unwrap_or_else(|e| e.into_inner());
+            if !told.contains(&key) {
+                told.push(key);
+                warning = Some(format!(
+                    "“{name}” needs an AI that follows instructions, and {}: the text was only cleaned up. Add a local instruction model or a cloud provider in Settings → AI polish.",
+                    crate::polish::no_instruct_reason(settings)
+                ));
+            }
+        }
         let cleaned = if warning.is_none() && !ctx.allows_rewrite() { llm::limit_breaks(&pre.text, &cleaned) } else { cleaned };
         // A rewritten text keeps the action's formatting rather than the category's tone rules.
         let tone_after = if rewrite.is_some() && warning.is_none() { "none" } else { tone.as_str() };
@@ -990,8 +1020,8 @@ impl App {
             _ => full.english,
         };
         let post = text::process(&cleaned, &text::Options {
-            // The local model doesn't write backticks: wrap code again (it skips what is already wrapped).
-            remove_fillers: false, voice_commands: false, backticks: local && full.backticks, tone: tone_after,
+            // A local cleanup model doesn't write backticks: wrap code again (it skips what is already wrapped).
+            remove_fillers: false, voice_commands: false, backticks: cleanup_model && full.backticks, tone: tone_after,
             preserve_formatting: rewrite.is_some() && warning.is_none(), english, ..full
         });
         let mut used = pre.used;
@@ -1055,7 +1085,17 @@ impl App {
         Ok(Cleaned { text: out, copy: copy || shell, copy_note, review, ..Default::default() })
     }
 
+    /// A client for a local model.
+    fn local_client(&self, m: &crate::polish::Model) -> llm::Client {
+        llm::Client { provider: crate::polish::PROVIDER.into(), model: m.id.into(), local_dir: Some(self.models_dir.clone()), ..Default::default() }
+    }
+
     pub fn llm_client(&self, settings: &Settings) -> llm::Client {
+        // Local: the model that follows instructions (commands, actions, summaries), if there is one.
+        if settings.llm.provider == crate::polish::PROVIDER {
+            let m = crate::polish::instruct_model(settings, &self.models_dir).unwrap_or_else(|| crate::polish::selected(settings));
+            return self.local_client(m);
+        }
         let cloud = settings.llm.provider == "cloud";
         llm::Client {
             provider: settings.llm.provider.clone(),
@@ -1067,7 +1107,8 @@ impl App {
                 _ => None,
             },
             model: settings.llm.model.clone(),
-            key: self.secrets.get(if cloud { "cloud" } else { "llm" }),
+            key: if cloud { self.secrets.get("cloud") } else { llm::key_id(settings).and_then(|id| self.secrets.get(&id)) },
+            local_dir: None,
         }
     }
 

@@ -1,24 +1,88 @@
 //! LLM post-processing: transcript clean-up (grammar, self-corrections, lists, tone) and command
 //! mode (rewrite selected text from a spoken instruction). Works with any OpenAI-compatible chat
-//! endpoint (OpenAI, Groq, OpenRouter, Ollama, LM Studio, vLLM, OpsTrellis Cloud) and Anthropic.
+//! endpoint (OpenAI, Groq, OpenRouter, Ollama, LM Studio, vLLM, OpsTrellis Cloud), Anthropic, and a
+//! local instruction model (`polish.rs`).
 
 use crate::context::AppContext;
+use crate::secrets::Secrets;
+use crate::settings::Settings;
 use crate::stt::{check, send, HTTP};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::time::Duration;
 
+#[derive(Default)]
 pub struct Client {
     pub provider: String,
     pub base_url: Option<String>,
     pub model: String,
     pub key: Option<String>,
+    /// For a local model (`polish.rs`): the models folder.
+    pub local_dir: Option<std::path::PathBuf>,
 }
 
 /// Dictation cleanup is on the critical path: past this, the rule-based text is inserted instead.
 pub const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Commands, meeting notes and follow-ups (the user expects a longer wait).
 const LONG_TIMEOUT: Duration = Duration::from_secs(30);
+
+const OPENAI_BASE: &str = "https://api.openai.com/v1";
+const ANTHROPIC_BASE: &str = "https://api.anthropic.com";
+
+/// Secret id of the AI key: it belongs to the server it is sent to, so switching services keeps
+/// every key and none can reach another server. None for OpsTrellis Cloud (its own token) and
+/// the on-device model (no key). The UI's "llm" secret maps to this (`set_secret` in lib.rs).
+pub fn key_id(settings: &Settings) -> Option<String> {
+    let llm = &settings.llm;
+    // Exactly where `App::llm_client` sends requests: only "openai" takes a base URL.
+    let base = match llm.provider.as_str() {
+        "cloud" | crate::polish::PROVIDER => return None,
+        "anthropic" => ANTHROPIC_BASE,
+        "openai" => llm.base_url.as_deref().map(crate::cloud::base_of).filter(|b| !b.is_empty()).unwrap_or(OPENAI_BASE),
+        _ => OPENAI_BASE,
+    };
+    // The URL parser lowercases the scheme and host (and maps international names) but keeps the
+    // path's case, which a server may tell apart.
+    let server = reqwest::Url::parse(base).map(|u| u.as_str().trim_end_matches('/').to_string()).unwrap_or_else(|_| base.to_string());
+    Some(format!("llm@{server}"))
+}
+
+/// Optional request settings a provider may reject (older or reasoning models refuse
+/// `temperature`, some refuse `reasoning_effort`): a 400 naming one of them is retried without.
+fn rejected_option(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:#}").to_lowercase();
+    (msg.contains(" 400:") || msg.contains(" 422:")) && ["temperature", "reasoning", "thinking", "unsupported", "not supported", "unknown parameter", "unrecognized"].iter().any(|w| msg.contains(w))
+}
+
+/// Server and model pairs that refused an optional setting: later requests go without, in one try.
+static REFUSES_OPTIONS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn refuses_options(server: &str, model: &str) -> bool {
+    REFUSES_OPTIONS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|k| *k == format!("{server} {model}"))
+}
+
+fn remember_refusal(server: &str, model: &str) {
+    let mut list = REFUSES_OPTIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let key = format!("{server} {model}");
+    if !list.contains(&key) {
+        list.push(key);
+    }
+}
+
+/// Moves the key saved before keys were kept per server ("llm") to the current server's id. With no
+/// current key slot (cloud, on device) it is dropped: the old code never kept one in that state.
+pub fn migrate_key(secrets: &Secrets, settings: &Settings) {
+    let Some(old) = secrets.get("llm") else { return };
+    if let Some(id) = key_id(settings).filter(|id| !secrets.has(id)) {
+        if let Err(e) = secrets.set(&id, &old) {
+            log::warn!("moving the AI key failed: {e:#}");
+            return;
+        }
+    }
+    if let Err(e) = secrets.delete("llm") {
+        log::warn!("removing the old AI key failed: {e:#}");
+    }
+}
 
 impl Client {
     pub async fn complete(&self, system: &str, user: &str) -> Result<String> {
@@ -27,50 +91,88 @@ impl Client {
 
     pub async fn complete_within(&self, system: &str, user: &str, timeout: Duration) -> Result<String> {
         if self.provider == crate::polish::PROVIDER {
-            return Err(anyhow!("{} only polishes dictation; commands, actions and summaries need a cloud or OpenAI-compatible AI provider", crate::polish::NAME));
+            return self.local(system, user, timeout).await;
         }
         let text = if self.provider == "anthropic" { self.anthropic(system, user, timeout).await? } else { self.openai(system, user, timeout).await? };
         Ok(strip_controls(&strip_wrapping(&text)))
     }
 
     async fn openai(&self, system: &str, user: &str, timeout: Duration) -> Result<String> {
-        let base = self.base_url.as_deref().filter(|b| !b.trim().is_empty()).unwrap_or("https://api.openai.com/v1").trim_end_matches('/');
+        let base = self.base_url.as_deref().filter(|b| !b.trim().is_empty()).unwrap_or(OPENAI_BASE).trim_end_matches('/');
         crate::endpoint::check(base)?;
-        let body = json!({
-            "model": self.model,
-            "temperature": 0.2,
-            "messages": [{ "role": "system", "content": system }, { "role": "user", "content": user }],
-        });
-        let mut rb = HTTP.post(format!("{base}/chat/completions")).timeout(timeout).json(&body);
-        if let Some(k) = self.key.as_deref().filter(|k| !k.is_empty()) {
-            rb = rb.bearer_auth(k);
+        let messages = json!([{ "role": "system", "content": system }, { "role": "user", "content": user }]);
+        let mut body = json!({ "model": self.model, "messages": messages, "temperature": 0.2 });
+        // Cleanup waits on this: reasoning off where a provider documents how.
+        let model = self.model.to_lowercase();
+        if base == OPENAI_BASE && (model.starts_with("gpt-5") || model.starts_with("gpt-6") || model.starts_with('o')) {
+            body["reasoning_effort"] = json!("none");
         }
-        let v: Value = check("llm", send(rb).await?).await?.json().await?;
+        if base.starts_with("https://api.deepseek.com") {
+            body["thinking"] = json!({ "type": "disabled" });
+        }
+        let post = |body: &Value| {
+            let mut rb = HTTP.post(format!("{base}/chat/completions")).timeout(timeout).json(body);
+            if let Some(k) = self.key.as_deref().filter(|k| !k.is_empty()) {
+                rb = rb.bearer_auth(k);
+            }
+            async move { check("llm", send(rb).await?).await?.json::<Value>().await.map_err(anyhow::Error::from) }
+        };
+        let bare = json!({ "model": self.model, "messages": messages });
+        let v = if refuses_options(base, &self.model) {
+            post(&bare).await?
+        } else {
+            match post(&body).await {
+                Err(e) if rejected_option(&e) => {
+                    remember_refusal(base, &self.model);
+                    post(&bare).await?
+                }
+                r => r?,
+            }
+        };
         v.pointer("/choices/0/message/content").and_then(Value::as_str).map(String::from).ok_or_else(|| anyhow!("llm: empty response"))
     }
 
+    /// A local instruction model. A cleanup model (or none downloaded) can't do this.
+    async fn local(&self, system: &str, user: &str, timeout: Duration) -> Result<String> {
+        let m = crate::polish::info(&self.model).filter(|m| m.kind == crate::polish::Kind::Instruct);
+        let (Some(m), Some(dir)) = (m, self.local_dir.clone()) else {
+            return Err(anyhow!("Actions, commands and summaries need a local instruction model or a cloud provider: choose one in Settings → AI polish"));
+        };
+        let (system, user, deadline) = (system.to_string(), user.to_string(), std::time::Instant::now() + timeout);
+        let text = tokio::task::spawn_blocking(move || crate::polish::chat_blocking(&dir, m, &system, &user, deadline)).await??;
+        Ok(strip_controls(&strip_wrapping(&text)))
+    }
+
     async fn anthropic(&self, system: &str, user: &str, timeout: Duration) -> Result<String> {
-        let base = self.base_url.as_deref().filter(|b| !b.trim().is_empty()).unwrap_or("https://api.anthropic.com").trim_end_matches('/');
+        let base = self.base_url.as_deref().filter(|b| !b.trim().is_empty()).unwrap_or(ANTHROPIC_BASE).trim_end_matches('/');
         crate::endpoint::check(base)?;
         let key = self.key.as_deref().ok_or_else(|| anyhow!("No Anthropic API key set"))?;
-        let body = json!({
-            "model": self.model,
-            "max_tokens": 4096,
-            "temperature": 0.2,
-            "system": system,
-            "messages": [{ "role": "user", "content": user }],
-        });
-        let resp = send(
-            HTTP.post(format!("{base}/v1/messages"))
-                .timeout(timeout)
-                .header("x-api-key", key)
-                .header("anthropic-version", "2023-06-01")
-                .json(&body),
-        )
-        .await?;
-        let v: Value = check("anthropic", resp).await?.json().await?;
-        v.pointer("/content/0/text").and_then(Value::as_str).map(String::from).ok_or_else(|| anyhow!("anthropic: empty response"))
+        let messages = json!([{ "role": "user", "content": user }]);
+        let post = |body: Value| {
+            let rb = HTTP.post(format!("{base}/v1/messages")).timeout(timeout).header("x-api-key", key).header("anthropic-version", "2023-06-01").json(&body);
+            async move { check("anthropic", send(rb).await?).await?.json::<Value>().await.map_err(anyhow::Error::from) }
+        };
+        // Newer models refuse sampling settings.
+        let bare = json!({ "model": self.model, "max_tokens": 4096, "system": system, "messages": messages });
+        let v = if refuses_options(base, &self.model) {
+            post(bare).await?
+        } else {
+            match post(json!({ "model": self.model, "max_tokens": 4096, "temperature": 0.2, "system": system, "messages": messages })).await {
+                Err(e) if rejected_option(&e) => {
+                    remember_refusal(base, &self.model);
+                    post(bare).await?
+                }
+                r => r?,
+            }
+        };
+        anthropic_text(&v).ok_or_else(|| anyhow!("anthropic: empty response"))
     }
+}
+
+/// The answer's first text block: newer models may start with a thinking block.
+fn anthropic_text(v: &Value) -> Option<String> {
+    let text = |b: &&Value| b.get("type").and_then(Value::as_str).is_none_or(|t| t == "text") && b.get("text").is_some();
+    v.get("content")?.as_array()?.iter().find(text)?.get("text")?.as_str().map(String::from)
 }
 
 fn tone_rule(tone: &str) -> &'static str {
@@ -112,10 +214,11 @@ pub const OUTPUT_LANGUAGES: &[(&str, &str)] = &[
 ];
 
 /// The language AI polish writes this dictation in, as (code, name): only with a provider that
-/// follows instructions (not the offline polish model), and never in a shell, where commands stay
-/// verbatim. Unknown codes are ignored.
-pub fn output_language(settings: &crate::settings::Settings, ctx: &AppContext) -> Option<(&'static str, &'static str)> {
-    if !settings.llm.enabled || settings.llm.provider == crate::polish::PROVIDER || !ctx.allows_rewrite() {
+/// follows instructions (not a local cleanup model alone), and never in a shell, where commands
+/// stay verbatim. Unknown codes are ignored.
+pub fn output_language(settings: &crate::settings::Settings, ctx: &AppContext, models_dir: &std::path::Path) -> Option<(&'static str, &'static str)> {
+    let follows = settings.llm.provider != crate::polish::PROVIDER || crate::polish::instruct_model(settings, models_dir).is_some();
+    if !settings.llm.enabled || !follows || !ctx.allows_rewrite() {
         return None;
     }
     let code = settings.output_languages.get(ctx.style_category())?;
@@ -359,10 +462,70 @@ mod tests {
         assert_eq!(limit_breaks("subject\nbody", "  Subject\n    indented\nmore"), "  Subject\n    indented more");
     }
 
+    fn settings(provider: &str, base: Option<&str>) -> Settings {
+        let mut s = Settings::default();
+        s.llm.provider = provider.into();
+        s.llm.base_url = base.map(String::from);
+        s
+    }
+
+    #[test]
+    fn key_id_names_the_server() {
+        let id = |p, b| key_id(&settings(p, b));
+        assert_eq!(id("openai", None).as_deref(), Some("llm@https://api.openai.com/v1"));
+        assert_eq!(id("openai", Some("  HTTPS://API.OpenAI.com/v1/ ")), id("openai", None), "case, whitespace, trailing slash");
+        assert_eq!(id("openai", Some("")), id("openai", None), "an empty address is the default");
+        assert_eq!(id("openai", Some("https://api.groq.com/openai/v1")).as_deref(), Some("llm@https://api.groq.com/openai/v1"));
+        assert_ne!(id("openai", Some("http://localhost:11434/v1")), id("openai", Some("http://localhost:1234/v1")));
+        assert_eq!(id("anthropic", Some("https://evil.example")).as_deref(), Some("llm@https://api.anthropic.com"), "Anthropic ignores the address");
+        assert_eq!((id("cloud", None), id("local", None)), (None, None));
+        assert_eq!(id("groq", Some("https://x.example/v1")), id("openai", None), "an unknown provider is sent to OpenAI, so its key is OpenAI's");
+        assert_ne!(id("openai", Some("https://gw.example/TeamA/v1")), id("openai", Some("https://gw.example/teama/v1")), "a path keeps its case");
+    }
+
+    #[test]
+    fn optional_settings_a_provider_rejects_are_dropped() {
+        let e = |m: &str| anyhow!("{m}");
+        assert!(rejected_option(&e("llm 400: Unsupported parameter: 'temperature' is not supported with this model.")));
+        assert!(rejected_option(&e("llm 400: Unrecognized request argument supplied: reasoning_effort")));
+        assert!(!rejected_option(&e("llm 401: Incorrect API key provided")), "not a setting");
+        assert!(!rejected_option(&e("llm 400: model not found")));
+        assert!(!rejected_option(&e("llm 500: temperature sensor offline")), "only a refused request");
+        assert!(rejected_option(&e("llm 422: Unsupported parameter: thinking")), "DeepSeek refuses with 422");
+        assert!(!refuses_options("https://srv.example/v1", "m1"));
+        remember_refusal("https://srv.example/v1", "m1");
+        assert!(refuses_options("https://srv.example/v1", "m1") && !refuses_options("https://srv.example/v1", "m2"));
+        let thinking_first = json!({ "content": [{ "type": "thinking", "thinking": "hm" }, { "type": "text", "text": "Meet at 3." }] });
+        assert_eq!(anthropic_text(&thinking_first).as_deref(), Some("Meet at 3."));
+        assert_eq!(anthropic_text(&json!({ "content": [] })), None);
+    }
+
+    #[test]
+    fn services_keep_separate_keys_and_the_old_key_moves() {
+        let dir = std::env::temp_dir().join(format!("opstrellis-llm-keys-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secrets = Secrets::file_only(&dir);
+        let (openai, groq) = (settings("openai", None), settings("openai", Some("https://api.groq.com/openai/v1")));
+        secrets.set("llm", "old-key").unwrap();
+        migrate_key(&secrets, &groq);
+        assert_eq!((secrets.get("llm"), secrets.get(&key_id(&groq).unwrap()).as_deref()), (None, Some("old-key")), "moved to the current server");
+        assert_eq!(secrets.get(&key_id(&openai).unwrap()), None, "not to another one");
+        secrets.set(&key_id(&openai).unwrap(), "openai-key").unwrap();
+        secrets.set("llm", "later-old-key").unwrap();
+        migrate_key(&secrets, &groq);
+        assert_eq!(secrets.get("llm"), None);
+        assert_eq!(secrets.get(&key_id(&groq).unwrap()).as_deref(), Some("old-key"), "an existing key is not replaced");
+        assert_eq!(secrets.get(&key_id(&openai).unwrap()).as_deref(), Some("openai-key"), "switching back finds its own key");
+        secrets.set("llm", "x").unwrap();
+        migrate_key(&secrets, &settings("cloud", None));
+        assert_eq!(secrets.get("llm"), None, "dropped when there is no slot for it");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[tokio::test]
     async fn insecure_base_url_is_refused_before_sending() {
         for provider in ["openai", "anthropic"] {
-            let c = Client { provider: provider.into(), base_url: Some("http://llm.example.com/v1".into()), model: "m".into(), key: Some("k".into()) };
+            let c = Client { provider: provider.into(), base_url: Some("http://llm.example.com/v1".into()), model: "m".into(), key: Some("k".into()), ..Default::default() };
             let e = c.complete_within("s", "u", Duration::from_secs(1)).await.unwrap_err().to_string();
             assert!(e.contains("isn't encrypted"), "{provider}: {e}");
         }
@@ -404,23 +567,24 @@ mod tests {
         assert!(p.contains("Never translate names, code identifiers") && p.contains("Spell these terms exactly as written: Karol") && p.contains("Casual"));
         assert!(!p.contains("Do not summarize, translate"));
 
+        let dir = std::env::temp_dir().join("no-local-models");
         let mut s = crate::settings::Settings::default();
         s.output_languages.insert("work".into(), "en".into());
         s.output_languages.insert("other".into(), "en".into());
-        assert_eq!(output_language(&s, &slack), None, "AI polish off");
+        assert_eq!(output_language(&s, &slack, &dir), None, "AI polish off");
         s.llm.enabled = true;
-        assert_eq!(output_language(&s, &slack), Some(("en", "English")));
+        assert_eq!(output_language(&s, &slack, &dir), Some(("en", "English")));
         let shell = crate::context::classify(Some("Alacritty".into()), None);
         assert_eq!(shell.style_category(), "other");
-        assert_eq!(output_language(&s, &shell), None, "a shell keeps commands verbatim");
+        assert_eq!(output_language(&s, &shell, &dir), None, "a shell keeps commands verbatim");
         let agent = crate::context::classify(Some("kitty".into()), Some("\u{2733} Claude Code".into()));
         s.output_languages.insert("ai".into(), "hi".into());
-        assert_eq!(output_language(&s, &agent), Some(("hi", "Hindi")), "an agent in a terminal may be translated");
+        assert_eq!(output_language(&s, &agent, &dir), Some(("hi", "Hindi")), "an agent in a terminal may be translated");
         s.output_languages.insert("work".into(), "xx".into());
-        assert_eq!(output_language(&s, &slack), None, "unknown code");
+        assert_eq!(output_language(&s, &slack, &dir), None, "unknown code");
         s.output_languages.insert("work".into(), "en".into());
         s.llm.provider = crate::polish::PROVIDER.into();
-        assert_eq!(output_language(&s, &slack), None, "the offline model can't translate");
+        assert_eq!(output_language(&s, &slack, &dir), None, "a local cleanup model alone can't translate");
         assert!(OUTPUT_LANGUAGES.iter().all(|(c, n)| !c.is_empty() && !n.is_empty()) && OUTPUT_LANGUAGES.len() >= 25);
 
         // Translation changes the length a lot (English to Chinese); judged like a rewrite.
@@ -459,7 +623,7 @@ mod tests {
             sock.write_all(resp.as_bytes()).await.unwrap();
             String::from_utf8_lossy(&buf).to_string()
         });
-        let c = Client { provider: "openai".into(), base_url: Some(base), model: "test-model".into(), key: Some("k".into()) };
+        let c = Client { provider: "openai".into(), base_url: Some(base), model: "test-model".into(), key: Some("k".into()), ..Default::default() };
         let text = "hey sam thanks for the update";
         let out = c.complete(&command_prompt(Some(text)), &command_input(Some(text), "Make it formal.")).await.unwrap();
         assert_eq!(out, "Hi Sam, thanks for the update.");
@@ -488,7 +652,7 @@ mod tests {
                 let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                 next.write_all(response.as_bytes()).await.unwrap();
             });
-            let client = Client { provider: provider.into(), base_url: Some(base), model: "test".into(), key: Some("test".into()) };
+            let client = Client { provider: provider.into(), base_url: Some(base), model: "test".into(), key: Some("test".into()), ..Default::default() };
             let failed = client.complete_within("cleanup", "text", Duration::from_millis(50)).await.unwrap_err();
             assert!(failed.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout), "{provider}: {failed}");
             assert_eq!(client.complete_within("cleanup", "next text", Duration::from_secs(2)).await.unwrap(), "Recovered");
@@ -505,6 +669,7 @@ mod tests {
             base_url: std::env::var("LLM_BASE_URL").ok(),
             model: std::env::var("LLM_MODEL").unwrap_or("gpt-4o-mini".into()),
             key: std::env::var("LLM_API_KEY").ok(),
+            ..Default::default()
         };
         let ctx = crate::context::classify(Some("Slack".into()), None);
         let raw = "um so let's meet at two pm actually three pm on friday";

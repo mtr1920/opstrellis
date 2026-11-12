@@ -3,6 +3,7 @@ import {
   api, errMsg, useEvent, type BackupSummary, type CloudStatus, type SettingsDetail, type LocalModel, type Permissions, type PolishModel, type WaylandShortcuts, type ProviderKind, type Settings, type SttEntry, type TeamStatus, type UpdateInfo,
 } from "../api";
 import { Icon } from "../icons";
+import { LLM_SERVICES, OTHER_SERVICE, serviceFor } from "../llmServices";
 import { WorkspacesSection } from "./Workspaces";
 import { IS_MAC, Keys, isSingleKey, Modal, Page, Progress, Row, Search, Section, Toggle, UnencryptedWarning, comboText, useModelDownloads, type SettingsProps } from "../ui";
 
@@ -182,11 +183,7 @@ function SettingsSection({ title, desc, children }: { title: string; desc?: stri
 
 // ---------- AI ----------
 
-const LLM_DEFAULTS: Record<Settings["llm"]["provider"], string> = {
-  openai: "gpt-4o-mini", anthropic: "claude-haiku-4-5", cloud: "auto", local: "s1-mini",
-};
-
-/** AI polish on/off, provider, model, key, and a test request. */
+/** AI polish on/off, service, model, key, and a test request. */
 export function LlmSection({ settings, set, saveNow }: SettingsProps & { saveNow: () => Promise<void> }) {
   const llm = settings.llm;
   const update = (patch: Partial<Settings["llm"]>) => set("llm", { ...llm, ...patch });
@@ -194,14 +191,27 @@ export function LlmSection({ settings, set, saveNow }: SettingsProps & { saveNow
   const [hasKey, setHasKey] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [test, setTest] = useState<{ busy?: boolean; ok?: string; error?: string }>({});
+  // "Other" with an empty address looks like OpenAI in the saved settings, so the pick is remembered here.
+  // Starts as the saved settings say, so clearing a custom address while editing it keeps the field.
+  const [pickedOther, setPickedOther] = useState(() => serviceFor(settings.llm).id === OTHER_SERVICE);
+  const service = pickedOther && llm.provider === "openai" ? LLM_SERVICES.find((s) => s.id === OTHER_SERVICE)! : serviceFor(llm);
+  // Keys are kept per server: after the service changes, the key shown is that service's.
+  const refreshKey = () => saveNow().then(() => api.hasSecrets()).then((s) => setHasKey(s.includes("llm")), () => {});
   useEffect(() => void api.hasSecrets().then((s) => setHasKey(s.includes("llm")), () => {}), []);
 
   async function saveKey() {
     try {
-      // A pending save of a new address would delete a key saved before it.
+      // The key is stored for the address saved now.
       await saveNow();
       await api.setSecret("llm", key.trim());
       setKey(""); setHasKey(true); setMsg(null);
+    } catch (e) { setMsg(errMsg(e)); }
+  }
+  async function removeKey() {
+    try {
+      await saveNow();
+      await api.deleteSecret("llm");
+      setHasKey(false); setMsg(null);
     } catch (e) { setMsg(errMsg(e)); }
   }
   async function runTest() {
@@ -222,48 +232,54 @@ export function LlmSection({ settings, set, saveNow }: SettingsProps & { saveNow
       {llm.enabled && (
         <div className="form-grid">
           <label className="field">
-            <span>Provider</span>
-            <select value={llm.provider} onChange={(e) => {
-              const provider = e.target.value as Settings["llm"]["provider"];
-              update({ provider, model: LLM_DEFAULTS[provider], baseUrl: null });
-              setTest({});
-              // The saved key belongs to the previous provider; never send it to the new one.
-              if (hasKey) api.deleteSecret("llm").then(() => setHasKey(false), (err) => setMsg(errMsg(err)));
+            <span>Service</span>
+            <select value={service.id} onChange={(e) => {
+              const next = LLM_SERVICES.find((s) => s.id === e.target.value)!;
+              setPickedOther(next.id === OTHER_SERVICE);
+              const patch = { provider: next.provider, model: next.defaultModel, baseUrl: next.baseUrl };
+              update(patch);
+              // On this device: keep a model that is already downloaded rather than one that isn't.
+              if (next.provider === "local") {
+                api.polishModels().then((list) => {
+                  const have = list.filter((m) => m.installed);
+                  const pick = have.find((m) => m.id === llm.model) ?? have.find((m) => m.kind === "cleanup") ?? have[0];
+                  if (pick && pick.id !== patch.model) set("llm", { ...llm, ...patch, model: pick.id });
+                }, () => {});
+              }
+              setTest({}); setKey(""); setMsg(null); setHasKey(false);
+              void refreshKey();
             }}>
-              <option value="openai">OpenAI-compatible</option>
-              <option value="anthropic">Anthropic</option>
-              <option value="cloud">OpsTrellis Cloud</option>
-              <option value="local">On this device (S1-mini, offline)</option>
+              {LLM_SERVICES.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
             </select>
           </label>
           {llm.provider !== "local" && (
             <label className="field">
               <span>Model</span>
-              <input value={llm.model} onChange={(e) => update({ model: e.target.value })} />
+              <input value={llm.model} list="llm-models" onChange={(e) => update({ model: e.target.value })} />
+              <datalist id="llm-models">{service.models?.map((m) => <option key={m} value={m} />)}</datalist>
             </label>
           )}
-          {llm.provider === "local" && <LocalPolish />}
-          {llm.provider === "openai" && (
+          {llm.provider === "local" && <LocalPolish settings={settings} set={set} />}
+          {service.id === OTHER_SERVICE && (
             <label className="field span2">
-              <span>Base URL <em>optional: Groq, OpenRouter, Ollama, LM Studio…</em></span>
+              <span>Base URL <em>optional: any OpenAI-compatible server</em></span>
               <input value={llm.baseUrl ?? ""} placeholder="https://api.openai.com/v1"
-                onChange={(e) => {
-                  update({ baseUrl: e.target.value || null });
-                  // Saving drops the key entered for the old address; show that it's gone.
-                  if (hasKey) saveNow().then(() => api.hasSecrets()).then((s) => setHasKey(s.includes("llm")), () => {});
-                }} />
+                onChange={(e) => update({ baseUrl: e.target.value || null })} onBlur={() => void refreshKey()} />
               <UnencryptedWarning url={llm.baseUrl} />
-              {hasKey && <span className="meta">Changing the address clears the saved key.</span>}
+              <span className="meta">Each address keeps its own saved key.</span>
             </label>
           )}
-          {llm.provider !== "cloud" && llm.provider !== "local" && (
+          {service.baseUrl && <p className="meta span2">Sends to {service.baseUrl}</p>}
+          {llm.provider !== "cloud" && llm.provider !== "local" && (!service.keyless || hasKey) && (
             <label className="field span2">
               <span>API key {hasKey && <em className="ok">saved</em>}</span>
               <div className="inline">
                 <input type="password" value={key} placeholder={hasKey ? "••••••••  (enter to replace)" : "Paste your API key"}
                   onChange={(e) => setKey(e.target.value)} />
                 <button className="btn" onClick={saveKey} disabled={!key.trim()}>Save key</button>
+                {hasKey && <button className="btn" onClick={removeKey}>Remove key</button>}
               </div>
+              {service.keyUrl && !hasKey && <span className="meta">Get a key at {service.keyUrl}</span>}
               {msg && <div className="error">{msg}</div>}
             </label>
           )}
@@ -279,47 +295,99 @@ export function LlmSection({ settings, set, saveNow }: SettingsProps & { saveNow
   );
 }
 
-/** The on-device polish model: download, progress, delete, and what it does and doesn't do. */
-function LocalPolish() {
-  const [model, setModel] = useState<PolishModel | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const load = () => api.polishModelStatus().then(setModel, (e) => setError(errMsg(e)));
-  useEffect(() => void load(), []);
-  const progress = useModelDownloads((id) => id === "s1-mini" && load())["s1-mini"];
-  const busy = (!!progress && !progress.error) || !!model?.downloading;
-  // A retry hides the last attempt's error until the new attempt reports progress.
-  const [retried, setRetried] = useState<typeof progress | undefined>(undefined);
-  const failed = (progress !== retried ? progress?.error : null) ?? error;
+/** Why a local polish model is suggested, from bench_polish (docs/TESTING.md). */
+const POLISH_PICKS: Record<string, string> = {
+  "spokenly-cleanup-1": "Best on our cleanup tests: the fewest changes to text that was already right, nothing lost, and the fastest.",
+  "qwen3.5-4b": "Best on our tests at actions such as Prompt engineer, Make formal and Bullet points.",
+};
 
-  return (
-    <div className="span2">
-      <div className="row">
+const sizeLabel = (mb: number) => (mb >= 1000 ? `${(mb / 1000).toFixed(1)} GB` : `${mb} MB`);
+
+/** The on-device polish models: which one cleans up, which one runs actions, downloads and deletes. */
+function LocalPolish({ settings, set }: SettingsProps) {
+  const llm = settings.llm;
+  const update = (patch: Partial<Settings["llm"]>) => set("llm", { ...llm, ...patch });
+  const [models, setModels] = useState<PolishModel[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const load = () => api.polishModels().then(setModels, (e) => setError(errMsg(e)));
+  useEffect(() => void load(), []);
+  // A finished download is used when the chosen model isn't downloaded.
+  const progress = useModelDownloads((id) => {
+    void load();
+    if (models.some((m) => m.id === id) && !chosen?.installed) update({ model: id });
+  });
+  // Retrying hides that model's last error until the new attempt reports progress.
+  const [retried, setRetried] = useState<Record<string, unknown>>({});
+  const chosen = models.find((m) => m.id === llm.model) ?? models.find((m) => m.id === "s1-mini");
+  const instructs = models.filter((m) => m.kind === "instruct" && m.installed);
+  const rewrite = chosen?.kind === "cleanup" ? instructs.find((m) => m.id === llm.localRewrite) : undefined;
+  const download = (m: PolishModel) => {
+    setError(null);
+    setRetried((r) => ({ ...r, [m.id]: progress[m.id] }));
+    api.downloadPolishModel(m.id).catch((e) => setError(errMsg(e)));
+  };
+
+  const row = (m: PolishModel) => {
+    const p = progress[m.id];
+    const busy = (!!p && !p.error) || m.downloading;
+    const failed = p !== retried[m.id] ? p?.error : null;
+    const pct = p?.total && !p.done ? Math.min(100, Math.floor((p.downloaded / p.total) * 100)) : null;
+    const langs = m.languages.length === 0 ? "Any language" : m.languages.length === 1 && m.languages[0] === "en" ? "English" : `${m.languages.length} languages`;
+    return (
+      <div key={m.id} className="row model-row">
         <div className="row-text">
-          <div className="row-title">S1-mini by Superwhisper <span className="meta">· English · {model?.sizeMb ?? 484} MB</span></div>
-          <div className="row-desc">
-            A small model trained only to clean up dictation: fillers, self-corrections (“at 2, sorry, 3” → “at 3”), grammar and lists.
-            Uses about 1 GB of memory while selected. Code editors, terminals and other languages keep the rule-based text;
-            actions, command mode and meeting summaries need one of the other providers.
+          <div className="row-title">
+            {m.name}
+            {POLISH_PICKS[m.id] && <span className="tag" title={POLISH_PICKS[m.id]}>Recommended</span>}
+            {chosen?.id === m.id && <span className="tag ok" title="AI polish uses this model.">In use</span>}
+            {rewrite?.id === m.id && <span className="tag ok" title="Runs actions, command mode and summaries.">Runs actions</span>}
           </div>
-          {busy && progress && <Progress value={progress.total ? progress.downloaded / progress.total : 0} />}
+          <div className="row-desc">{m.description}</div>
+          <div className="row-desc model-facts">{langs} · {sizeLabel(m.sizeMb)} · {m.license}</div>
+          {busy && <Progress value={pct === null ? 0 : pct / 100} />}
+          {failed && <div className="error">Download failed: {failed}. Check your connection and try again.</div>}
         </div>
         <div className="row-control">
-          {model?.installed ? (
-            <>
-              <span className="tag ok">Installed</span>
-              <button className="icon-btn" title="Delete model"
-                onClick={() => api.deletePolishModel().then(load, (e) => setError(errMsg(e)))}><Icon name="trash" /></button>
-            </>
+          {busy ? (
+            <span className="meta model-pct">{pct === null ? "Starting…" : pct === 100 ? "Checking…" : `${pct}%`}</span>
+          ) : !m.installed ? (
+            <button className="btn" onClick={() => download(m)}>Download</button>
           ) : (
-            <button className="btn primary" disabled={busy || !model}
-              onClick={() => { setError(null); setRetried(progress); api.downloadPolishModel().catch((e) => setError(errMsg(e))); }}>
-              {busy && progress ? `${Math.round((progress.downloaded / (progress.total || 1)) * 100)}%` : busy ? "Downloading…" : "Download"}
-            </button>
+            <>
+              {chosen?.id !== m.id && <button className="btn" onClick={() => update({ model: m.id })}>Use model</button>}
+              <button className="icon-btn" title="Delete model" aria-label={`Delete ${m.name}`}
+                onClick={() => api.deletePolishModel(m.id).then(load, (e) => setError(errMsg(e)))}><Icon name="trash" /></button>
+            </>
           )}
         </div>
       </div>
-      {model && !model.installed && !busy && <p className="meta">Until it's downloaded, dictation uses the rule-based cleanup.</p>}
-      {failed && <div className="error">Download failed: {failed}. Check your connection and try again.</div>}
+    );
+  };
+
+  return (
+    <div className="span2">
+      <p className="meta">Nothing leaves your computer. A model uses about its download size in memory while it's in use.</p>
+      <div className="row-title">Cleanup models</div>
+      <p className="meta">Fast, for every dictation: fillers, self-corrections, punctuation and lists. They can't run actions, command mode,
+        translation or meeting summaries, and code editors, terminals and languages they don't know keep the rule-based text.</p>
+      {models.filter((m) => m.kind === "cleanup").map(row)}
+      <div className="row-title">Instruction models</div>
+      <p className="meta">Follow the same instructions as a cloud AI: cleanup, actions like Prompt engineer, command mode, translation and
+        meeting summaries. Larger and slower than a cleanup model.</p>
+      {models.filter((m) => m.kind === "instruct").map(row)}
+      {chosen?.kind === "cleanup" && (
+        <label className="field">
+          <span>Actions, commands and summaries</span>
+          <select value={rewrite?.id ?? ""} aria-label="Model for actions, commands and summaries"
+            onChange={(e) => update({ localRewrite: e.target.value || null })}>
+            <option value="">Not on this device</option>
+            {instructs.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+          </select>
+          {instructs.length === 0 && <span className="meta">Download an instruction model to run them offline with {chosen.name} cleaning up.</span>}
+        </label>
+      )}
+      {chosen && !chosen.installed && <p className="meta">Until {chosen.name} is downloaded, dictation uses the rule-based cleanup.</p>}
+      {error && <div className="error">{error}</div>}
     </div>
   );
 }
