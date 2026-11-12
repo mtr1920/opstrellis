@@ -7,6 +7,7 @@ mod azure;
 mod deepgram;
 mod elevenlabs;
 mod google;
+pub mod live;
 pub mod local;
 mod openai;
 mod ws;

@@ -1,0 +1,31 @@
+spoken	expected	terms
+Ask Siobhan to check the Supabase migration before lunch.	Ask Siobhan to check the Supabase migration before lunch.	Siobhan|Supabase
+Joaquin moved the preview deployments from Netlify to Vercel.	Joaquin moved the preview deployments from Netlify to Vercel.	Joaquin|Netlify|Vercel
+The Tauri build fails on Windows because of the WebView version.	The Tauri build fails on Windows because of the WebView version.	Tauri|WebView
+Keep the cart state in Zustand instead of Redux.	Keep the cart state in Zustand instead of Redux.	Zustand|Redux
+Priyanka wants the metrics in Grafana and the traces in Datadog.	Priyanka wants the metrics in Grafana and the traces in Datadog.	Priyanka|Grafana|Datadog
+Saoirse rewrote the schema with Drizzle and dropped Prisma.	Saoirse rewrote the schema with Drizzle and dropped Prisma.	Saoirse|Drizzle|Prisma
+The embeddings live in pgvector on Neon.	The embeddings live in pgvector on Neon.	pgvector|Neon
+Run the end to end tests with Playwright, not Cypress.	Run the end to end tests with Playwright, not Cypress.	Playwright|Cypress
+Niamh is pairing with Oluwaseun on the Kafka consumer.	Niamh is pairing with Oluwaseun on the Kafka consumer.	Niamh|Oluwaseun|Kafka
+We cache sessions in Upstash and send email through Resend.	We cache sessions in Upstash and send email through Resend.	Upstash|Resend
+Authentication moved to Clerk last sprint.	Authentication moved to Clerk last sprint.	Clerk
+The monorepo uses Turborepo with Vite and Vitest.	The monorepo uses Turborepo with Vite and Vitest.	Turborepo|Vite|Vitest
+Errors go to Sentry and product analytics go to PostHog.	Errors go to Sentry and product analytics go to PostHog.	Sentry|PostHog
+Try the prompt on Qwen and Mistral through Ollama first.	Try the prompt on Qwen and Mistral through Ollama first.	Qwen|Mistral|Ollama
+The validation layer is Pydantic behind FastAPI.	The validation layer is Pydantic behind FastAPI.	Pydantic|FastAPI
+Xiaoming will review the Terraform plan tomorrow.	Xiaoming will review the Terraform plan tomorrow.	Xiaoming|Terraform
+Move the design tokens from Figma into Tailwind.	Move the design tokens from Figma into Tailwind.	Figma|Tailwind
+The edge functions run on Deno, the scripts on Bun.	The edge functions run on Deno, the scripts on Bun.	Deno|Bun
+Nguyen filed the bug in Linear and linked the Notion page.	Nguyen filed the bug in Linear and linked the Notion page.	Nguyen|Linear|Notion
+Search is backed by Elasticsearch with a Redis cache in front.	Search is backed by Elasticsearch with a Redis cache in front.	Elasticsearch|Redis
+The component library is Svelte with Storybook stories.	The component library is Svelte with Storybook stories.	Svelte|Storybook
+We pulled the model from Hugging Face and served it with vLLM.	We pulled the model from Hugging Face and served it with vLLM.	Hugging Face|vLLM
+Bartholomew owns the Kubernetes cluster on Cloudflare.	Bartholomew owns the Kubernetes cluster on Cloudflare.	Bartholomew|Kubernetes|Cloudflare
+Ingrid asked whether LangChain is still worth it.	Ingrid asked whether LangChain is still worth it.	Ingrid|LangChain
+Please book a room for Thursday afternoon.	Please book a room for Thursday afternoon.
+The meeting ran long so we skipped the demo.	The meeting ran long so we skipped the demo.
+Send the slides to the whole team before the call.	Send the slides to the whole team before the call.
+I think the second option is cheaper and simpler.	I think the second option is cheaper and simpler.
+We should rename the folder before we ship it.	We should rename the folder before we ship it.
+Let me know when the build is green again.	Let me know when the build is green again.

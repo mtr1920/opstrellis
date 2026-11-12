@@ -113,16 +113,68 @@ Measured with the local Moonshine Tiny model on 4 vCPUs.
 
 ### Long dictations with a local model
 
-Local models decode each phrase when a pause (≥ 0.6 s) ends it, and any phrase that runs past
-30 s without a pause, so on release only the last phrase is left. Measured with Moonshine Tiny on 4 vCPUs, using the
-two LibriSpeech clips repeated with 0.6 s gaps:
+`stt/live.rs` commits a dictation piece by piece at pauses while it is recorded, so on release only
+the last piece is left (and often not even that: a draft of it is decoded once speech stops). The
+ignored test `bench_live_dictation` replays long dictations as the recording thread would see them
+(a tick every 100 ms; a decode still running when the key is released counts as waiting) through
+the loop that shipped before (`old`: a cut at every ≥ 0.6 s pause by loudness, a preview of the last
+5 s), through `stt/live.rs` (`new`), and as one pass over the whole dictation on release (`whole`).
+Each dictation is five consecutive sentences of one voice joined with pauses of 0.25–1.2 s, released
+0.4 s after the last word; `quiet` is the same audio at -24 dB, `noisy` with noise at 10 dB SNR.
 
-| Dictation | One decode on release (before) | Phrase by phrase (now) |
-|---|---|---|
-| 25 s | 2.7 s, 4.5% WER | last phrase only, 3.0% WER |
-| 49 s | 9.8 s, 4.5% WER | last phrase only, 3.0% WER |
-| 98 s | 57 s, unusable (391 words for 264) | last phrase only, 3.0% WER |
-| 196 s | 281 s, unusable (1111 words for 528) | last phrase only, 3.0% WER |
+```sh
+desktop/bench/dev-speech/synthesize.sh /tmp/dev-wavs
+TSV=desktop/bench/names/sentences.tsv desktop/bench/dev-speech/synthesize.sh /tmp/names-wavs
+cd desktop/src-tauri
+OPSTRELLIS_BENCH_DEV_WAVS=/tmp/dev-wavs OPSTRELLIS_TEST_MODELS=<models dir> \
+  cargo test --release bench_live_dictation -- --ignored --nocapture
+# Names and brands said as written, with every term of the file as the vocabulary (hotwords):
+OPSTRELLIS_BENCH_DEV_TSV=$PWD/../bench/names/sentences.tsv OPSTRELLIS_BENCH_DEV_WAVS=/tmp/names-wavs \
+  OPSTRELLIS_BENCH_VOCAB=terms OPSTRELLIS_TEST_MODELS=<models dir> cargo test --release bench_live_dictation -- --ignored --nocapture
+```
 
-Decoding the last phrase takes about 1.1 s for the 16.7 s clip, and much less for a typical
-few-second phrase. With no pauses at all, the 30 s cut keeps it at about 2 s (4.5% WER).
+Parakeet Unified 0.6B (int8) on an Apple M-series Mac, 36 dev-speech dictations (704 s) and 18
+names dictations (334 s). "As written" counts casing and punctuation too; "after rules" is
+`text::process` as in `bench_dev_speech`. The release time includes waiting for a decode that was
+still running when the key was released.
+
+| Set | Loop | WER as written | WER after rules | Terms exact | Release → text (median / p95) |
+|---|---|---|---|---|---|
+| dev, clean | old | 54.9% | 9.7% | 51.8% | 602 / 1201 ms |
+| dev, clean | new | 54.4% | 9.7% | 52.5% | 481 / 852 ms |
+| dev, clean | whole | 53.5% | 8.8% | 53.5% | 2101 / 2353 ms |
+| dev, quiet | old | 55.5% | 10.0% | 52.5% | 456 / 607 ms |
+| dev, quiet | new | 54.0% | 9.7% | 56.1% | 723 / 1002 ms |
+| dev, noisy | old | 53.9% | 11.2% | 50.2% | 1375 / 2502 ms |
+| dev, noisy | new | 54.0% | 11.2% | 51.5% | 673 / 1112 ms |
+| names, clean | old | 18.3% | 10.5% | 45.5% | 557 / 649 ms |
+| names, clean | new | 17.3% | 11.6% | 47.9% | 479 / 746 ms |
+| names, noisy | old | 19.4% | 14.2% | 44.2% | 1726 / 2419 ms |
+| names, noisy | new | 20.1% | 14.0% | 41.2% | 710 / 1542 ms |
+| names + vocabulary, clean | old | 18.3% | 9.6% | 47.9% | 585 / 832 ms |
+| names + vocabulary, clean | new | 12.0% | 8.0% | 73.9% | 458 / 1135 ms |
+| names + vocabulary, noisy | old | 19.4% | 13.6% | 46.1% | 1839 / 2246 ms |
+| names + vocabulary, noisy | new | 14.9% | 9.1% | 66.1% | 798 / 2059 ms |
+
+The old loop cannot use the vocabulary (its "after rules" column still gains from the product names
+added to the tech pack). The vocabulary rows were measured with hotword strength 1.0, the rest
+before the product names were added. With previews on (dev, clean, first voice), the new
+preview took back 28.1 words per dictation where the old one took back 44.4
+(`OPSTRELLIS_BENCH_DETAIL=1` prints them). The decoding thread is busier while recording (0.43 s
+per second of audio with previews, old 0.22 s), mostly from drafts.
+
+Moonshine Tiny has no word timestamps, so it gets plain pieces of at least 8 s ending at pauses of
+≥ 0.6 s. After rules: clean 22.2% → 17.1%, quiet 26.4% → 18.9%, noisy 29.1% → 31.3%. In noise the
+old loop found no pause by loudness and decoded each dictation in one pass.
+
+Hotword strength (`OPSTRELLIS_HOTWORDS_SCORE`) on the names clips one by one (`bench_dev_speech`
+with `OPSTRELLIS_BENCH_VOCAB=terms`): none 12.8% WER and 37.6% of terms; 1.0 (shipped) 7.4% and
+68.5%; 1.5 9.4% and 71.5%; 2.5 16.7% and 78.8% (words that weren't said turn into terms); 3.5
+unusable. On `desktop/bench/products/sentences.tsv` (AI tools and developer products, plus control
+sentences with look-alike words: cloud, code, cursor, codecs) 1.5 repeated a hotword ("Claude Claude
+Claude"), wrote "Codex Claude" for "Codex CLI" and dropped the end of a sentence; 1.0 did none of
+that. There, at 1.0, the vocabulary took WER after rules from 4.8% to 3.0% and terms from 61.1% to
+80.0%, with the control sentences unchanged.
+
+These are synthetic voices (macOS `say`), so pauses and pronunciation are cleaner than people's;
+compare rows with each other.

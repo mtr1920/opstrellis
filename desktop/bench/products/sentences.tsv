@@ -1,0 +1,34 @@
+spoken	expected	terms
+Ask Claude to review the pull request before lunch.	Ask Claude to review the pull request before lunch.	Claude
+Open Claude Code in the terminal and run the tests.	Open Claude Code in the terminal and run the tests.	Claude Code
+Claude Opus wrote the migration and Claude Sonnet reviewed it.	Claude Opus wrote the migration and Claude Sonnet reviewed it.	Claude Opus|Claude Sonnet
+Anthropic released a new Claude model this week.	Anthropic released a new Claude model this week.	Anthropic|Claude
+Let Codex fix the failing build on main.	Let Codex fix the failing build on main.	Codex
+Run the Codex CLI with the full auto flag.	Run the Codex CLI with the full auto flag.	Codex CLI
+Compare ChatGPT and Gemini on the same prompt.	Compare ChatGPT and Gemini on the same prompt.	ChatGPT|Gemini
+GitHub Copilot suggested the wrong import again.	GitHub Copilot suggested the wrong import again.	GitHub Copilot
+I switched from VS Code to Cursor for this project.	I switched from VS Code to Cursor for this project.	VS Code|Cursor
+Try the prompt with DeepSeek and Qwen locally.	Try the prompt with DeepSeek and Qwen locally.	DeepSeek|Qwen
+Run Llama through Ollama on the laptop.	Run Llama through Ollama on the laptop.	Llama|Ollama
+Mistral and Grok both refused that request.	Mistral and Grok both refused that request.	Mistral|Grok
+Windsurf and Zed both support the agent mode.	Windsurf and Zed both support the agent mode.	Windsurf|Zed
+Add an MCP server so the agent can read Jira tickets.	Add an MCP server so the agent can read Jira tickets.	MCP|Jira
+The OpenAI key is in the environment file.	The OpenAI key is in the environment file.	OpenAI
+Deploy the Next.js app to Vercel after the Supabase migration.	Deploy the Next.js app to Vercel after the Supabase migration.	Next.js|Vercel|Supabase
+The Tauri window crashes when Sentry is enabled.	The Tauri window crashes when Sentry is enabled.	Tauri|Sentry
+Validate the request body with Zod before calling tRPC.	Validate the request body with Zod before calling tRPC.	Zod|tRPC
+Move the components to shadcn and drop the old theme.	Move the components to shadcn and drop the old theme.	shadcn
+Cache the pipeline with Turborepo and run Jest after.	Cache the pipeline with Turborepo and run Jest after.	Turborepo|Jest
+Send the logs to PostHog instead of Datadog.	Send the logs to PostHog instead of Datadog.	PostHog|Datadog
+Store the vectors in Pinecone or in pgvector on Postgres.	Store the vectors in Pinecone or in pgvector on Postgres.	Pinecone|pgvector|Postgres
+Use Hugging Face to download the model weights.	Use Hugging Face to download the model weights.	Hugging Face
+Run it on Kubernetes with Helm and Terraform.	Run it on Kubernetes with Helm and Terraform.	Kubernetes|Helm|Terraform
+Perplexity found the docs faster than Google.	Perplexity found the docs faster than Google.	Perplexity|Google
+The cloud bill went up again this month.	The cloud bill went up again this month.
+Write the code first and the tests after.	Write the code first and the tests after.
+Move the cursor to the end of the line.	Move the cursor to the end of the line.
+The pilot project starts next quarter.	The pilot project starts next quarter.
+We need a linear scale on that chart.	We need a linear scale on that chart.
+Put a note in the shared folder for the team.	Put a note in the shared folder for the team.
+She was clawed by the cat this morning.	She was clawed by the cat this morning.
+The codecs on that camera are outdated.	The codecs on that camera are outdated.

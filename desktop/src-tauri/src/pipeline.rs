@@ -61,16 +61,14 @@ pub struct Session {
     /// Set when recording ends; stops the local segments loop.
     done: Arc<std::sync::atomic::AtomicBool>,
     /// Local model at the chain head: phrases transcribed while recording (see `spawn_local_segments`).
-    segments: Option<std::thread::JoinHandle<Option<Segments>>>,
+    segments: Option<std::thread::JoinHandle<Option<Live>>>,
     /// The folder name of the workspace in use, shown in the pill.
     workspace: Option<String>,
     /// The agent's question this dictation answers (`ask.rs`).
     answers: Option<u64>,
 }
 
-/// Phrases a local model already transcribed while the user was speaking: the text and how many
-/// samples of the recording it covers.
-type Segments = (usize, Vec<String>);
+use crate::stt::live::Live;
 
 
 /// A press shorter than this is a "tap": it switches to hands-free mode instead of push-to-talk.
@@ -522,6 +520,7 @@ impl App {
                 let on_partial: PartialFn = Arc::new(move |t: String| {
                     let _ = app.handle.emit("partial-transcript", t);
                 });
+                let vocabulary = vocabulary.clone();
                 let task = tauri::async_runtime::spawn(async move {
                     // Chunks recorded while connecting wait in the channel.
                     let connecting = Instant::now();
@@ -575,7 +574,7 @@ impl App {
         let segments = providers
             .first()
             .filter(|p| p.entry.provider == ProviderKind::Local)
-            .map(|p| self.spawn_local_segments(p.clone(), lang(&settings), recording.buffer(), done.clone(), settings.overlay));
+            .map(|p| self.spawn_local_segments(p.clone(), lang(&settings), vocabulary, recording.buffer(), done.clone(), settings.overlay));
         let workspace = workspace.map(|w| w.name);
         if let Some(question) = answers {
             crate::ask::QUESTIONS.begin_answer(question);
@@ -585,63 +584,48 @@ impl App {
 
     /// Local models have no streaming API, and one decode of a whole recording is slow (it grows
     /// much faster than the audio: 98 s took 57 s with Moonshine Tiny) and makes the model repeat
-    /// itself after about a minute. So each phrase is transcribed when a pause ends it, and on
-    /// release only the last one is left. In between, the last few seconds are re-decoded about
-    /// once a second as a preview for the overlay. Returns None if the model failed.
+    /// itself after about a minute. So the recording is committed piece by piece at pauses while
+    /// it is recorded, and on release only the last piece is left; a preview for the overlay is
+    /// re-decoded about once a second (see `stt::live`). Returns None if the model failed.
     fn spawn_local_segments(
         self: &Arc<Self>,
         p: Provider,
         language: Option<String>,
+        vocabulary: Vec<String>,
         buffer: Arc<std::sync::Mutex<Vec<i16>>>,
         done: Arc<std::sync::atomic::AtomicBool>,
         preview: bool,
-    ) -> std::thread::JoinHandle<Option<Segments>> {
+    ) -> std::thread::JoinHandle<Option<Live>> {
         let app = self.clone();
         std::thread::spawn(move || {
             use std::sync::atomic::Ordering;
-            const RATE: usize = audio::SAMPLE_RATE as usize;
-            let decode = |a: &[i16]| crate::stt::local::transcribe_blocking(&p.models_dir, &p.entry.model, language.as_deref(), a);
-            let (mut committed, mut texts) = (0usize, Vec::<String>::new());
-            let mut last_preview = Instant::now();
-            // Whisper: one pass on release unless the recording outgrows its window, except for
-            // scripts that need short segments to fit its token budget.
-            let longest = RATE * crate::stt::local::max_segment_secs(&p.entry.model, language.as_deref());
-            let fixed = crate::stt::local::fixed_window(&p.entry.model) && longest >= RATE * 30;
-            let shortest = if fixed { RATE * 20 } else { 0 };
+            let model = &p.entry.model;
+            let hotwords = crate::stt::local::hotwords_for(&p.models_dir, model, &vocabulary);
+            let mut decode = |a: &[i16]| crate::stt::local::decode_blocking(&p.models_dir, model, language.as_deref(), &hotwords, a);
+            let mut live = Live::new(crate::stt::local::plan(model, language.as_deref()));
             while !done.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(300));
-                // Empty once the recording is stopped and its buffer taken.
-                let pending = buffer.lock().unwrap_or_else(|e| e.into_inner()).get(committed..).map(<[i16]>::to_vec).unwrap_or_default();
-                // A segment must end within what the model takes in one pass.
-                let (window, max) = (&pending[..pending.len().min(longest)], longest - RATE);
-                let cut = if pending.len() >= shortest { audio::split_point(window, RATE * 6 / 10, max) } else { None };
-                let shown = if let Some(cut) = cut {
-                    if !audio::is_silent(&pending[..cut]) {
-                        texts.push(decode(&pending[..cut]).ok()?);
-                    }
-                    committed += cut;
-                    texts.join(" ")
-                } else if preview && last_preview.elapsed() >= Duration::from_millis(900) {
-                    last_preview = Instant::now();
-                    let tail = &pending[pending.len().saturating_sub(RATE * 5)..];
-                    if audio::is_silent(tail) {
-                        continue;
-                    }
-                    let t = decode(tail).ok()?;
-                    texts.iter().map(String::as_str).chain([t.as_str()]).collect::<Vec<_>>().join(" ")
-                } else {
-                    continue;
-                };
-                if preview && !done.load(Ordering::SeqCst) && !shown.trim().is_empty() {
-                    let _ = app.handle.emit("partial-transcript", shown.trim().to_string());
+                std::thread::park_timeout(crate::stt::live::TICK);
+                // What's left after the release is decoded by finish_local_segments.
+                if done.load(Ordering::SeqCst) {
+                    break;
+                }
+                let new = buffer.lock().unwrap_or_else(|e| e.into_inner()).get(live.len()..).map(<[i16]>::to_vec).unwrap_or_default();
+                live.push(&new);
+                let shown = live.tick(&mut decode, preview).ok()?;
+                if let Some(shown) = shown.filter(|_| !done.load(Ordering::SeqCst)) {
+                    let _ = app.handle.emit("partial-transcript", shown);
                 }
             }
-            Some((committed, texts))
+            Some(live)
         })
     }
 
     fn finish(self: &Arc<Self>, s: Session) {
         s.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Its loop waits between ticks; the release shouldn't wait with it.
+        if let Some(seg) = &s.segments {
+            seg.thread().unpark();
+        }
         crate::hotkeys::set_cancel_key(self, false);
         self.busy.store(true, std::sync::atomic::Ordering::SeqCst);
         self.emit_stage(s.mode, "transcribing");
@@ -673,7 +657,12 @@ impl App {
         if let Some(dir) = std::env::var("OPSTRELLIS_DUMP_AUDIO").ok().filter(|_| cfg!(debug_assertions)) {
             let _ = std::fs::write(std::path::Path::new(&dir).join("last.wav"), audio::to_wav(&audio));
         }
-        if audio::is_silent(&audio) {
+        // Loud enough is speech as before; only what reads as silence is checked for quiet speech.
+        let heard = !audio::is_silent(&audio) || {
+            let quiet = audio.clone();
+            tokio::task::spawn_blocking(move || crate::vad::has_speech(&quiet)).await.unwrap_or(false)
+        };
+        if !heard {
             if let Some((_, t)) = stream {
                 t.abort();
             }
@@ -687,7 +676,7 @@ impl App {
         let vocabulary = self.vocabulary_for(crate::workspace::active(&ctx).as_ref());
         let transcribing = Instant::now();
         let local = match segments {
-            Some(seg) => finish_local_segments(seg, &providers[0], &audio, lang(&settings)).await,
+            Some(seg) => finish_local_segments(seg, &providers[0], &audio, lang(&settings), &vocabulary).await,
             None => None,
         };
         let transcribed = match local {
@@ -1274,17 +1263,14 @@ pub fn provider_name(kind: ProviderKind) -> &'static str {
 
 /// Waits for the phrases transcribed during recording, then transcribes the rest of `audio`.
 /// None when the model failed or produced no text, so the caller can fall back.
-async fn finish_local_segments(seg: std::thread::JoinHandle<Option<Segments>>, p: &Provider, audio: &[i16], language: Option<String>) -> Option<String> {
-    let (p, audio) = (p.clone(), audio.to_vec());
+async fn finish_local_segments(seg: std::thread::JoinHandle<Option<Live>>, p: &Provider, audio: &[i16], language: Option<String>, vocabulary: &[String]) -> Option<String> {
+    let (p, audio, vocabulary) = (p.clone(), audio.to_vec(), vocabulary.to_vec());
     let text = tokio::task::spawn_blocking(move || {
-        let (committed, mut texts) = seg.join().ok()??;
-        let decode = |a: &[i16]| crate::stt::local::transcribe_blocking(&p.models_dir, &p.entry.model, language.as_deref(), a);
-        // transcribe_blocking cuts what's left into pieces the model can take.
-        let rest = audio.get(committed..).unwrap_or_default();
-        if !audio::is_silent(rest) {
-            texts.push(decode(rest).ok()?);
-        }
-        Some(texts.join(" ").trim().to_string())
+        let mut live = seg.join().ok()??;
+        let model = &p.entry.model;
+        let hotwords = crate::stt::local::hotwords_for(&p.models_dir, model, &vocabulary);
+        live.push(audio.get(live.len()..).unwrap_or_default());
+        live.finish(&mut |a: &[i16]| crate::stt::local::decode_blocking(&p.models_dir, model, language.as_deref(), &hotwords, a)).ok()
     })
     .await
     .ok()??;
