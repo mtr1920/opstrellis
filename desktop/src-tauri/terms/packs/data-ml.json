@@ -53,8 +53,6 @@
 {"term": "GPU"},
 {"term": "TPU"},
 {"term": "BERT"},
-{"term": "DeepSeek", "say": ["deep seek"]},
-{"term": "Qwen"},
 {"term": "Stable Diffusion"},
 {"term": "Midjourney"},
 {"term": "PyTorch Lightning"},

@@ -60,6 +60,9 @@ Import pack…).
 - `aliases`: what a speech model writes instead of the term, replaced everywhere, prose included.
   `techAliases`: replaced only in code editors and terminals. At most 10 of each, up to 60 characters.
 - `say`: how the term is spoken, used only by the alias miner below.
+- `hint` (the built-in tech pack only): `true` makes the term a hint from the first dictation, ahead
+  of other packs' terms. Only for names that aren't also words (Claude, not Cursor): a local model
+  biased toward a hint writes it for words that sound like it.
 
 ### Safety rules
 

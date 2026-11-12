@@ -219,7 +219,7 @@ fn entries(identifiers: &[String]) -> Vec<Entry> {
         .iter()
         .filter_map(|(id, fs)| {
             let tech_aliases: Vec<String> = fs.iter().filter(|f| owners[f.as_str()] == 1).cloned().collect();
-            (!tech_aliases.is_empty()).then(|| Entry { term: (*id).clone(), aliases: Vec::new(), tech_aliases })
+            (!tech_aliases.is_empty()).then(|| Entry { term: (*id).clone(), aliases: Vec::new(), tech_aliases, hint: false })
         })
         .collect();
     crate::terms::clean(entries).0

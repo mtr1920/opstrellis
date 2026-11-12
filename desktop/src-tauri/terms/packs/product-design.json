@@ -18,7 +18,6 @@
 {"term": "Unsplash"},
 {"term": "Loom"},
 {"term": "Amplitude"},
-{"term": "PostHog", "say": ["post hog"], "aliases": ["post hog"]},
 {"term": "Hotjar"},
 {"term": "Pendo"},
 {"term": "LaunchDarkly", "say": ["launch darkly"], "aliases": ["launch darkly"]},
