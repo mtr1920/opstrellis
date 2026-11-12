@@ -1097,7 +1097,7 @@ impl App {
                 _ => None,
             },
             model: settings.llm.model.clone(),
-            key: self.secrets.get(if cloud { "cloud" } else { "llm" }),
+            key: if cloud { self.secrets.get("cloud") } else { llm::key_id(settings).and_then(|id| self.secrets.get(&id)) },
             local_dir: None,
         }
     }

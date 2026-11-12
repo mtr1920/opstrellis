@@ -4,6 +4,8 @@
 //! local instruction model (`polish.rs`).
 
 use crate::context::AppContext;
+use crate::secrets::Secrets;
+use crate::settings::Settings;
 use crate::stt::{check, send, HTTP};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -24,6 +26,37 @@ pub const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Commands, meeting notes and follow-ups (the user expects a longer wait).
 const LONG_TIMEOUT: Duration = Duration::from_secs(30);
 
+const OPENAI_BASE: &str = "https://api.openai.com/v1";
+const ANTHROPIC_BASE: &str = "https://api.anthropic.com";
+
+/// Secret id of the AI key: it belongs to the server it is sent to, so switching services keeps
+/// every key and none can reach another server. None for OpsTrellis Cloud (its own token) and
+/// the on-device model (no key). The UI's "llm" secret maps to this (`set_secret` in lib.rs).
+pub fn key_id(settings: &Settings) -> Option<String> {
+    let llm = &settings.llm;
+    let base = match llm.provider.as_str() {
+        "cloud" | crate::polish::PROVIDER => return None,
+        "anthropic" => ANTHROPIC_BASE,
+        _ => llm.base_url.as_deref().map(crate::cloud::base_of).filter(|b| !b.is_empty()).unwrap_or(OPENAI_BASE),
+    };
+    Some(format!("llm@{}", base.to_lowercase()))
+}
+
+/// Moves the key saved before keys were kept per server ("llm") to the current server's id. With no
+/// current key slot (cloud, on device) it is dropped: the old code never kept one in that state.
+pub fn migrate_key(secrets: &Secrets, settings: &Settings) {
+    let Some(old) = secrets.get("llm") else { return };
+    if let Some(id) = key_id(settings).filter(|id| !secrets.has(id)) {
+        if let Err(e) = secrets.set(&id, &old) {
+            log::warn!("moving the AI key failed: {e:#}");
+            return;
+        }
+    }
+    if let Err(e) = secrets.delete("llm") {
+        log::warn!("removing the old AI key failed: {e:#}");
+    }
+}
+
 impl Client {
     pub async fn complete(&self, system: &str, user: &str) -> Result<String> {
         self.complete_within(system, user, LONG_TIMEOUT).await
@@ -38,7 +71,7 @@ impl Client {
     }
 
     async fn openai(&self, system: &str, user: &str, timeout: Duration) -> Result<String> {
-        let base = self.base_url.as_deref().filter(|b| !b.trim().is_empty()).unwrap_or("https://api.openai.com/v1").trim_end_matches('/');
+        let base = self.base_url.as_deref().filter(|b| !b.trim().is_empty()).unwrap_or(OPENAI_BASE).trim_end_matches('/');
         crate::endpoint::check(base)?;
         let body = json!({
             "model": self.model,
@@ -65,7 +98,7 @@ impl Client {
     }
 
     async fn anthropic(&self, system: &str, user: &str, timeout: Duration) -> Result<String> {
-        let base = self.base_url.as_deref().filter(|b| !b.trim().is_empty()).unwrap_or("https://api.anthropic.com").trim_end_matches('/');
+        let base = self.base_url.as_deref().filter(|b| !b.trim().is_empty()).unwrap_or(ANTHROPIC_BASE).trim_end_matches('/');
         crate::endpoint::check(base)?;
         let key = self.key.as_deref().ok_or_else(|| anyhow!("No Anthropic API key set"))?;
         let body = json!({
@@ -373,6 +406,47 @@ mod tests {
         assert_eq!(limit_breaks(said, "Fix login bug\n\nThe token expired.\nIt was too early."), "Fix login bug\n\nThe token expired. It was too early.", "only the extra break goes");
         assert_eq!(limit_breaks("a\nb\nc", "A\n\nB C"), "A\n\nB C", "fewer breaks than said: as is");
         assert_eq!(limit_breaks("subject\nbody", "  Subject\n    indented\nmore"), "  Subject\n    indented more");
+    }
+
+    fn settings(provider: &str, base: Option<&str>) -> Settings {
+        let mut s = Settings::default();
+        s.llm.provider = provider.into();
+        s.llm.base_url = base.map(String::from);
+        s
+    }
+
+    #[test]
+    fn key_id_names_the_server() {
+        let id = |p, b| key_id(&settings(p, b));
+        assert_eq!(id("openai", None).as_deref(), Some("llm@https://api.openai.com/v1"));
+        assert_eq!(id("openai", Some("  HTTPS://API.OpenAI.com/v1/ ")), id("openai", None), "case, whitespace, trailing slash");
+        assert_eq!(id("openai", Some("")), id("openai", None), "an empty address is the default");
+        assert_eq!(id("openai", Some("https://api.groq.com/openai/v1")).as_deref(), Some("llm@https://api.groq.com/openai/v1"));
+        assert_ne!(id("openai", Some("http://localhost:11434/v1")), id("openai", Some("http://localhost:1234/v1")));
+        assert_eq!(id("anthropic", Some("https://evil.example")).as_deref(), Some("llm@https://api.anthropic.com"), "Anthropic ignores the address");
+        assert_eq!((id("cloud", None), id("local", None)), (None, None));
+    }
+
+    #[test]
+    fn services_keep_separate_keys_and_the_old_key_moves() {
+        let dir = std::env::temp_dir().join(format!("opstrellis-llm-keys-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secrets = Secrets::file_only(&dir);
+        let (openai, groq) = (settings("openai", None), settings("openai", Some("https://api.groq.com/openai/v1")));
+        secrets.set("llm", "old-key").unwrap();
+        migrate_key(&secrets, &groq);
+        assert_eq!((secrets.get("llm"), secrets.get(&key_id(&groq).unwrap()).as_deref()), (None, Some("old-key")), "moved to the current server");
+        assert_eq!(secrets.get(&key_id(&openai).unwrap()), None, "not to another one");
+        secrets.set(&key_id(&openai).unwrap(), "openai-key").unwrap();
+        secrets.set("llm", "later-old-key").unwrap();
+        migrate_key(&secrets, &groq);
+        assert_eq!(secrets.get("llm"), None);
+        assert_eq!(secrets.get(&key_id(&groq).unwrap()).as_deref(), Some("old-key"), "an existing key is not replaced");
+        assert_eq!(secrets.get(&key_id(&openai).unwrap()).as_deref(), Some("openai-key"), "switching back finds its own key");
+        secrets.set("llm", "x").unwrap();
+        migrate_key(&secrets, &settings("cloud", None));
+        assert_eq!(secrets.get("llm"), None, "dropped when there is no slot for it");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

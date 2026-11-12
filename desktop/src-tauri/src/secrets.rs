@@ -12,23 +12,33 @@ const SERVICE: &str = "app.opstrellis.desktop";
 pub struct Secrets {
     fallback_path: PathBuf,
     lock: Mutex<()>,
+    /// False only in tests, so they never touch the real keychain.
+    keychain: bool,
 }
 
 impl Secrets {
     pub fn new(data_dir: &std::path::Path) -> Self {
-        Secrets { fallback_path: data_dir.join("secrets.json"), lock: Mutex::new(()) }
+        Secrets { fallback_path: data_dir.join("secrets.json"), lock: Mutex::new(()), keychain: true }
+    }
+
+    #[cfg(test)]
+    pub fn file_only(data_dir: &std::path::Path) -> Self {
+        Secrets { keychain: false, ..Secrets::new(data_dir) }
     }
 
     pub fn get(&self, id: &str) -> Option<String> {
-        if let Ok(v) = keyring::Entry::new(SERVICE, id).and_then(|e| e.get_password()) {
-            return Some(v);
+        if self.keychain {
+            if let Ok(v) = keyring::Entry::new(SERVICE, id).and_then(|e| e.get_password()) {
+                return Some(v);
+            }
         }
         self.read_file().remove(id)
     }
 
     pub fn set(&self, id: &str, value: &str) -> Result<()> {
         let value = value.trim();
-        match keyring::Entry::new(SERVICE, id).and_then(|e| e.set_password(value)) {
+        let stored = if self.keychain { keyring::Entry::new(SERVICE, id).and_then(|e| e.set_password(value)) } else { Err(keyring::Error::NoEntry) };
+        match stored {
             Ok(()) => {
                 // Make sure no stale fallback copy remains.
                 self.update_file(|m| {
@@ -45,7 +55,7 @@ impl Secrets {
     }
 
     pub fn delete(&self, id: &str) -> Result<()> {
-        if let Ok(e) = keyring::Entry::new(SERVICE, id) {
+        if let Some(e) = self.keychain.then(|| keyring::Entry::new(SERVICE, id).ok()).flatten() {
             let _ = e.delete_credential();
         }
         self.update_file(|m| {
@@ -140,7 +150,7 @@ mod tests {
         assert_eq!((mode(&file), std::fs::read(&file).unwrap()), (0o600, b"{}".to_vec()), "an existing file is replaced and tightened");
         assert!(!dir.join("secrets.json.tmp").exists());
 
-        let secrets = Secrets { fallback_path: file.clone(), lock: Mutex::new(()) };
+        let secrets = Secrets { fallback_path: file.clone(), lock: Mutex::new(()), keychain: false };
         secrets.update_file(|m| {
             m.insert("test".into(), "value".into());
         })
