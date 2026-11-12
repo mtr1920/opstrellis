@@ -100,7 +100,13 @@ let notes: Note[] = [
   { id: 2, title: "Groceries", body: "oat milk, coffee beans, lemons", updatedAt: iso(2 * D), kind: "note" },
   { id: 3, title: "Meeting · Oct 14, 10:00", body: "## Summary\nWeekly sync on the launch.\n\n## Action items\n- [ ] Sam: send the pricing draft\n\n## Transcript (12 min)\nOk let's start…", updatedAt: iso(D), kind: "meeting" },
 ];
-const polishModel: PolishModel = { name: "S1-mini by Superwhisper", sizeMb: 484, installed: false, downloading: false };
+const polishModel = (id: string, name: string, sizeMb: number, kind: PolishModel["kind"], languages: string[], description: string): PolishModel =>
+  ({ id, name, sizeMb, kind, languages, license: "Apache 2.0", description, installed: false, downloading: false });
+const polishModels: PolishModel[] = [
+  polishModel("s1-mini", "S1-mini by Superwhisper", 484, "cleanup", ["en"], "A small model trained only to clean up dictation."),
+  polishModel("spokenly-cleanup-1", "Spokenly Cleanup 1", 639, "cleanup", ["en", "de", "es", "fr", "zh", "ru", "ja"], "Cleans up dictation for the app it goes to."),
+  polishModel("qwen3.5-4b", "Qwen3.5 4B", 2741, "instruct", [], "Follows instructions: actions, command mode, translation and meeting summaries."),
+];
 const CANARY = ["en", "de", "es", "fr"];
 const COHERE = ["en", "fr", "de", "it", "es", "pt", "el", "nl", "pl", "zh", "ja", "ko", "vi", "ar"];
 const EUROPEAN = ["bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de", "el", "hu", "it", "lv", "lt", "mt", "pl", "pt", "ro", "sk", "sl", "es", "sv", "ru", "uk"];
@@ -293,6 +299,8 @@ function retranscribe(id: number): Promise<string> {
   }, 700));
 }
 
+const aiKey = (id: string) => (id === "llm" ? `llm@${settings.llm.provider}:${(settings.llm.baseUrl ?? "").trim().replace(/\/+$/, "").toLowerCase()}` : id);
+
 const handlers: Record<string, (a: any) => unknown> = {
   get_settings: () => structuredClone(settings),
   save_settings: ({ settings: s }) => {
@@ -304,9 +312,13 @@ const handlers: Record<string, (a: any) => unknown> = {
     if (turnedOnUpdates) setTimeout(() => emit("update-available", UPDATE), 3000);
     return structuredClone(settings);
   },
-  set_secret: ({ id }) => void secrets.add(id),
-  delete_secret: ({ id }) => void secrets.delete(id),
-  has_secrets: () => [...secrets],
+  // Like the backend: the AI key ("llm") is kept per server.
+  set_secret: ({ id }) => {
+    if (id === "llm" && (settings.llm.provider === "cloud" || settings.llm.provider === "local")) throw "This AI service takes no key";
+    secrets.add(aiKey(id));
+  },
+  delete_secret: ({ id }) => void secrets.delete(aiKey(id)),
+  has_secrets: () => [...secrets].filter((id) => !id.startsWith("llm@")).concat(secrets.has(aiKey("llm")) ? ["llm"] : []),
   list_input_devices: () => ["Built-in Microphone", "USB Audio Device", "Headset (Bluetooth)"],
   list_history: ({ query }) => history.filter((x) => !query || x.text.toLowerCase().includes(query.toLowerCase())),
   update_history: ({ id, text }) => { history = history.map((x) => (x.id === id ? { ...x, text } : x)); return { added: [], pending: [], undo: [], full: false }; },
@@ -375,19 +387,21 @@ const handlers: Record<string, (a: any) => unknown> = {
     emit("model-download", { id, downloaded: 0, total: 0, done: true, error: null, cancelled: true });
     d.finish();
   },
-  polish_model_status: () => ({ ...polishModel }),
-  download_polish_model: () => {
-    const total = polishModel.sizeMb * 1e6;
+  polish_model_status: () => ({ ...(polishModels.find((m) => m.id === settings.llm.model) ?? polishModels[0]) }),
+  polish_models: () => polishModels.map((m) => ({ ...m })),
+  download_polish_model: ({ id }) => {
+    const m = polishModels.find((x) => x.id === (id ?? "s1-mini"))!;
+    const total = m.sizeMb * 1e6;
     let downloaded = 0;
-    polishModel.downloading = true;
+    m.downloading = true;
     const t = setInterval(() => {
       downloaded = Math.min(total, downloaded + total / 12);
       const done = downloaded >= total;
-      if (done) { clearInterval(t); polishModel.installed = true; polishModel.downloading = false; }
-      emit("model-download", { id: "s1-mini", downloaded, total, done, error: null });
+      if (done) { clearInterval(t); m.installed = true; m.downloading = false; }
+      emit("model-download", { id: m.id, downloaded, total, done, error: null });
     }, 250);
   },
-  delete_polish_model: () => void (polishModel.installed = false),
+  delete_polish_model: ({ id }) => void (polishModels.find((x) => x.id === (id ?? "s1-mini"))!.installed = false),
   delete_local_model: ({ id }) => void (models.find((x) => x.id === id)!.installed = false),
   test_llm: () => new Promise((r) => setTimeout(() => r({ text: "So let's meet at 3pm on Friday", latencyMs: 640 }), 600)),
   test_stt: () => new Promise((r) => setTimeout(() => r({ text: "The quick brown fox jumps over the lazy dog.", latencyMs: 412 }), 700)),

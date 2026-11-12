@@ -34,12 +34,24 @@ const ANTHROPIC_BASE: &str = "https://api.anthropic.com";
 /// the on-device model (no key). The UI's "llm" secret maps to this (`set_secret` in lib.rs).
 pub fn key_id(settings: &Settings) -> Option<String> {
     let llm = &settings.llm;
+    // Exactly where `App::llm_client` sends requests: only "openai" takes a base URL.
     let base = match llm.provider.as_str() {
         "cloud" | crate::polish::PROVIDER => return None,
         "anthropic" => ANTHROPIC_BASE,
-        _ => llm.base_url.as_deref().map(crate::cloud::base_of).filter(|b| !b.is_empty()).unwrap_or(OPENAI_BASE),
+        "openai" => llm.base_url.as_deref().map(crate::cloud::base_of).filter(|b| !b.is_empty()).unwrap_or(OPENAI_BASE),
+        _ => OPENAI_BASE,
     };
-    Some(format!("llm@{}", base.to_lowercase()))
+    // The URL parser lowercases the scheme and host (and maps international names) but keeps the
+    // path's case, which a server may tell apart.
+    let server = reqwest::Url::parse(base).map(|u| u.as_str().trim_end_matches('/').to_string()).unwrap_or_else(|_| base.to_string());
+    Some(format!("llm@{server}"))
+}
+
+/// Optional request settings a provider may reject (older or reasoning models refuse
+/// `temperature`, some refuse `reasoning_effort`): a 400 naming one of them is retried without.
+fn rejected_option(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:#}").to_lowercase();
+    msg.contains(" 400:") && ["temperature", "reasoning", "thinking", "unsupported", "not supported", "unknown parameter", "unrecognized"].iter().any(|w| msg.contains(w))
 }
 
 /// Moves the key saved before keys were kept per server ("llm") to the current server's id. With no
@@ -73,16 +85,27 @@ impl Client {
     async fn openai(&self, system: &str, user: &str, timeout: Duration) -> Result<String> {
         let base = self.base_url.as_deref().filter(|b| !b.trim().is_empty()).unwrap_or(OPENAI_BASE).trim_end_matches('/');
         crate::endpoint::check(base)?;
-        let body = json!({
-            "model": self.model,
-            "temperature": 0.2,
-            "messages": [{ "role": "system", "content": system }, { "role": "user", "content": user }],
-        });
-        let mut rb = HTTP.post(format!("{base}/chat/completions")).timeout(timeout).json(&body);
-        if let Some(k) = self.key.as_deref().filter(|k| !k.is_empty()) {
-            rb = rb.bearer_auth(k);
+        let messages = json!([{ "role": "system", "content": system }, { "role": "user", "content": user }]);
+        let mut body = json!({ "model": self.model, "messages": messages, "temperature": 0.2 });
+        // Cleanup waits on this: reasoning off where a provider documents how.
+        let model = self.model.to_lowercase();
+        if base == OPENAI_BASE && (model.starts_with("gpt-5") || model.starts_with("gpt-6") || model.starts_with('o')) {
+            body["reasoning_effort"] = json!("none");
         }
-        let v: Value = check("llm", send(rb).await?).await?.json().await?;
+        if base.starts_with("https://api.deepseek.com") {
+            body["thinking"] = json!({ "type": "disabled" });
+        }
+        let post = |body: &Value| {
+            let mut rb = HTTP.post(format!("{base}/chat/completions")).timeout(timeout).json(body);
+            if let Some(k) = self.key.as_deref().filter(|k| !k.is_empty()) {
+                rb = rb.bearer_auth(k);
+            }
+            async move { check("llm", send(rb).await?).await?.json::<Value>().await.map_err(anyhow::Error::from) }
+        };
+        let v = match post(&body).await {
+            Err(e) if rejected_option(&e) => post(&json!({ "model": self.model, "messages": messages })).await?,
+            r => r?,
+        };
         v.pointer("/choices/0/message/content").and_then(Value::as_str).map(String::from).ok_or_else(|| anyhow!("llm: empty response"))
     }
 
@@ -101,24 +124,24 @@ impl Client {
         let base = self.base_url.as_deref().filter(|b| !b.trim().is_empty()).unwrap_or(ANTHROPIC_BASE).trim_end_matches('/');
         crate::endpoint::check(base)?;
         let key = self.key.as_deref().ok_or_else(|| anyhow!("No Anthropic API key set"))?;
-        let body = json!({
-            "model": self.model,
-            "max_tokens": 4096,
-            "temperature": 0.2,
-            "system": system,
-            "messages": [{ "role": "user", "content": user }],
-        });
-        let resp = send(
-            HTTP.post(format!("{base}/v1/messages"))
-                .timeout(timeout)
-                .header("x-api-key", key)
-                .header("anthropic-version", "2023-06-01")
-                .json(&body),
-        )
-        .await?;
-        let v: Value = check("anthropic", resp).await?.json().await?;
-        v.pointer("/content/0/text").and_then(Value::as_str).map(String::from).ok_or_else(|| anyhow!("anthropic: empty response"))
+        let messages = json!([{ "role": "user", "content": user }]);
+        let post = |body: Value| {
+            let rb = HTTP.post(format!("{base}/v1/messages")).timeout(timeout).header("x-api-key", key).header("anthropic-version", "2023-06-01").json(&body);
+            async move { check("anthropic", send(rb).await?).await?.json::<Value>().await.map_err(anyhow::Error::from) }
+        };
+        // Newer models refuse sampling settings.
+        let v = match post(json!({ "model": self.model, "max_tokens": 4096, "temperature": 0.2, "system": system, "messages": messages })).await {
+            Err(e) if rejected_option(&e) => post(json!({ "model": self.model, "max_tokens": 4096, "system": system, "messages": messages })).await?,
+            r => r?,
+        };
+        anthropic_text(&v).ok_or_else(|| anyhow!("anthropic: empty response"))
     }
+}
+
+/// The answer's first text block: newer models may start with a thinking block.
+fn anthropic_text(v: &Value) -> Option<String> {
+    let text = |b: &&Value| b.get("type").and_then(Value::as_str).is_none_or(|t| t == "text") && b.get("text").is_some();
+    v.get("content")?.as_array()?.iter().find(text)?.get("text")?.as_str().map(String::from)
 }
 
 fn tone_rule(tone: &str) -> &'static str {
@@ -425,6 +448,21 @@ mod tests {
         assert_ne!(id("openai", Some("http://localhost:11434/v1")), id("openai", Some("http://localhost:1234/v1")));
         assert_eq!(id("anthropic", Some("https://evil.example")).as_deref(), Some("llm@https://api.anthropic.com"), "Anthropic ignores the address");
         assert_eq!((id("cloud", None), id("local", None)), (None, None));
+        assert_eq!(id("groq", Some("https://x.example/v1")), id("openai", None), "an unknown provider is sent to OpenAI, so its key is OpenAI's");
+        assert_ne!(id("openai", Some("https://gw.example/TeamA/v1")), id("openai", Some("https://gw.example/teama/v1")), "a path keeps its case");
+    }
+
+    #[test]
+    fn optional_settings_a_provider_rejects_are_dropped() {
+        let e = |m: &str| anyhow!("{m}");
+        assert!(rejected_option(&e("llm 400: Unsupported parameter: 'temperature' is not supported with this model.")));
+        assert!(rejected_option(&e("llm 400: Unrecognized request argument supplied: reasoning_effort")));
+        assert!(!rejected_option(&e("llm 401: Incorrect API key provided")), "not a setting");
+        assert!(!rejected_option(&e("llm 400: model not found")));
+        assert!(!rejected_option(&e("llm 500: temperature sensor offline")), "only a refused request");
+        let thinking_first = json!({ "content": [{ "type": "thinking", "thinking": "hm" }, { "type": "text", "text": "Meet at 3." }] });
+        assert_eq!(anthropic_text(&thinking_first).as_deref(), Some("Meet at 3."));
+        assert_eq!(anthropic_text(&json!({ "content": [] })), None);
     }
 
     #[test]

@@ -24,15 +24,15 @@ export const LLM_SERVICES: LlmService[] = [
   { id: "openrouter", label: "OpenRouter", provider: "openai", baseUrl: "https://openrouter.ai/api/v1", defaultModel: "openrouter/auto", keyUrl: "openrouter.ai/keys", models: ["openrouter/auto"] },
   { id: "mistral", label: "Mistral", provider: "openai", baseUrl: "https://api.mistral.ai/v1", defaultModel: "mistral-small-latest", keyUrl: "console.mistral.ai/api-keys", models: ["mistral-small-latest"] },
   { id: "deepseek", label: "DeepSeek", provider: "openai", baseUrl: "https://api.deepseek.com", defaultModel: "deepseek-flash", keyUrl: "platform.deepseek.com/api_keys", models: ["deepseek-flash", "deepseek-v4-pro"] },
-  { id: "xai", label: "xAI", provider: "openai", baseUrl: "https://api.x.ai/v1", defaultModel: "grok-4.20-0309-non-reasoning", keyUrl: "console.x.ai", models: ["grok-4.20-0309-non-reasoning", "grok-4.3"] },
-  { id: "together", label: "Together AI", provider: "openai", baseUrl: "https://api.together.ai/v1", defaultModel: "Qwen/Qwen3.8-Flash", keyUrl: "api.together.ai/settings/api-keys", models: ["Qwen/Qwen3.8-Flash", "zai-org/GLM-5.3-Flash", "MiniMaxAI/MiniMax-M3.1-Flash"] },
+  { id: "xai", label: "xAI", provider: "openai", baseUrl: "https://api.x.ai/v1", defaultModel: "grok-4.20-0309-non-reasoning", keyUrl: "console.x.ai/team/default/api-keys", models: ["grok-4.20-0309-non-reasoning", "grok-4.3"] },
+  { id: "together", label: "Together AI", provider: "openai", baseUrl: "https://api.together.ai/v1", defaultModel: "Qwen/Qwen3.8-Flash", keyUrl: "api.together.ai/settings/projects/~current/api-keys", models: ["Qwen/Qwen3.8-Flash", "zai-org/GLM-5.3-Flash", "MiniMaxAI/MiniMax-M3.1-Flash"] },
   { id: "fireworks", label: "Fireworks", provider: "openai", baseUrl: "https://api.fireworks.ai/inference/v1", defaultModel: "accounts/fireworks/models/glm-5p3-flash", keyUrl: "app.fireworks.ai/settings/users/api-keys", models: ["accounts/fireworks/models/glm-5p3-flash"] },
-  { id: "cerebras", label: "Cerebras", provider: "openai", baseUrl: "https://api.cerebras.ai/v1", defaultModel: "gpt-oss-120b", keyUrl: "cloud.cerebras.ai", models: ["gpt-oss-120b", "qwen-3.8-27b"] },
+  { id: "cerebras", label: "Cerebras", provider: "openai", baseUrl: "https://api.cerebras.ai/v1", defaultModel: "qwen-3.8-27b", keyUrl: "cloud.cerebras.ai", models: ["qwen-3.8-27b", "gpt-oss-120b"] },
   { id: "ollama", label: "Ollama (this computer)", provider: "openai", baseUrl: "http://localhost:11434/v1", defaultModel: "llama3.2", keyless: true, models: ["llama3.2", "qwen3:8b", "gpt-oss:20b"] },
   { id: "lmstudio", label: "LM Studio (this computer)", provider: "openai", baseUrl: "http://localhost:1234/v1", defaultModel: "local-model", keyless: true },
   { id: OTHER_SERVICE, label: "Other OpenAI-compatible", provider: "openai", baseUrl: null, defaultModel: "gpt-4o-mini" },
   { id: "cloud", label: "OpsTrellis Cloud", provider: "cloud", baseUrl: null, defaultModel: "auto" },
-  { id: "local", label: "On this device (S1-mini, offline)", provider: "local", baseUrl: null, defaultModel: "s1-mini" },
+  { id: "local", label: "On this device (offline)", provider: "local", baseUrl: null, defaultModel: "spokenly-cleanup-1" },
 ];
 
 const norm = (url: string | null) => (url ?? "").trim().replace(/\/+$/, "").toLowerCase();

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, errMsg, type AppUse, type Category, type Settings, type TermPack, type TermPackPreview, type Tone, type Transform } from "../api";
+import { api, errMsg, type AppUse, type Category, type PolishModel, type Settings, type TermPack, type TermPackPreview, type Tone, type Transform } from "../api";
 import { Icon } from "../icons";
 import { CATEGORY_LABELS, Modal, Page, Row, Section, Toggle, type SettingsProps } from "../ui";
 
@@ -217,6 +217,14 @@ function AppAi({ settings, set, tab, label }: SettingsProps & { tab: Category; l
   useEffect(() => void api.listTransforms().then((ts) => setTransforms(ts.filter((t) => t.output === "replace" && !t.team)), () => {}), []);
   const current = settings.autoTransforms[tab];
   const ai = settings.llm.enabled;
+  const local = settings.llm.provider === "local";
+  // A local cleanup model alone can't follow instructions; an installed local instruction model can.
+  const [localModels, setLocalModels] = useState<PolishModel[]>([]);
+  useEffect(() => void (local ? api.polishModels().then(setLocalModels, () => {}) : setLocalModels([])), [local]);
+  const chosenLocal = localModels.find((m) => m.id === settings.llm.model) ?? localModels.find((m) => m.id === "s1-mini");
+  const localFollows = localModels.some((m) => m.installed && m.kind === "instruct" &&
+    (m.id === chosenLocal?.id || (chosenLocal?.kind === "cleanup" && m.id === settings.llm.localRewrite)));
+  const follows = !local || localFollows;
   const choose = (value: string) => {
     const next = { ...settings.autoTransforms };
     if (value) next[tab] = Number(value);
@@ -224,7 +232,7 @@ function AppAi({ settings, set, tab, label }: SettingsProps & { tab: Category; l
     set("autoTransforms", next);
   };
   const setNotes = (v: string) => set("styleNotes", { ...settings.styleNotes, [tab]: v });
-  const translates = ai && settings.llm.provider !== "local";
+  const translates = ai && follows;
   const setLanguage = (code: string) => {
     const next = { ...settings.outputLanguages };
     if (code) next[tab] = code;
@@ -235,7 +243,9 @@ function AppAi({ settings, set, tab, label }: SettingsProps & { tab: Category; l
     <Section title={`AI in ${label.toLowerCase()} apps`}
       desc={ai ? "Applied by AI polish, in the same request as the cleanup." : "Turn on AI polish below to use these."}>
       <div className="card">
-        <Row title="Auto action" desc={`Rewrite every dictation here with an action from Library → Actions before it's inserted.${tab === "other" ? " Never in a plain terminal." : ""}`}>
+        <Row title="Auto action" desc={ai && !follows
+          ? "The on-device cleanup model can't run actions: dictations here are cleaned up only. Add a local instruction model or choose a cloud provider in Settings → AI polish."
+          : `Rewrite every dictation here with an action from Library → Actions before it's inserted.${tab === "other" ? " Never in a plain terminal." : ""}`}>
           <select value={current ?? ""} disabled={!ai} aria-label={`Auto action for ${label}`} onChange={(e) => choose(e.target.value)}>
             <option value="">Off</option>
             {transforms.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
@@ -243,7 +253,7 @@ function AppAi({ settings, set, tab, label }: SettingsProps & { tab: Category; l
         </Row>
         <Row title="Write in" desc={translates
           ? `Speak any language, or a mix; AI polish writes it in this one. Names, code and your dictionary terms stay as they are.${tab === "other" ? " Never in a plain terminal." : ""}`
-          : "Needs AI polish with a cloud or OpenAI-compatible provider (Settings → AI polish); the on-device model can't translate."}>
+          : "Needs AI polish with a model that follows instructions (Settings → AI polish): a cloud provider or a local instruction model."}>
           <select value={settings.outputLanguages[tab] ?? ""} disabled={!translates} aria-label={`Language to write ${label.toLowerCase()} in`}
             onChange={(e) => setLanguage(e.target.value)}>
             <option value="">Same as spoken</option>
