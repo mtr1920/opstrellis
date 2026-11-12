@@ -3,6 +3,7 @@ import {
   api, errMsg, useEvent, type BackupSummary, type CloudStatus, type SettingsDetail, type LocalModel, type Permissions, type PolishModel, type WaylandShortcuts, type ProviderKind, type Settings, type SttEntry, type TeamStatus, type UpdateInfo,
 } from "../api";
 import { Icon } from "../icons";
+import { LLM_SERVICES, OTHER_SERVICE, serviceFor } from "../llmServices";
 import { WorkspacesSection } from "./Workspaces";
 import { IS_MAC, Keys, isSingleKey, Modal, Page, Progress, Row, Search, Section, Toggle, UnencryptedWarning, comboText, useModelDownloads, type SettingsProps } from "../ui";
 
@@ -182,11 +183,7 @@ function SettingsSection({ title, desc, children }: { title: string; desc?: stri
 
 // ---------- AI ----------
 
-const LLM_DEFAULTS: Record<Settings["llm"]["provider"], string> = {
-  openai: "gpt-4o-mini", anthropic: "claude-haiku-4-5", cloud: "auto", local: "s1-mini",
-};
-
-/** AI polish on/off, provider, model, key, and a test request. */
+/** AI polish on/off, service, model, key, and a test request. */
 export function LlmSection({ settings, set, saveNow }: SettingsProps & { saveNow: () => Promise<void> }) {
   const llm = settings.llm;
   const update = (patch: Partial<Settings["llm"]>) => set("llm", { ...llm, ...patch });
@@ -194,14 +191,26 @@ export function LlmSection({ settings, set, saveNow }: SettingsProps & { saveNow
   const [hasKey, setHasKey] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [test, setTest] = useState<{ busy?: boolean; ok?: string; error?: string }>({});
+  // "Other" with an empty address looks like OpenAI in the saved settings, so the pick is remembered here.
+  const [pickedOther, setPickedOther] = useState(false);
+  const service = pickedOther && llm.provider === "openai" ? LLM_SERVICES.find((s) => s.id === OTHER_SERVICE)! : serviceFor(llm);
+  // Keys are kept per server: after the service changes, the key shown is that service's.
+  const refreshKey = () => saveNow().then(() => api.hasSecrets()).then((s) => setHasKey(s.includes("llm")), () => {});
   useEffect(() => void api.hasSecrets().then((s) => setHasKey(s.includes("llm")), () => {}), []);
 
   async function saveKey() {
     try {
-      // A pending save of a new address would delete a key saved before it.
+      // The key is stored for the address saved now.
       await saveNow();
       await api.setSecret("llm", key.trim());
       setKey(""); setHasKey(true); setMsg(null);
+    } catch (e) { setMsg(errMsg(e)); }
+  }
+  async function removeKey() {
+    try {
+      await saveNow();
+      await api.deleteSecret("llm");
+      setHasKey(false); setMsg(null);
     } catch (e) { setMsg(errMsg(e)); }
   }
   async function runTest() {
@@ -222,48 +231,45 @@ export function LlmSection({ settings, set, saveNow }: SettingsProps & { saveNow
       {llm.enabled && (
         <div className="form-grid">
           <label className="field">
-            <span>Provider</span>
-            <select value={llm.provider} onChange={(e) => {
-              const provider = e.target.value as Settings["llm"]["provider"];
-              update({ provider, model: LLM_DEFAULTS[provider], baseUrl: null });
-              setTest({});
-              // The saved key belongs to the previous provider; never send it to the new one.
-              if (hasKey) api.deleteSecret("llm").then(() => setHasKey(false), (err) => setMsg(errMsg(err)));
+            <span>Service</span>
+            <select value={service.id} onChange={(e) => {
+              const next = LLM_SERVICES.find((s) => s.id === e.target.value)!;
+              setPickedOther(next.id === OTHER_SERVICE);
+              update({ provider: next.provider, model: next.defaultModel, baseUrl: next.baseUrl });
+              setTest({}); setKey(""); setMsg(null); setHasKey(false);
+              void refreshKey();
             }}>
-              <option value="openai">OpenAI-compatible</option>
-              <option value="anthropic">Anthropic</option>
-              <option value="cloud">OpsTrellis Cloud</option>
-              <option value="local">On this device (S1-mini, offline)</option>
+              {LLM_SERVICES.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
             </select>
           </label>
           {llm.provider !== "local" && (
             <label className="field">
               <span>Model</span>
-              <input value={llm.model} onChange={(e) => update({ model: e.target.value })} />
+              <input value={llm.model} list="llm-models" onChange={(e) => update({ model: e.target.value })} />
+              <datalist id="llm-models">{service.models?.map((m) => <option key={m} value={m} />)}</datalist>
             </label>
           )}
           {llm.provider === "local" && <LocalPolish />}
-          {llm.provider === "openai" && (
+          {service.id === OTHER_SERVICE && (
             <label className="field span2">
-              <span>Base URL <em>optional: Groq, OpenRouter, Ollama, LM Studio…</em></span>
+              <span>Base URL <em>optional: any OpenAI-compatible server</em></span>
               <input value={llm.baseUrl ?? ""} placeholder="https://api.openai.com/v1"
-                onChange={(e) => {
-                  update({ baseUrl: e.target.value || null });
-                  // Saving drops the key entered for the old address; show that it's gone.
-                  if (hasKey) saveNow().then(() => api.hasSecrets()).then((s) => setHasKey(s.includes("llm")), () => {});
-                }} />
+                onChange={(e) => update({ baseUrl: e.target.value || null })} onBlur={() => void refreshKey()} />
               <UnencryptedWarning url={llm.baseUrl} />
-              {hasKey && <span className="meta">Changing the address clears the saved key.</span>}
+              <span className="meta">Each address keeps its own saved key.</span>
             </label>
           )}
-          {llm.provider !== "cloud" && llm.provider !== "local" && (
+          {service.baseUrl && <p className="meta span2">Sends to {service.baseUrl}</p>}
+          {llm.provider !== "cloud" && llm.provider !== "local" && !service.keyless && (
             <label className="field span2">
               <span>API key {hasKey && <em className="ok">saved</em>}</span>
               <div className="inline">
                 <input type="password" value={key} placeholder={hasKey ? "••••••••  (enter to replace)" : "Paste your API key"}
                   onChange={(e) => setKey(e.target.value)} />
                 <button className="btn" onClick={saveKey} disabled={!key.trim()}>Save key</button>
+                {hasKey && <button className="btn" onClick={removeKey}>Remove key</button>}
               </div>
+              {service.keyUrl && !hasKey && <span className="meta">Get a key at {service.keyUrl}</span>}
               {msg && <div className="error">{msg}</div>}
             </label>
           )}
