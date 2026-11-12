@@ -53,7 +53,8 @@
       "icons/icon.png"
     ],
     "resources": {
-      "resources/sample.wav": "sample.wav"
+      "resources/sample.wav": "sample.wav",
+      "resources/silero_vad.onnx": "silero_vad.onnx"
     },
     "category": "Productivity",
     "shortDescription": "Voice dictation for every app",

@@ -22,6 +22,10 @@ pub struct Entry {
     /// Applied in code editors and terminals only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tech_aliases: Vec<String>,
+    /// A hint to the transcriber before the user has ever said it (tech pack only): for names that
+    /// aren't also words, which a local model would otherwise write as the words they sound like.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hint: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -145,7 +149,7 @@ impl Matcher {
 /// The packs in use: tech (if on), then enabled built-in packs, then enabled user packs.
 pub struct Active {
     matcher: Matcher,
-    /// Terms of the enabled built-in extra packs, in pack order.
+    /// The tech pack's hinted names and the terms of the enabled built-in extra packs, in pack order.
     pack_hints: Vec<String>,
 }
 
@@ -154,8 +158,8 @@ impl Active {
         self.matcher.is_term(s)
     }
 
-    /// The enabled built-in extra packs' terms in pack order, so they can be hints before they are
-    /// ever said.
+    /// The tech pack's hinted names, then the enabled built-in extra packs' terms in pack order, so
+    /// they can be hints before they are ever said.
     pub fn pack_terms(&self) -> &[String] {
         &self.pack_hints
     }
@@ -174,8 +178,12 @@ static BUILTIN: LazyLock<Vec<Pack>> = LazyLock::new(|| {
 });
 static TECH: LazyLock<Arc<Active>> = LazyLock::new(|| {
     let matcher = Matcher::new(TECH_ENTRIES.iter()).expect("terms regex");
-    Arc::new(Active { matcher, pack_hints: Vec::new() })
+    Arc::new(Active { matcher, pack_hints: tech_hints() })
 });
+
+fn tech_hints() -> Vec<String> {
+    TECH_ENTRIES.iter().filter(|e| e.hint).map(|e| e.term.clone()).collect()
+}
 /// Imported packs, by id.
 static USER: RwLock<Vec<Arc<Pack>>> = RwLock::new(Vec::new());
 static ACTIVE: LazyLock<RwLock<Arc<Active>>> = LazyLock::new(|| RwLock::new(TECH.clone()));
@@ -274,12 +282,13 @@ fn build(tech: bool, ids: &[String], user: &[Arc<Pack>], size_limit: usize) -> A
     };
     // An imported pack's text is untrusted, so its terms reach the transcriber and the AI prompt
     // only once the user has said them (through usage counts).
-    let pack_hints = kept
-        .iter()
+    let pack_hints = if tech { tech_hints() } else { Vec::new() }
+        .into_iter()
+        .chain(kept.iter()
         .filter(|p| BUILTIN.iter().any(|b| std::ptr::eq(b, **p)))
         .flat_map(|p| &p.terms)
         .filter(|e| matcher.lookup.get(&norm(&e.term)).is_some_and(|&i| matcher.terms[i] == e.term))
-        .map(|e| e.term.clone())
+        .map(|e| e.term.clone()))
         .collect();
     Arc::new(Active { matcher, pack_hints })
 }
@@ -645,7 +654,7 @@ mod tests {
 
     fn entry(term: &str, aliases: &[&str], tech_aliases: &[&str]) -> Entry {
         let v = |l: &[&str]| l.iter().map(|s| s.to_string()).collect();
-        Entry { term: term.into(), aliases: v(aliases), tech_aliases: v(tech_aliases) }
+        Entry { term: term.into(), aliases: v(aliases), tech_aliases: v(tech_aliases), hint: false }
     }
 
     fn user_pack(id: &str, terms: Vec<Entry>) -> Arc<Pack> {
@@ -679,12 +688,13 @@ mod tests {
         assert!(Arc::ptr_eq(&tech_only, &TECH), "tech alone is the shared set");
         assert_eq!(tech_only.matcher.fix("check v lookup", false, &[]).0, "check v lookup");
         assert_eq!(tech_only.matcher.find("EBITDA and kubectl"), vec!["kubectl"]);
-        assert!(tech_only.pack_terms().is_empty());
+        assert_eq!(tech_only.pack_terms(), tech_hints(), "the tech pack's hinted names, from the start");
+        assert!(tech_only.pack_terms().iter().any(|t| t == "Claude Code") && !tech_only.pack_terms().iter().any(|t| t == "Cursor"));
 
         let finance = build(true, &ids(&["finance", "unknown"]), &[], SIZE_LIMIT);
         assert_eq!(finance.matcher.fix("check v lookup", false, &[]).0, "check VLOOKUP");
         assert_eq!(finance.matcher.find("EBITDA and kubectl"), vec!["EBITDA", "kubectl"]);
-        assert_eq!(finance.pack_terms()[0], "EBITDA", "pack terms come in pack order");
+        assert_eq!(finance.pack_terms()[tech_hints().len()], "EBITDA", "pack terms come in pack order, after the tech pack's");
         assert!(finance.is_term("kubectl") && finance.is_term("EBITDA"));
 
         let no_tech = build(false, &ids(&["finance"]), &[], SIZE_LIMIT);
@@ -826,7 +836,7 @@ mod tests {
         let user = vec![Arc::new(p)];
         let s = build(true, &ids(&["evil", "finance"]), &user, SIZE_LIMIT);
         assert!(!s.pack_terms().iter().any(|t| t == "decline" || t == "rm -rf"));
-        assert_eq!(s.pack_terms()[0], "EBITDA");
+        assert_eq!(s.pack_terms()[tech_hints().len()], "EBITDA");
         assert_eq!(s.matcher.find("please decline it"), vec!["decline"], "said, it is counted and then hinted");
         assert!(s.is_term("decline"));
     }

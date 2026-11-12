@@ -24,6 +24,7 @@ mod team;
 mod terms;
 mod text;
 mod update;
+mod vad;
 mod wayland;
 mod workspace;
 
@@ -1114,6 +1115,9 @@ pub fn run() {
         .setup(|tapp| {
             init_logging(tapp.handle());
             std::thread::spawn(terms::warm);
+            if let Some(vad) = tapp.path().resource_dir().ok().map(|d| d.join("silero_vad.onnx")).filter(|p| p.exists()) {
+                vad::set_model(vad);
+            }
             let data_dir = tapp.path().app_data_dir()?;
             secrets::private_dir(&data_dir)?;
             let settings_path = data_dir.join("settings.json");

@@ -366,10 +366,20 @@ pub fn split_point(samples: &[i16], min_pause: usize, max: usize) -> Option<usiz
         }
     }
     if cut.is_none() && samples.len() > max {
-        let from = levels.len().saturating_sub(5 * SAMPLE_RATE as usize / FRAME);
-        cut = (from..levels.len()).min_by(|&a, &b| levels[a].total_cmp(&levels[b])).map(|i| i * FRAME + FRAME / 2);
+        cut = Some(quietest(samples, levels.len().saturating_sub(5 * SAMPLE_RATE as usize / FRAME) * FRAME));
     }
     cut
+}
+
+/// Whether a frame is louder than silence.
+pub fn loud(frame: &[i16]) -> bool {
+    rms(frame) >= SILENCE_RMS
+}
+
+/// The middle of the quietest 50 ms frame of `samples` from `from` on (`samples.len()` if there is none).
+pub fn quietest(samples: &[i16], from: usize) -> usize {
+    let from = from / FRAME * FRAME;
+    samples.get(from..).unwrap_or_default().chunks_exact(FRAME).enumerate().min_by(|a, b| rms(a.1).total_cmp(&rms(b.1))).map_or(samples.len(), |(i, _)| from + i * FRAME + FRAME / 2)
 }
 
 #[cfg(test)]

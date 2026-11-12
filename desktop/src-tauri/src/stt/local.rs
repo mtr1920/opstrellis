@@ -132,8 +132,42 @@ pub fn info(id: &str) -> Option<&'static ModelInfo> {
 
 /// sherpa-onnx pads every Whisper clip with 10 s of silence, so a short clip costs nearly as much
 /// as a long one: cutting a dictation into phrases only adds passes and loses context at every cut.
-pub fn fixed_window(id: &str) -> bool {
+fn fixed_window(id: &str) -> bool {
     info(id).is_some_and(|m| matches!(m.family, Family::Whisper(_)))
+}
+
+/// NVIDIA transducers give a timestamp per token and words that start with a space, and take
+/// hotwords (with beam search).
+fn has_words(m: &ModelInfo) -> bool {
+    matches!(m.family, Family::NemoTransducer)
+}
+
+/// How a dictation with this model is cut into pieces (see `live`).
+pub fn plan(id: &str, language: Option<&str>) -> super::live::Plan {
+    const RATE: usize = SAMPLE_RATE as usize;
+    let max = RATE * max_segment_secs(id, language);
+    // Whisper: one pass on release unless the recording outgrows its window, except for scripts
+    // that need short pieces to fit its token budget.
+    // Moonshine decodes fast and loses words at every cut (it has no context), so its pieces are
+    // long: 8 s scored best of 1–16 s in bench_live_dictation.
+    let moonshine = info(id).is_some_and(|m| matches!(m.family, Family::Moonshine));
+    let min_commit = if fixed_window(id) && max >= RATE * 30 {
+        RATE * 20
+    } else if moonshine {
+        RATE * 8
+    } else {
+        super::live::MIN_COMMIT
+    };
+    let words = info(id).is_some_and(has_words);
+    let (context, lookahead) = if words { (super::live::CONTEXT, super::live::LOOKAHEAD) } else { (0, 0) };
+    let min_pause = if words { super::live::MIN_PAUSE } else { super::live::MIN_PAUSE_PLAIN };
+    #[cfg(test)]
+    let (min_commit, min_pause, context, lookahead) = {
+        let ms = |var: &str, v: usize| std::env::var(var).ok().and_then(|s| s.parse::<usize>().ok()).map_or(v, |ms| ms * RATE / 1000);
+        let w = |var: &str, v: usize| if words { ms(var, v) } else { 0 };
+        (ms("OPSTRELLIS_MIN_COMMIT_MS", min_commit), ms("OPSTRELLIS_MIN_PAUSE_MS", min_pause), w("OPSTRELLIS_CONTEXT_MS", context), w("OPSTRELLIS_LOOKAHEAD_MS", lookahead))
+    };
+    super::live::Plan { min_commit, min_pause, max, context, lookahead }
 }
 
 /// Whether Whisper will spell this dictation with many tokens per second (see `transcribe_blocking`).
@@ -145,7 +179,7 @@ fn token_heavy(m: &ModelInfo, language: &str) -> bool {
 /// The longest audio, in seconds, a model gets in one pass. Whisper and the LLM-style decoders
 /// see about 30 s, Omnilingual rejects clips over 40 s, Parakeet degrades past 20 s, and Whisper
 /// writing a token-heavy script must stay short enough for its padded token budget.
-pub fn max_segment_secs(id: &str, language: Option<&str>) -> usize {
+fn max_segment_secs(id: &str, language: Option<&str>) -> usize {
     match info(id) {
         Some(m) if matches!(m.family, Family::Whisper(_)) && token_heavy(m, language.unwrap_or("")) => 10,
         Some(m) if matches!(m.family, Family::NemoTransducer) => 20,
@@ -503,6 +537,14 @@ fn config(dir: &Path, m: &ModelInfo, language: &str) -> Result<sherpa_onnx::Offl
             };
             model.tokens = p("tokens.txt");
             model.model_type = Some("nemo_transducer".into());
+            // Hotwords are optional: a model folder that can't take the file still loads.
+            match bpe_vocab(dir) {
+                Ok(vocab) => {
+                    model.modeling_unit = Some("bpe".into());
+                    model.bpe_vocab = Some(vocab.to_string_lossy().into_owned());
+                }
+                Err(e) => log::warn!("no hotwords for {}: {e:#}", m.id),
+            }
         }
         Family::Zipformer(suffix) => {
             // icefall ships an int8 decoder that loses accuracy; its examples use the float one.
@@ -563,7 +605,66 @@ fn config(dir: &Path, m: &ModelInfo, language: &str) -> Result<sherpa_onnx::Offl
     if let Some(missing) = files.iter().find(|f| !f.exists()) {
         return Err(anyhow!("{} is incomplete: {} is missing. Delete it and download it again.", m.name, missing.display()));
     }
-    Ok(OfflineRecognizerConfig { model_config: model, decoding_method: Some("greedy_search".into()), ..Default::default() })
+    // Hotwords need beam search, which costs about 10% more than greedy with Parakeet.
+    let beam = has_words(m);
+    Ok(OfflineRecognizerConfig {
+        model_config: model,
+        decoding_method: Some(if beam { "modified_beam_search" } else { "greedy_search" }.into()),
+        max_active_paths: 4,
+        hotwords_score: hotwords_score(),
+        ..Default::default()
+    })
+}
+
+fn hotwords_score() -> f32 {
+    #[cfg(test)]
+    if let Some(score) = std::env::var("OPSTRELLIS_HOTWORDS_SCORE").ok().and_then(|s| s.parse().ok()) {
+        return score;
+    }
+    HOTWORDS_SCORE
+}
+
+/// How strongly hotwords are preferred, per token. Stronger made Parakeet repeat a hotword
+/// ("Claude Claude Claude"), write one for a similar word, or drop the rest of a sentence.
+const HOTWORDS_SCORE: f32 = 1.0;
+
+/// sherpa-onnx encodes hotwords with a SentencePiece vocabulary, which NeMo exports don't ship.
+/// Their tokens.txt lists the BPE pieces in merge order, which is what the scores encode.
+fn bpe_vocab(dir: &Path) -> Result<PathBuf> {
+    let path = dir.join("bpe.vocab");
+    if !path.exists() {
+        let tokens = std::fs::read_to_string(dir.join("tokens.txt")).context("reading tokens.txt")?;
+        let vocab: String = tokens.lines().filter_map(|l| l.rsplit_once(' ')).map(|(piece, id)| format!("{piece}\t-{id}\n")).collect();
+        let tmp = dir.join("bpe.vocab.part");
+        std::fs::write(&tmp, vocab)?;
+        std::fs::rename(&tmp, &path)?;
+    }
+    Ok(path)
+}
+
+/// The vocabulary entries a transducer can be biased toward: words and names as they are spoken
+/// and written alike. Code identifiers (`getUserById`, `snake_case`), paths and flags are left to
+/// the text rules, which map their spoken words.
+pub fn hotwords_for(models_dir: &Path, id: &str, vocabulary: &[String]) -> String {
+    info(id).map(|m| hotwords(&model_dir(models_dir, m), m, vocabulary)).unwrap_or_default()
+}
+
+/// sherpa-onnx drops every hotword of a stream when one has a character no token spells
+/// (`C#`, an accented name), so those are left out.
+fn hotwords(dir: &Path, m: &ModelInfo, vocabulary: &[String]) -> String {
+    const MAX: usize = 200;
+    if !has_words(m) || bpe_vocab(dir).is_err() {
+        return String::new();
+    }
+    let tokens = std::fs::read_to_string(dir.join("tokens.txt")).unwrap_or_default();
+    let spelled: std::collections::HashSet<char> = tokens.lines().filter_map(|l| l.rsplit_once(' ')).flat_map(|(piece, _)| piece.chars()).collect();
+    let word = |w: &str| {
+        let first = w.chars().next().is_some_and(char::is_alphanumeric);
+        let camel = w.starts_with(char::is_lowercase) && w.chars().any(char::is_uppercase);
+        first && !camel && w.chars().any(char::is_alphabetic) && w.chars().all(|c| c.is_alphanumeric() || ".'+#&-".contains(c))
+    };
+    let speakable = |t: &&str| t.len() <= 40 && (1..=4).contains(&t.split_whitespace().count()) && t.split_whitespace().all(word) && t.chars().all(|c| c == ' ' || spelled.contains(&c));
+    vocabulary.iter().map(|t| t.trim()).filter(speakable).take(MAX).collect::<Vec<_>>().join("\n")
 }
 
 fn load(dir: &Path, m: &ModelInfo, language: &str) -> Result<sherpa_onnx::OfflineRecognizer> {
@@ -575,9 +676,47 @@ fn language_bound(m: &ModelInfo) -> bool {
     matches!(m.family, Family::Whisper(_) | Family::SenseVoice | Family::Canary | Family::Cohere)
 }
 
-/// Blocking transcription with the given model (loads it if needed). Audio longer than the model
-/// takes in one pass is cut at pauses and transcribed piece by piece.
-pub fn transcribe_blocking(models_dir: &Path, id: &str, language: Option<&str>, audio: &[i16]) -> Result<String> {
+/// A word of a decoded clip.
+pub struct Word {
+    /// With its leading space; punctuation stays with the word before it.
+    pub text: String,
+    /// Seconds from the clip's start.
+    pub start: f32,
+}
+
+#[derive(Default)]
+pub struct Decoded {
+    pub text: String,
+    /// For models with word timestamps (`has_words`).
+    pub words: Option<Vec<Word>>,
+}
+
+/// Groups tokens into words: a token that starts with a space starts a word.
+fn group_words(tokens: &[String], timestamps: &[f32]) -> Vec<Word> {
+    let mut out: Vec<Word> = Vec::new();
+    for (t, &start) in tokens.iter().zip(timestamps) {
+        match out.last_mut() {
+            Some(w) if !t.starts_with(' ') => w.text.push_str(t),
+            _ => out.push(Word { text: if t.starts_with(' ') { t.clone() } else { format!(" {t}") }, start }),
+        }
+    }
+    out
+}
+
+/// Blocking transcription with the given model (loads it if needed), biased toward `vocabulary`
+/// where the model can be. Audio longer than the model takes in one pass is cut at pauses and
+/// transcribed piece by piece, with the same cuts as a live dictation.
+pub fn transcribe_blocking(models_dir: &Path, id: &str, language: Option<&str>, vocabulary: &[String], audio: &[i16]) -> Result<String> {
+    let m = info(id).ok_or_else(|| anyhow!("Unknown local model {id}"))?;
+    let hot = hotwords(&model_dir(models_dir, m), m, vocabulary);
+    let mut live = super::live::Live::new(plan(id, language));
+    live.push(audio);
+    live.finish(&mut |a: &[i16]| decode_blocking(models_dir, id, language, &hot, a))
+}
+
+/// One pass over a clip the model can take whole (loads the model if needed). `hotwords`: one
+/// phrase per line, from `hotwords`.
+pub fn decode_blocking(models_dir: &Path, id: &str, language: Option<&str>, hotwords: &str, audio: &[i16]) -> Result<Decoded> {
     let m = info(id).ok_or_else(|| anyhow!("Unknown local model {id}"))?;
     if !is_installed(models_dir, m) {
         return Err(anyhow!("Local model \"{}\" is not downloaded yet (Settings → Local models)", m.name));
@@ -595,31 +734,18 @@ pub fn transcribe_blocking(models_dir: &Path, id: &str, language: Option<&str>, 
         log::info!("loaded local model {id} in {:?}", started.elapsed());
     }
     let recognizer = &guard.as_ref().expect("loaded").2;
-    const RATE: usize = SAMPLE_RATE as usize;
-    let max = RATE * max_segment_secs(id, language);
-    let (mut rest, mut texts) = (audio, Vec::new());
-    while rest.len() > max {
-        let cut = crate::audio::split_point(&rest[..max], RATE * 6 / 10, max - RATE).filter(|&c| c > 0).unwrap_or(max);
-        if !crate::audio::is_silent(&rest[..cut]) {
-            texts.push(decode(recognizer, m, &lang, &rest[..cut]));
-        }
-        rest = &rest[cut..];
-    }
-    if texts.is_empty() || !crate::audio::is_silent(rest) {
-        texts.push(decode(recognizer, m, &lang, rest));
-    }
-    Ok(texts.into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join(" "))
+    Ok(decode(recognizer, m, &lang, hotwords, audio))
 }
 
 /// One pass of the recognizer over a clip the model can take whole.
-fn decode(recognizer: &sherpa_onnx::OfflineRecognizer, m: &ModelInfo, lang: &str, audio: &[i16]) -> String {
+fn decode(recognizer: &sherpa_onnx::OfflineRecognizer, m: &ModelInfo, lang: &str, hotwords: &str, audio: &[i16]) -> Decoded {
     let mut samples: Vec<f32> = audio.iter().map(|s| *s as f32 / 32768.0).collect();
     // Cohere drops the last words of a clip that ends right after speech.
     if matches!(m.family, Family::Cohere) {
         samples.resize(samples.len() + SAMPLE_RATE as usize / 2, 0.0);
     }
     let run = |samples: &[f32]| {
-        let stream = recognizer.create_stream();
+        let stream = if hotwords.is_empty() { recognizer.create_stream() } else { recognizer.create_stream_with_hotwords(hotwords) };
         stream.accept_waveform(SAMPLE_RATE as i32, samples);
         recognizer.decode(&stream);
         stream.get_result()
@@ -637,12 +763,14 @@ fn decode(recognizer: &sherpa_onnx::OfflineRecognizer, m: &ModelInfo, lang: &str
         samples.resize((samples.len() * 2).min(window), 0.0);
         result = run(&samples);
     }
-    result.map(|r| r.text.trim().to_string()).unwrap_or_default()
+    let Some(r) = result else { return Decoded::default() };
+    let words = r.timestamps.as_ref().filter(|t| has_words(m) && t.len() == r.tokens.len()).map(|t| group_words(&r.tokens, t));
+    Decoded { text: r.text.trim().to_string(), words }
 }
 
 pub async fn transcribe(models_dir: &Path, id: &str, req: &Request<'_>) -> Result<String> {
-    let (dir, id, lang, audio) = (models_dir.to_path_buf(), id.to_string(), req.language.map(String::from), req.audio.to_vec());
-    tokio::task::spawn_blocking(move || transcribe_blocking(&dir, &id, lang.as_deref(), &audio)).await?
+    let (dir, id, lang, vocabulary, audio) = (models_dir.to_path_buf(), id.to_string(), req.language.map(String::from), req.vocabulary.to_vec(), req.audio.to_vec());
+    tokio::task::spawn_blocking(move || transcribe_blocking(&dir, &id, lang.as_deref(), &vocabulary, &audio)).await?
 }
 
 /// Preloads a model so the first dictation isn't delayed by model loading.
@@ -650,7 +778,7 @@ pub async fn transcribe(models_dir: &Path, id: &str, req: &Request<'_>) -> Resul
 pub fn warm_up(models_dir: &Path, id: &str, language: Option<&str>) {
     if let Some(m) = info(id) {
         if is_installed(models_dir, m) {
-            let _ = transcribe_blocking(models_dir, id, language, &vec![0i16; SAMPLE_RATE as usize / 2]);
+            let _ = decode_blocking(models_dir, id, language, "", &vec![0i16; SAMPLE_RATE as usize / 2]);
         }
     }
 }
@@ -658,6 +786,17 @@ pub fn warm_up(models_dir: &Path, id: &str, language: Option<&str>) {
 #[cfg(test)]
 mod install_tests {
     use super::*;
+
+    #[test]
+    fn hotwords_are_names_the_model_can_spell() {
+        let dir = temp("hotwords");
+        std::fs::write(dir.join("tokens.txt"), "<unk> 0\n▁S 1\n▁Supa 2\nbase 3\nupabse 4\nio 5\nhan 6\n▁Vercel 7\n▁Next 8\n.js 9\n▁C 10\n").unwrap();
+        let m = info("parakeet-unified-en").unwrap();
+        let vocab: Vec<String> = ["Supabase", "C#", "getUserById", "--force", "~/projects", "Siobhán", "Next.js", "user_id", "Vercel"].map(String::from).to_vec();
+        assert_eq!(hotwords(&dir, m, &vocab), "Supabase\nNext.js\nVercel");
+        assert!(dir.join("bpe.vocab").exists());
+        assert_eq!(hotwords(&dir, info("whisper-base").unwrap(), &vocab), "", "only transducers take hotwords");
+    }
 
     fn temp(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("opstrellis-models-{tag}-{}", uuid::Uuid::new_v4()));
@@ -807,7 +946,16 @@ mod bench {
 
     /// Word error rate via edit distance on words.
     pub fn wer(reference: &str, hypothesis: &str) -> f64 {
-        let (r, h) = (words(reference), words(hypothesis));
+        edits(&words(reference), &words(hypothesis))
+    }
+
+    /// Word error rate that also counts casing and punctuation (words as written, split at spaces).
+    fn wer_written(reference: &str, hypothesis: &str) -> f64 {
+        let split = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        edits(&split(reference), &split(hypothesis))
+    }
+
+    fn edits(r: &[String], h: &[String]) -> f64 {
         let mut prev: Vec<usize> = (0..=h.len()).collect();
         for (i, rw) in r.iter().enumerate() {
             let mut cur = vec![i + 1; h.len() + 1];
@@ -870,7 +1018,7 @@ mod bench {
             clips.retain(|p| p.extension().is_some_and(|e| e == "wav") && !p.to_string_lossy().contains("8k"));
             clips.sort();
             let Some(clip) = clips.first() else { continue };
-            let text = transcribe_blocking(&dir, m.id, None, &crate::audio::read_wav(clip).unwrap()).unwrap_or_else(|e| format!("ERROR {e:#}"));
+            let text = transcribe_blocking(&dir, m.id, None, &[], &crate::audio::read_wav(clip).unwrap()).unwrap_or_else(|e| format!("ERROR {e:#}"));
             println!("| {} | {} | {} |", m.id, clip.file_name().unwrap().to_string_lossy(), text);
         }
         let Ok(clips) = std::env::var("OPSTRELLIS_LANG_WAVS") else { return };
@@ -883,7 +1031,7 @@ mod bench {
             let (Ok(audio), Ok(reference)) = (crate::audio::read_wav(&clips.join(format!("{lang}.wav"))), std::fs::read_to_string(clips.join(format!("{lang}.txt")))) else { continue };
             for m in installed.iter().filter(|m| m.langs.contains(&lang.as_str())) {
                 let t = std::time::Instant::now();
-                let r = transcribe_blocking(&dir, m.id, Some(&lang), &audio);
+                let r = transcribe_blocking(&dir, m.id, Some(&lang), &[], &audio);
                 let rtf = t.elapsed().as_secs_f64() / (audio.len() as f64 / SAMPLE_RATE as f64);
                 match r {
                     Ok(text) => println!("| {lang} | {} | {:.1}% | {rtf:.3} | {text} |", m.id, 100.0 * cer(&reference, &text)),
@@ -944,13 +1092,13 @@ mod bench {
             }
             unload();
             let t = std::time::Instant::now();
-            transcribe_blocking(&dir, id, Some("en"), &vec![0; 8000]).unwrap();
+            transcribe_blocking(&dir, id, Some("en"), &[], &vec![0; 8000]).unwrap();
             let load = t.elapsed();
             let (mut errs, mut audio_s, mut cpu_s) = (0.0, 0.0, 0.0);
             for (wav, reference) in &refs {
                 let audio = crate::audio::read_wav(wav).unwrap();
                 let t = std::time::Instant::now();
-                let hyp = transcribe_blocking(&dir, id, Some("en"), &audio).unwrap();
+                let hyp = transcribe_blocking(&dir, id, Some("en"), &[], &audio).unwrap();
                 cpu_s += t.elapsed().as_secs_f64();
                 audio_s += audio.len() as f64 / SAMPLE_RATE as f64;
                 errs += wer(reference, &hyp);
@@ -988,11 +1136,16 @@ mod bench {
     /// desktop/bench/dev-speech/synthesize.sh and scores the raw transcript and the rule-based
     /// cleanup (docs/BENCHMARK.md).
     /// OPSTRELLIS_BENCH_DEV_WAVS=<dir> [OPSTRELLIS_BENCH_DEV_TSV=<sentences.tsv>] [OPSTRELLIS_TEST_MODELS=<dir>]
+    /// [OPSTRELLIS_BENCH_VOCAB=terms] [OPSTRELLIS_HOTWORDS_SCORE=<score>]
     /// cargo test --release bench_dev_speech -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn bench_dev_speech() {
-        let models = PathBuf::from(std::env::var("OPSTRELLIS_TEST_MODELS").unwrap_or_else(|_| "/tmp/opstrellis-models".into()));
+    fn test_models() -> PathBuf {
+        PathBuf::from(std::env::var("OPSTRELLIS_TEST_MODELS").unwrap_or_else(|_| "/tmp/opstrellis-models".into()))
+    }
+
+    /// The sentences (expected text, terms) and the WAVs synthesize.sh rendered of them
+    /// (name, path, sentence index), sorted by name.
+    #[allow(clippy::type_complexity)]
+    fn dev_clips() -> (Vec<(String, Vec<String>)>, Vec<(String, PathBuf, usize)>, PathBuf) {
         let wavs = PathBuf::from(std::env::var("OPSTRELLIS_BENCH_DEV_WAVS").expect("OPSTRELLIS_BENCH_DEV_WAVS: the directory written by synthesize.sh"));
         let tsv = std::env::var("OPSTRELLIS_BENCH_DEV_TSV").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../bench/dev-speech/sentences.tsv").into());
         let rows: Vec<(String, Vec<String>)> = std::fs::read_to_string(&tsv)
@@ -1018,9 +1171,25 @@ mod bench {
             .collect();
         clips.sort();
         assert!(!clips.is_empty(), "no WAVs in {}", wavs.display());
+        (rows, clips, wavs)
+    }
 
-        // The options clean_up builds for a terminal or editor with AI off and the default cleanup settings.
-        let opts = crate::text::Options {
+    /// OPSTRELLIS_BENCH_VOCAB: "terms" (every term of the sentence file, like a dictionary of
+    /// that size) or entries separated by `|`.
+    fn bench_vocabulary(rows: &[(String, Vec<String>)]) -> Vec<String> {
+        match std::env::var("OPSTRELLIS_BENCH_VOCAB").as_deref() {
+            Ok("terms") => {
+                let mut seen = std::collections::HashSet::new();
+                rows.iter().flat_map(|r| r.1.clone()).filter(|t| seen.insert(t.clone())).collect()
+            }
+            Ok(list) => list.split('|').filter(|t| !t.is_empty()).map(String::from).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// The options clean_up builds for a terminal or editor with AI off and the default cleanup settings.
+    fn rules() -> crate::text::Options<'static> {
+        crate::text::Options {
             remove_fillers: true,
             voice_commands: true,
             dictionary: &[],
@@ -1036,7 +1205,16 @@ mod bench {
             workspace: None,
             workspace_names: false,
             mentions: false,
-        };
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_dev_speech() {
+        let models = test_models();
+        let (rows, clips, wavs) = dev_clips();
+        let opts = rules();
+        let vocabulary = bench_vocabulary(&rows);
 
         println!("\n{} clips ({} sentences) from {}\n", clips.len(), rows.len(), wavs.display());
         println!("| model | clips | WER raw | WER after rules | terms raw | terms after rules | real-time factor |\n|---|---|---|---|---|---|---|");
@@ -1046,7 +1224,7 @@ mod bench {
                 continue;
             }
             unload();
-            transcribe_blocking(&models, m.id, Some("en"), &vec![0; 8000]).unwrap();
+            transcribe_blocking(&models, m.id, Some("en"), &[], &vec![0; 8000]).unwrap();
             let (mut audio_s, mut cpu_s) = (0.0, 0.0);
             let (mut ref_words, mut err_raw, mut err_proc) = (0usize, 0.0, 0.0);
             let (mut terms, mut hit_raw, mut hit_proc) = (0usize, 0usize, 0usize);
@@ -1055,7 +1233,7 @@ mod bench {
                 let (expected, wanted) = &rows[*i];
                 let audio = crate::audio::read_wav(wav).unwrap();
                 let t = std::time::Instant::now();
-                let raw = transcribe_blocking(&models, m.id, Some("en"), &audio).unwrap();
+                let raw = transcribe_blocking(&models, m.id, Some("en"), &vocabulary, &audio).unwrap();
                 cpu_s += t.elapsed().as_secs_f64();
                 audio_s += audio.len() as f64 / SAMPLE_RATE as f64;
                 let processed = crate::text::process(&raw, &opts).text;
@@ -1091,6 +1269,250 @@ mod bench {
             println!("\nWorst 10 after rules, {model}:");
             for c in scored.iter().take(10) {
                 println!("  {} (WER {:.0}%, terms {:?})\n    expected:  {}\n    raw:       {}\n    processed: {}", c.name, 100.0 * wer(&c.expected, &c.processed), c.terms, c.expected, c.raw.trim(), c.processed.trim());
+            }
+        }
+    }
+
+    fn level(frame: &[i16]) -> f64 {
+        (frame.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / frame.len().max(1) as f64).sqrt()
+    }
+
+    /// `audio` with low-frequency-weighted noise added at `snr_db` below the speech level.
+    fn with_noise(audio: &[i16], snr_db: f64) -> Vec<i16> {
+        let loud: Vec<f64> = audio.chunks(800).map(level).filter(|l| *l >= 150.0).collect();
+        let speech = (loud.iter().map(|l| l * l).sum::<f64>() / loud.len().max(1) as f64).sqrt();
+        let (mut x, mut lp) = (0x2545_F491_4F6C_DD1Du64, 0.0f64);
+        let noise: Vec<f64> = (0..audio.len())
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                lp = 0.85 * lp + 0.15 * ((x >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0);
+                lp
+            })
+            .collect();
+        let rms = (noise.iter().map(|n| n * n).sum::<f64>() / noise.len().max(1) as f64).sqrt().max(1e-9);
+        let gain = speech / 10f64.powf(snr_db / 20.0) / rms;
+        audio.iter().zip(&noise).map(|(s, n)| (*s as f64 + n * gain).clamp(-32768.0, 32767.0) as i16).collect()
+    }
+
+    /// Words of the previous preview that the next one no longer starts with.
+    fn retracted(previews: &[String]) -> usize {
+        previews
+            .windows(2)
+            .map(|p| {
+                let (a, b): (Vec<&str>, Vec<&str>) = (p[0].split_whitespace().collect(), p[1].split_whitespace().collect());
+                a.len() - a.iter().zip(&b).take_while(|(x, y)| x == y).count()
+            })
+            .sum()
+    }
+
+    /// Runs `step(recorded)` as the recording thread does: it wakes `live::TICK` after its last step ended
+    /// and handles what was recorded by then, until the key is released at the end of the audio.
+    /// Returns the time spent in steps and how long the release waited for a step still running.
+    fn live_clock(samples: usize, mut step: impl FnMut(usize)) -> (std::time::Duration, std::time::Duration) {
+        const RATE: f64 = SAMPLE_RATE as f64;
+        let (total, mut clock, mut busy) = (samples as f64 / RATE, 0.0, 0.0);
+        loop {
+            clock += super::super::live::TICK.as_secs_f64();
+            if clock >= total {
+                return (std::time::Duration::from_secs_f64(busy), std::time::Duration::ZERO);
+            }
+            let t = std::time::Instant::now();
+            step((clock * RATE) as usize);
+            let spent = t.elapsed().as_secs_f64();
+            (clock, busy) = (clock + spent, busy + spent);
+            if clock >= total {
+                return (std::time::Duration::from_secs_f64(busy), std::time::Duration::from_secs_f64(clock - total));
+            }
+        }
+    }
+
+    /// The phrase-by-phrase loop `live` replaced, for comparison: a cut at the last pause of at
+    /// least 0.6 s by loudness, a preview of the last 5 s, and the rest cut the same way on release.
+    fn old_dictation(id: &str, audio: &[i16], preview: bool, decode: &mut dyn FnMut(&[i16]) -> String) -> (String, Vec<String>, std::time::Duration, std::time::Duration) {
+        use crate::audio::{is_silent, split_point};
+        const RATE: usize = SAMPLE_RATE as usize;
+        let longest = RATE * max_segment_secs(id, Some("en"));
+        let (mut committed, mut texts, mut previews, mut last_preview) = (0usize, Vec::new(), Vec::new(), 0usize);
+        let (busy, wait) = live_clock(audio.len(), |end| {
+            let pending = &audio[committed..end];
+            let cut = split_point(&pending[..pending.len().min(longest)], RATE * 6 / 10, longest - RATE);
+            let shown = if let Some(cut) = cut {
+                if !is_silent(&pending[..cut]) {
+                    texts.push(decode(&pending[..cut]));
+                }
+                committed += cut;
+                texts.join(" ")
+            } else if preview && end - last_preview >= RATE * 9 / 10 {
+                last_preview = end;
+                let tail = &pending[pending.len().saturating_sub(RATE * 5)..];
+                if is_silent(tail) {
+                    return;
+                }
+                let t = decode(tail);
+                texts.iter().map(String::as_str).chain([t.as_str()]).collect::<Vec<_>>().join(" ")
+            } else {
+                return;
+            };
+            if !shown.trim().is_empty() {
+                previews.push(shown.trim().to_string());
+            }
+        });
+        let released = std::time::Instant::now();
+        let mut rest = &audio[committed..];
+        if !is_silent(rest) {
+            let mut parts = Vec::new();
+            while rest.len() > longest {
+                let cut = split_point(&rest[..longest], RATE * 6 / 10, longest - RATE).filter(|&c| c > 0).unwrap_or(longest);
+                if !is_silent(&rest[..cut]) {
+                    parts.push(decode(&rest[..cut]));
+                }
+                rest = &rest[cut..];
+            }
+            if parts.is_empty() || !is_silent(rest) {
+                parts.push(decode(rest));
+            }
+            texts.push(parts.join(" "));
+        }
+        (texts.join(" ").trim().to_string(), previews, busy, wait + released.elapsed())
+    }
+
+    fn new_dictation(id: &str, audio: &[i16], preview: bool, decode: &mut dyn FnMut(&[i16]) -> Result<Decoded>) -> (String, Vec<String>, std::time::Duration, std::time::Duration) {
+        let mut live = super::super::live::Live::new(plan(id, Some("en")));
+        let mut previews = Vec::new();
+        let (busy, wait) = live_clock(audio.len(), |end| {
+            live.push(&audio[live.len()..end]);
+            if let Some(s) = live.tick(decode, preview).unwrap() {
+                previews.push(s);
+            }
+        });
+        let released = std::time::Instant::now();
+        live.push(&audio[live.len()..]);
+        let text = live.finish(decode).unwrap();
+        (text, previews, busy, wait + released.elapsed())
+    }
+
+    /// Long dictations: five consecutive sentences of one voice from the developer-speech set,
+    /// joined with pauses of 0.25–1.2 s, clean, quiet (-24 dB) and with noise at 10 dB SNR.
+    /// Each is recorded live (as `live_clock` times it) through the old phrase-by-phrase
+    /// loop and through `live::Live`, and scored on the final transcript, the words the preview
+    /// took back, and the time from release to text. The preview runs for the first voice's clean
+    /// dictations (OPSTRELLIS_BENCH_PREVIEW=all: every one, none: no previews).
+    /// OPSTRELLIS_BENCH_DEV_WAVS=<dir> [OPSTRELLIS_BENCH_DEV_TSV=<sentences.tsv>] [OPSTRELLIS_BENCH_MODEL=parakeet-unified-en]
+    /// [OPSTRELLIS_BENCH_VOCAB=terms|a|b] [OPSTRELLIS_BENCH_LOOPS=old,new,whole] [OPSTRELLIS_BENCH_VARIANTS=clean,quiet,noisy]
+    /// [OPSTRELLIS_BENCH_PREFIX=<start of a dictation's expected text>] [OPSTRELLIS_BENCH_DETAIL=1: previews and regressions]
+    /// cargo test --release bench_live_dictation -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_live_dictation() {
+        const RATE: usize = SAMPLE_RATE as usize;
+        let models = test_models();
+        let id = std::env::var("OPSTRELLIS_BENCH_MODEL").unwrap_or_else(|_| "parakeet-unified-en".into());
+        let previews_for = std::env::var("OPSTRELLIS_BENCH_PREVIEW").unwrap_or_default();
+        let (rows, clips, _) = dev_clips();
+        let hot = hotwords_for(&models, &id, &bench_vocabulary(&rows));
+        let opts = rules();
+        let gaps = [0.3, 0.8, 0.45, 1.2, 0.25];
+        let mut voices: std::collections::BTreeMap<String, Vec<(PathBuf, usize)>> = Default::default();
+        for (name, path, i) in &clips {
+            voices.entry(name.rsplit_once('-').unwrap().0.to_string()).or_default().push((path.clone(), *i));
+        }
+        let first = voices.keys().next().cloned().unwrap();
+        let prefix = std::env::var("OPSTRELLIS_BENCH_PREFIX").unwrap_or_default();
+        // (voice, expected, terms, audio)
+        let mut dictations = Vec::new();
+        for (voice, list) in &voices {
+            for group in list.chunks(5) {
+                let mut audio = Vec::new();
+                for (k, (path, _)) in group.iter().enumerate() {
+                    audio.extend(crate::audio::read_wav(path).unwrap());
+                    // The key is released 0.4 s after the last word.
+                    let gap = if k + 1 == group.len() { 0.4 } else { gaps[k % gaps.len()] };
+                    audio.extend(vec![0i16; (gap * RATE as f64) as usize]);
+                }
+                let expected = group.iter().map(|(_, i)| rows[*i].0.as_str()).collect::<Vec<_>>().join(" ");
+                let terms: Vec<String> = group.iter().flat_map(|(_, i)| rows[*i].1.clone()).collect();
+                if expected.starts_with(&prefix) {
+                    dictations.push((voice.clone(), expected, terms, audio));
+                }
+            }
+        }
+        assert!(!dictations.is_empty(), "no dictation starts with OPSTRELLIS_BENCH_PREFIX={prefix:?}");
+        let audio_s: f64 = dictations.iter().map(|d| d.3.len() as f64 / RATE as f64).sum();
+        println!("\n{} dictations ({:.0} s of audio, {:.1} s each on average), model {id}, {} hotwords\n", dictations.len(), audio_s, audio_s / dictations.len() as f64, hot.lines().count());
+        println!("| loop | audio | WER raw | WER as written | WER after rules | terms after rules | preview words taken back | release → text (median / p95) | CPU while recording |\n|---|---|---|---|---|---|---|---|---|");
+        decode_blocking(&models, &id, Some("en"), "", &vec![0; 8000]).unwrap();
+        let variants: [(&str, fn(&[i16]) -> Vec<i16>); 3] = [("clean", |a| a.to_vec()), ("quiet", |a| a.iter().map(|s| s / 16).collect()), ("noisy", |a| with_noise(a, 10.0))];
+        let only = |var: &str, all: &str| std::env::var(var).map_or(true, |v| v.split(',').any(|x| x == all));
+        let detail = std::env::var("OPSTRELLIS_BENCH_DETAIL").is_ok();
+        for (variant, transform) in variants.into_iter().filter(|(v, _)| only("OPSTRELLIS_BENCH_VARIANTS", v)) {
+            let mut texts: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
+            for strategy in ["old", "new", "whole"].into_iter().filter(|s| only("OPSTRELLIS_BENCH_LOOPS", s)) {
+                let mut err_written = 0.0;
+                let (mut ref_words, mut err_raw, mut err_proc, mut terms, mut hits, mut back, mut previewed) = (0usize, 0.0, 0.0, 0usize, 0usize, 0usize, 0usize);
+                let (mut releases, mut cpu) = (Vec::new(), 0.0);
+                for (voice, expected, wanted, clean) in &dictations {
+                    let audio = transform(clean);
+                    let preview = match previews_for.as_str() {
+                        "all" => true,
+                        "none" => false,
+                        _ => variant == "clean" && *voice == first,
+                    };
+                    let (text, previews, recording, release) = match strategy {
+                        "old" => old_dictation(&id, &audio, preview, &mut |a| decode_blocking(&models, &id, Some("en"), "", a).unwrap().text),
+                        "new" => new_dictation(&id, &audio, preview, &mut |a| decode_blocking(&models, &id, Some("en"), &hot, a)),
+                        // One pass over the whole dictation on release: the most context, the longest wait.
+                        _ => {
+                            let t = std::time::Instant::now();
+                            let text = decode_blocking(&models, &id, Some("en"), &hot, &audio).unwrap().text;
+                            (text, Vec::new(), std::time::Duration::ZERO, t.elapsed())
+                        }
+                    };
+                    if detail && preview && *voice == first && texts.get(strategy).is_none_or(|t| t.is_empty()) {
+                        println!("\npreviews, {strategy}, first dictation:");
+                        for p in &previews {
+                            println!("  {p}");
+                        }
+                    }
+                    texts.entry(strategy).or_default().push(text.clone());
+                    let processed = crate::text::process(&text, &opts).text;
+                    let n = words(expected).len();
+                    ref_words += n;
+                    err_raw += wer(expected, &text) * n as f64;
+                    err_written += wer_written(expected, &text) * n as f64;
+                    err_proc += wer(expected, &processed) * n as f64;
+                    let pt = terms_in(&processed);
+                    terms += wanted.len();
+                    hits += wanted.iter().filter(|w| has_term(&pt, w)).count();
+                    if preview {
+                        back += retracted(&previews);
+                        previewed += 1;
+                    }
+                    releases.push(release.as_secs_f64() * 1000.0);
+                    cpu += recording.as_secs_f64();
+                }
+                releases.sort_by(f64::total_cmp);
+                let pct = |a: f64, b: f64| 100.0 * a / b.max(1.0);
+                let back = if previewed > 0 { format!("{:.1} per dictation", back as f64 / previewed as f64) } else { "-".into() };
+                println!(
+                    "| {strategy} | {variant} | {:.1}% | {:.1}% | {:.1}% | {:.1}% | {back} | {:.0} / {:.0} ms | {:.2} s per s |",
+                    pct(err_raw, ref_words as f64),
+                    pct(err_written, ref_words as f64),
+                    pct(err_proc, ref_words as f64),
+                    pct(hits as f64, terms as f64),
+                    releases[releases.len() / 2],
+                    releases[(releases.len() * 95 / 100).min(releases.len() - 1)],
+                    cpu / audio_s
+                );
+            }
+            if let (true, Some(old), Some(new)) = (detail, texts.get("old"), texts.get("new")) {
+                let mut worst: Vec<usize> = (0..old.len()).collect();
+                worst.sort_by(|&a, &b| (wer(&dictations[b].1, &new[b]) - wer(&dictations[b].1, &old[b])).total_cmp(&(wer(&dictations[a].1, &new[a]) - wer(&dictations[a].1, &old[a]))));
+                println!("\nNew worse than old most, {variant}:");
+                for &i in worst.iter().take(3) {
+                    println!("  expected: {}\n  old ({:.0}%): {}\n  new ({:.0}%): {}", dictations[i].1, 100.0 * wer(&dictations[i].1, &old[i]), old[i], 100.0 * wer(&dictations[i].1, &new[i]), new[i]);
+                }
             }
         }
     }
