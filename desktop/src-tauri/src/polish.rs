@@ -284,6 +284,7 @@ fn unload_model(id: &'static str) {
 pub fn warm(models_dir: &Path, ids: &[&str]) {
     let models: Vec<&'static Model> = ids.iter().filter_map(|id| info(id)).collect();
     *wanted() = models.iter().map(|m| m.id).collect();
+    log::debug!("keeping local AI models loaded: {:?}", models.iter().map(|m| m.id).collect::<Vec<_>>());
     {
         let keep = wanted().clone();
         loaded().retain(|(id, _)| keep.contains(id));
@@ -294,7 +295,7 @@ pub fn warm(models_dir: &Path, ids: &[&str]) {
             let started = Instant::now();
             match load(&dir, m, true) {
                 Ok(Some(_)) => log::info!("loaded {} in {:?}", m.name, started.elapsed()),
-                Ok(None) => {}
+                Ok(None) => log::debug!("{} no longer wanted", m.name),
                 Err(e) => log::warn!("{e:#}"),
             }
         }

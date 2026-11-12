@@ -257,7 +257,9 @@ fn save_settings(app: State, mut settings: Settings) -> Res<Settings> {
     if let Some(item) = app.tray_ai.lock().unwrap().as_ref() {
         let _ = item.set_checked(settings.llm.enabled);
     }
-    if (old.llm.enabled, &old.llm.provider) != (settings.llm.enabled, &settings.llm.provider) {
+    // The local models to keep loaded follow the chosen model and the one paired for actions too.
+    let polish_setup = |s: &Settings| (s.llm.enabled, s.llm.provider.clone(), s.llm.model.clone(), s.llm.local_rewrite.clone());
+    if polish_setup(&old) != polish_setup(&settings) {
         sync_polish(&app);
     }
     // Nothing queued is sent while sync is off (`flush_usage`), so a failure here is only logged.
@@ -1159,7 +1161,9 @@ pub fn run() {
                 review: Mutex::new(None),
             });
             tapp.manage(app.clone());
-            llm::migrate_key(&app.secrets, &app.settings());
+            // macOS may ask before an app reads the keychain: that mustn't hold up the start.
+            let keys = app.clone();
+            std::thread::spawn(move || llm::migrate_key(&keys.secrets, &keys.settings()));
             let (packs_dir, handle) = (data_dir.join("term-packs"), tapp.handle().clone());
             std::thread::spawn(move || {
                 terms::load_user_packs(&packs_dir);
