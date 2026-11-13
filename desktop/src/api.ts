@@ -95,8 +95,8 @@ export type TeamUnused = "shadowed" | "limit" | "complex";
 export interface DictEntry { id: number; phrase: string; replacement: string | null; createdAt: string; learned: boolean; source?: DictSource; unused?: TeamUnused | null }
 /** team, unused: set by listSnippets. Team entries are read-only. */
 export interface Snippet { id: number; trigger: string; expansion: string; createdAt: string; team?: boolean; unused?: TeamUnused | null }
-/** output: "replace" the selection (or insert at the cursor), or "copy" the result to the clipboard. team, unused: set by listTransforms. */
-export interface Transform { id: number; name: string; prompt: string; builtin: boolean; output: "replace" | "copy"; team?: boolean; unused?: TeamUnused | null }
+/** output: "replace" the selection (or insert at the cursor), or "copy" the result to the clipboard. team, unused, edited, defaultName: set by listTransforms; edited: a built-in that is no longer its default; defaultName: the name of the default it restores to. */
+export interface Transform { id: number; name: string; prompt: string; builtin: boolean; output: "replace" | "copy"; team?: boolean; unused?: TeamUnused | null; edited?: boolean; defaultName?: string }
 /** The team library on this computer. `skipped`: entries not used because they are invalid here or past a limit. */
 export interface TeamStatus {
   team: { id: string; name: string } | null; dictionary: number; snippets: number; actions: number; skipped: number;
@@ -228,6 +228,8 @@ function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 export const api = {
   getSettings: () => call<Settings>("get_settings"),
   saveSettings: (settings: Settings) => call<Settings>("save_settings", { settings }),
+  /** Preferences back to their defaults, saved like saveSettings; keys, providers, privacy, sign-in, team sync and the library stay. */
+  resetSettings: () => call<Settings>("reset_settings"),
   setSecret: (id: string, value: string) => call<void>("set_secret", { id, value }),
   deleteSecret: (id: string) => call<void>("delete_secret", { id }),
   hasSecrets: () => call<string[]>("has_secrets"),
@@ -261,6 +263,8 @@ export const api = {
   upsertTransform: (transform: { id?: number; name: string; prompt: string; output: Transform["output"] }) =>
     call<Transform>("upsert_transform", { transform }),
   deleteTransform: (id: number) => call<void>("delete_transform", { id }),
+  /** Puts a built-in action's name, prompt and output back to its default. */
+  restoreTransform: (id: number) => call<Transform>("restore_transform", { id }),
 
   listNotes: (kind?: Note["kind"]) => call<Note[]>("list_notes", { kind }),
   upsertNote: (note: { id?: number; title: string; body: string }) => call<Note>("upsert_note", { note }),

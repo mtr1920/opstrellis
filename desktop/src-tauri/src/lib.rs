@@ -274,6 +274,13 @@ fn save_settings(app: State, mut settings: Settings) -> Res<Settings> {
     Ok(settings)
 }
 
+/// Saved like any other change, so its shortcuts, autostart and the rest apply, or the old settings stay.
+#[tauri::command]
+fn reset_settings(app: State) -> Res<Settings> {
+    let reset = app.settings().reset(&backup::builtin_pack_ids());
+    save_settings(app, reset)
+}
+
 /// Keys that a save makes stale. A key belongs to the provider and server it was entered for: a
 /// transcription entry's (`stt:<id>`) must not outlive the entry or follow it to another provider
 /// or base URL. The AI key is named for its server (`llm::key_id`), so it never needs dropping.
@@ -317,6 +324,11 @@ mod save_tests {
         let defaulted = with(vec![e("a", ProviderKind::Deepgram, None), e("b", ProviderKind::Openai, None), e("c", ProviderKind::Assemblyai, None)], None);
         assert_eq!(stale_secrets(&old, &defaulted), vec!["stt:b"], "back to the provider default is another server too");
         assert!(stale_secrets(&with(vec![], None), &with(vec![], Some("https://evil.example/v1"))).is_empty(), "AI keys are named for their server and stay");
+        let mut signed_in = old.clone();
+        signed_in.cloud.base_url = "https://cloud.example".into();
+        let reset = signed_in.reset(&backup::builtin_pack_ids());
+        assert!(stale_secrets(&signed_in, &reset).is_empty(), "a reset drops no key");
+        assert_eq!(cloud::base_of(&reset.cloud.base_url), cloud::base_of(&signed_in.cloud.base_url), "nor the account");
     }
 }
 
@@ -464,8 +476,8 @@ fn delete_snippet(app: State, id: i64) -> Res<()> {
     app.db.delete_snippet(id).map_err(err)
 }
 #[tauri::command]
-fn list_transforms(app: State) -> Res<Vec<db::LibraryRow<db::Transform>>> {
-    app.db.list_transform_rows().map_err(err)
+fn list_transforms(app: State) -> Res<Vec<db::ActionRow>> {
+    app.db.list_action_rows().map_err(err)
 }
 #[tauri::command]
 fn upsert_transform(app: State, transform: db::Transform) -> Res<db::Transform> {
@@ -474,6 +486,10 @@ fn upsert_transform(app: State, transform: db::Transform) -> Res<db::Transform> 
 #[tauri::command]
 fn delete_transform(app: State, id: i64) -> Res<()> {
     app.db.delete_transform(id).map_err(err)
+}
+#[tauri::command]
+fn restore_transform(app: State, id: i64) -> Res<db::Transform> {
+    app.db.restore_builtin(id).map_err(err)
 }
 #[tauri::command]
 fn list_notes(app: State, kind: Option<String>) -> Res<Vec<db::Note>> {
@@ -1315,11 +1331,11 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            get_settings, save_settings, set_secret, delete_secret, has_secrets, list_input_devices,
+            get_settings, save_settings, reset_settings, set_secret, delete_secret, has_secrets, list_input_devices,
             list_history, update_history, repolish_history, undo_learned, delete_history, clear_history, get_stats, list_apps,
             retranscribe_history,
             list_dictionary, upsert_dictionary, delete_dictionary, list_snippets, upsert_snippet, delete_snippet,
-            list_transforms, upsert_transform, delete_transform, list_notes, upsert_note, delete_note,
+            list_transforms, upsert_transform, delete_transform, restore_transform, list_notes, upsert_note, delete_note,
             list_local_models, download_local_model, cancel_local_download, delete_local_model, polish_model_status, polish_models, download_polish_model, delete_polish_model, test_stt, test_llm,
             start_dictation, stop_dictation, cancel_dictation, paste_last,
             cloud_login, cloud_logout, cloud_status, team_status, team_sync_now, permissions, request_accessibility, request_input_monitoring, open_logs,

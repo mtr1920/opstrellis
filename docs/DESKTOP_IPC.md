@@ -77,7 +77,7 @@ interface Stats {
 
 interface DictEntry { id: number; phrase: string; replacement: string | null; createdAt: string; learned: boolean; source?: "manual" | "learned" | "agent" | "team"; unused?: TeamUnused | null }  // replacement null = vocabulary hint only; source and unused are set by list_dictionary (learned = source "learned"; "agent" = added through `opstrellis mcp`; "team" = synced from the team library, read-only; editing an entry makes it "manual")
 interface Snippet { id: number; trigger: string; expansion: string; createdAt: string; team?: boolean; unused?: TeamUnused | null }   // team, unused: set by list_snippets
-interface Transform { id: number; name: string; prompt: string; builtin: boolean; output: "replace" | "copy"; team?: boolean; unused?: TeamUnused | null }   // command mode: replace the selection, or copy the result; team, unused: set by list_transforms
+interface Transform { id: number; name: string; prompt: string; builtin: boolean; output: "replace" | "copy"; team?: boolean; unused?: TeamUnused | null; edited?: boolean; defaultName?: string }   // command mode: replace the selection, or copy the result; team, unused, edited, defaultName: set by list_transforms (edited: a built-in whose name, prompt or output is no longer its default; defaultName: the name of the default it restores to, only on a built-in that has one)
 type TeamUnused = "shadowed" | "limit" | "complex";   // why a team entry is not used: one of the user's own (or a built-in action) has its phrase, trigger or name, it is past a limit, or (dictionary) the team's words would make the matcher fail to build; null for entries in use and the user's own
 interface TeamStatus { team: { id: string; name: string } | null; dictionary: number; snippets: number; actions: number; skipped: number; syncedAt: string | null /* RFC3339, last successful sync */; error: string | null /* last failed sync, cleared by the next success */ }   // counts are the team entries stored here; skipped = invalid ones plus those past a limit
 interface Note { id: number; title: string; body: string; updatedAt: string; kind: "note" | "meeting" }
@@ -133,6 +133,7 @@ auto-repeat never reaches the app below; after Enter the paste waits for that.
 | command | args | returns |
 |---|---|---|
 | `get_settings` | – | `Settings` |
+| `reset_settings` | – | `Settings`: preferences back to their defaults, saved through `save_settings` (same side effects and errors). Kept: transcription providers, the AI service and model (not its on/off), privacy, cloud server, email, sign-in and team library sync, onboarding, workspaces, `updateCheckedAt`, imported term packs. Keys, history and the library are untouched |
 | `save_settings` | `{ settings }` | `Settings` (re-registers hotkeys; rejects with message on invalid hotkey; rebuilds the term packs in use, in the background, when `cleanup.techTerms` or `cleanup.termPacks` changed) |
 | `set_secret` / `delete_secret` | `{ id, value }` / `{ id }` | – (ids: `stt:<entryId>`, `llm`; `llm` is deleted on save when the AI provider or base URL changes) |
 | `has_secrets` | – | `string[]` ids that have a stored secret |
@@ -149,6 +150,7 @@ auto-repeat never reaches the app below; after Enter the paste waits for that.
 | `list_dictionary` / `upsert_dictionary` / `delete_dictionary` | – / `{ entry: {id?, phrase, replacement} }` / `{ id }` | `DictEntry[]` / `DictEntry` / – (`upsert_dictionary` rejects control characters and anything past the dictionary budget of 2000 entries and 150000 bytes of phrases plus replacements; `upsert_snippet` and `upsert_transform` reject control characters, allowing only newline and tab in expansions and prompts) |
 | `list_snippets` / `upsert_snippet` / `delete_snippet` | – / `{ snippet: {id?, trigger, expansion} }` / `{ id }` | same pattern |
 | `list_transforms` / `upsert_transform` / `delete_transform` | – / `{ transform: {id?, name, prompt} }` / `{ id }` | same pattern. The list commands return every entry, team ones included; every upsert and delete of a team entry rejects with "Team entries are edited in the team dashboard" |
+| `restore_transform` | `{ id }` | `Transform`: puts a built-in action's name, prompt and output back to its default. Rejects a non-built-in, a team entry or a built-in whose default isn't known. The caller drops auto actions pointing at it when its output changed |
 | `team_status` | – | `TeamStatus` (local only, no request) |
 | `team_sync_now` | – | `TeamStatus` after a sync attempt (none when signed out or `cloud.teamLibrary` is off; a failure is in `error`) |
 | `list_notes` / `upsert_note` / `delete_note` | `{ kind?: "note" \| "meeting" }` / `{ note: {id?, title, body} }` / `{ id }` | same pattern |

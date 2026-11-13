@@ -99,6 +99,19 @@ pub struct LibraryRow<T> {
     pub unused: Option<&'static str>,
 }
 
+/// An action as the Actions page lists it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionRow {
+    #[serde(flatten)]
+    pub row: LibraryRow<Transform>,
+    /// A built-in whose name, prompt or output is no longer its default (`restore_builtin`).
+    pub edited: bool,
+    /// The name of the default a built-in restores to; None when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_name: Option<&'static str>,
+}
+
 /// Team entries past these are not used (the server allows 2000 library entries in all). Every
 /// snippet trigger is compiled and matched on every dictation, about 0.2 ms each (`text.rs` snippet_speed).
 pub const TEAM_MAX_SNIPPETS: usize = 50;
@@ -309,6 +322,53 @@ pub fn is_builtin_prompt(prompt: &str) -> bool {
     BUILTIN_TRANSFORMS.iter().chain(BUILTIN_COPY_ACTIONS).any(|(_, p)| *p == prompt)
 }
 
+/// Every built-in action as seeded: (name, prompt, output), in seed order.
+fn builtin_defaults() -> impl Iterator<Item = (&'static str, &'static str, &'static str)> {
+    BUILTIN_TRANSFORMS.iter().map(|(n, p)| (*n, *p, "replace")).chain(BUILTIN_COPY_ACTIONS.iter().map(|(n, p)| (*n, *p, "copy")))
+}
+
+/// The default of the built-in whose `builtin_key` is `key`.
+fn builtin_default(key: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    builtin_defaults().find(|(n, _, _)| *n == key)
+}
+
+/// Gives each built-in row without a `builtin_key` the default it started as. The five replace
+/// built-ins are the first five built-in rows: seeded together into an empty table, never deletable.
+/// A copy action may be missing (v4 skipped one named like the user's own), so those are matched by
+/// a current or retired prompt, then by name, then in seed order preferring a row that copies.
+fn assign_builtin_keys(c: &Connection) -> Result<()> {
+    let rows: Vec<(i64, String, String, String, Option<String>)> = c
+        .prepare("SELECT id, name, prompt, output, builtin_key FROM transforms WHERE builtin = 1 AND team_id IS NULL ORDER BY id")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut keyed: Vec<(&str, i64)> = rows.iter().zip(BUILTIN_TRANSFORMS).filter(|(r, _)| r.4.is_none()).map(|(r, (key, _))| (*key, r.0)).collect();
+    let mut rest: Vec<_> = rows.iter().skip(BUILTIN_TRANSFORMS.len()).filter(|r| r.4.is_none()).collect();
+    let mut free: Vec<&str> = BUILTIN_COPY_ACTIONS.iter().map(|(n, _)| *n).filter(|n| !rows.iter().any(|r| r.4.as_deref() == Some(*n))).collect();
+    let had_prompt = |key: &str, prompt: &str| builtin_default(key).is_some_and(|(_, p, _)| p == prompt) || RETIRED_PROMPTS.iter().any(|(n, p)| *n == key && *p == prompt);
+    let own: Vec<String> = c
+        .prepare("SELECT name FROM transforms WHERE builtin = 0 AND team_id IS NULL")?
+        .query_map([], |r| Ok(r.get::<_, String>(0)?.trim().to_lowercase()))?
+        .collect::<Result<_, _>>()?;
+    for pass in 0..3 {
+        if pass == 2 {
+            // A default named like one of the user's own actions was likely never seeded (see v4): it goes last.
+            free.sort_by_key(|key| own.contains(&key.to_lowercase()));
+        }
+        free.retain(|&key| {
+            let row = match pass {
+                0 => rest.iter().position(|r| had_prompt(key, &r.2)),
+                1 => rest.iter().position(|r| r.1.trim().to_lowercase() == key.to_lowercase()),
+                _ => rest.iter().position(|r| r.3 == "copy").or((!rest.is_empty()).then_some(0)),
+            };
+            row.map(|i| keyed.push((key, rest.remove(i).0))).is_none()
+        });
+    }
+    for (key, id) in keyed {
+        c.execute("UPDATE transforms SET builtin_key = ?1 WHERE id = ?2", params![key, id])?;
+    }
+    Ok(())
+}
+
 /// Built-in prompts of earlier versions, by action: a row still holding one gets today's
 /// prompt, a prompt the user edited stays theirs.
 const RETIRED_PROMPTS: &[(&str, &str)] = &[
@@ -363,9 +423,12 @@ impl Db {
         )?;
         let has_transforms: i64 = conn.query_row("SELECT COUNT(*) FROM transforms", [], |r| r.get(0))?;
         if has_transforms == 0 {
+            // All or none: the five must be the first built-in rows (`assign_builtin_keys`).
+            let seed = conn.transaction()?;
             for (name, prompt) in BUILTIN_TRANSFORMS {
-                conn.execute("INSERT INTO transforms (name, prompt, builtin) VALUES (?1, ?2, 1)", params![name, prompt])?;
+                seed.execute("INSERT INTO transforms (name, prompt, builtin) VALUES (?1, ?2, 1)", params![name, prompt])?;
             }
+            seed.commit()?;
         }
         // v0.4: actions can copy their result instead of replacing the selection; meetings are
         // their own kind of note (they were told apart by a "Meeting" title prefix).
@@ -415,6 +478,18 @@ impl Db {
              INSERT OR IGNORE INTO team_sync (id, epoch, version) VALUES (1, 0, 0);
              CREATE TABLE IF NOT EXISTS team_skipped (id TEXT PRIMARY KEY);",
         )?;
+        migration.commit()?;
+        // v7: built-in actions remember the default they started as, so they can be restored to it.
+        let migration = conn.transaction()?;
+        let has_key: i64 = migration.query_row("SELECT COUNT(*) FROM pragma_table_info('transforms') WHERE name = 'builtin_key'", [], |r| r.get(0))?;
+        if has_key == 0 {
+            migration.execute("ALTER TABLE transforms ADD COLUMN builtin_key TEXT", [])?;
+        }
+        // On every open, so built-ins seeded above get their key too; rows that have one keep it.
+        assign_builtin_keys(&migration)?;
+        if migration.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))? < 7 {
+            migration.pragma_update(None, "user_version", 7)?;
+        }
         migration.commit()?;
         Ok(Db(Mutex::new(conn)))
     }
@@ -953,6 +1028,37 @@ impl Db {
         Ok(rows.into_iter().zip(unused).map(|((entry, team), unused)| LibraryRow { entry, team, unused }).collect())
     }
 
+    /// `list_transform_rows`, telling which built-ins differ from their default.
+    pub fn list_action_rows(&self) -> Result<Vec<ActionRow>> {
+        let keys: BTreeMap<i64, String> = self
+            .conn()
+            .prepare("SELECT id, builtin_key FROM transforms WHERE builtin = 1 AND team_id IS NULL AND builtin_key IS NOT NULL")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        Ok(self
+            .list_transform_rows()?
+            .into_iter()
+            .map(|row| {
+                let default = row.entry.id.and_then(|id| keys.get(&id)).and_then(|k| builtin_default(k));
+                let t = &row.entry;
+                let edited = default.is_some_and(|d| d != (t.name.as_str(), t.prompt.as_str(), t.output.as_str()));
+                ActionRow { edited, default_name: default.map(|d| d.0), row }
+            })
+            .collect())
+    }
+
+    /// Puts a built-in action's name, prompt and output back to its default.
+    pub fn restore_builtin(&self, id: i64) -> Result<Transform> {
+        let c = self.conn();
+        ensure_own(&c, "transforms", Some(id))?;
+        let row: Option<(bool, Option<String>)> = c.query_row("SELECT builtin, builtin_key FROM transforms WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let (builtin, key) = row.ok_or_else(|| anyhow::anyhow!("This action no longer exists"))?;
+        anyhow::ensure!(builtin, "Only built-in actions can be restored to their default");
+        let (name, prompt, output) = key.as_deref().and_then(builtin_default).ok_or_else(|| anyhow::anyhow!("This built-in action's default isn't known, so it can't be restored"))?;
+        c.execute("UPDATE transforms SET name = ?1, prompt = ?2, output = ?3 WHERE id = ?4", params![name, prompt, output, id])?;
+        Ok(Transform { id: Some(id), name: name.into(), prompt: prompt.into(), builtin: true, output: output.into() })
+    }
+
     pub fn upsert_transform(&self, mut t: Transform) -> Result<Transform> {
         anyhow::ensure!(!t.name.trim().is_empty() && !t.prompt.trim().is_empty(), "Name and prompt are required");
         anyhow::ensure!(plain_line(&t.name) && plain_text(&t.prompt), "Names can't contain control characters, and prompts only newlines and tabs");
@@ -1362,6 +1468,177 @@ mod tests {
             conn.execute("UPDATE transforms SET prompt = ?1 WHERE name = 'Polish'", [BUILTIN_TRANSFORMS[0].1]).unwrap();
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A database as `version` (4 to 6) left it: no `builtin_key`, after `sql` ran on it.
+    fn old_db(version: i64, sql: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("opstrellis-keys-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db");
+        drop(Db::open(&path).unwrap());
+        Connection::open(&path).unwrap().execute_batch(&format!("ALTER TABLE transforms DROP COLUMN builtin_key; PRAGMA user_version = {version}; {sql}")).unwrap();
+        path
+    }
+
+    fn v6_db(sql: &str) -> std::path::PathBuf {
+        old_db(6, sql)
+    }
+
+    /// (name, builtin_key) of every built-in, oldest first.
+    fn builtin_keys(db: &Db) -> Vec<(String, Option<String>)> {
+        let c = db.conn();
+        let mut s = c.prepare("SELECT name, builtin_key FROM transforms WHERE builtin = 1 ORDER BY id").unwrap();
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<Result<_, _>>().unwrap()
+    }
+
+    fn key_of(db: &Db, name: &str) -> Option<String> {
+        builtin_keys(db).into_iter().find(|(n, _)| n == name).unwrap_or_else(|| panic!("no built-in {name}")).1
+    }
+
+    fn edited(db: &Db) -> Vec<String> {
+        db.list_action_rows().unwrap().into_iter().filter(|r| r.edited).map(|r| r.row.entry.name).collect()
+    }
+
+    const DEFAULT_NAMES: [&str; 7] = ["Polish", "Prompt engineer", "Make formal", "Shorten", "Bullet points", "Reply", "Summarize"];
+
+    #[test]
+    fn builtins_get_the_key_of_their_default() {
+        let version = |db: &Db| db.conn().pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap();
+        let named = |db: &Db| builtin_keys(db).into_iter().map(|(n, k)| (n.clone(), k.unwrap_or_default() == n)).collect::<Vec<_>>();
+        let db = temp_db();
+        assert_eq!(named(&db), DEFAULT_NAMES.map(|n| (n.to_string(), true)), "a fresh database");
+        assert_eq!(version(&db), 7);
+        assert!(edited(&db).is_empty());
+        for from in [4, 5, 6] {
+            let path = old_db(from, "");
+            let db = Db::open(&path).unwrap();
+            assert_eq!(named(&db), DEFAULT_NAMES.map(|n| (n.to_string(), true)), "unedited v{from} built-ins");
+            assert_eq!(version(&db), 7);
+            assert!(edited(&db).is_empty());
+            let first = builtin_keys(&db);
+            drop(db);
+            assert_eq!(builtin_keys(&Db::open(&path).unwrap()), first, "v{from}: opening again changes nothing");
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn renamed_and_edited_builtins_keep_their_own_key() {
+        let current = |name: &str| builtin_default(name).unwrap().1;
+        for from in [4, 5, 6] {
+            // Polish takes Shorten's name and copies; Summarize takes Reply's name; Reply keeps a retired prompt.
+            let path = old_db(from, &format!(
+                "UPDATE transforms SET name = 'Shorten', prompt = 'My polish', output = 'copy' WHERE id = 1;
+                 UPDATE transforms SET name = 'Tidy', prompt = 'My shorten' WHERE id = 4;
+                 UPDATE transforms SET name = 'Formal', prompt = '{}' WHERE id = 3;
+                 UPDATE transforms SET name = 'Answer', prompt = '{}' WHERE name = 'Reply';
+                 UPDATE transforms SET name = 'Reply' WHERE name = 'Summarize';
+                 INSERT INTO transforms (name, prompt, builtin, output, team_id) VALUES ('Polish', 'team', 0, 'replace', 't1');",
+                RETIRED_PROMPTS[2].1,
+                RETIRED_PROMPTS[5].1.replace('\'', "''")
+            ));
+            let db = Db::open(&path).unwrap();
+            for (name, key) in [("Shorten", "Polish"), ("Tidy", "Shorten"), ("Formal", "Make formal"), ("Answer", "Reply"), ("Reply", "Summarize")] {
+                assert_eq!(key_of(&db, name).as_deref(), Some(key), "v{from}: {name}");
+            }
+            let prompt = |name: &str| db.list_transforms().unwrap().into_iter().find(|t| t.name == name).unwrap().prompt;
+            assert_eq!(prompt("Formal") == current("Make formal"), from < 6, "v{from}: retired prompts are upgraded before v6 only");
+            assert_eq!(edited(&db), ["Shorten", "Formal", "Tidy", "Answer", "Reply"]);
+            let team: Option<String> = db.conn().query_row("SELECT builtin_key FROM transforms WHERE team_id = 't1'", [], |r| r.get(0)).unwrap();
+            assert_eq!(team, None, "team rows are left alone");
+            drop(db);
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn keys_with_missing_copy_actions_and_own_actions_of_their_name() {
+        // Reply was never seeded (the user had their own), and Summarize was renamed and edited.
+        let path = v6_db(
+            "DELETE FROM transforms WHERE name = 'Reply';
+             INSERT INTO transforms (name, prompt, builtin, output) VALUES ('reply', 'My own reply prompt', 0, 'replace');
+             UPDATE transforms SET name = 'Digest', prompt = 'My digest' WHERE name = 'Summarize';",
+        );
+        let db = Db::open(&path).unwrap();
+        assert_eq!(builtin_keys(&db).len(), 6);
+        assert_eq!(key_of(&db, "Digest").as_deref(), Some("Summarize"));
+        assert!(!builtin_keys(&db).iter().any(|(_, k)| k.as_deref() == Some("Reply")));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+
+        // Neither copy action was seeded.
+        let path = v6_db("DELETE FROM transforms WHERE output = 'copy'; INSERT INTO transforms (name, prompt) VALUES ('Summarize', 'mine');");
+        let db = Db::open(&path).unwrap();
+        assert_eq!(builtin_keys(&db).iter().map(|(n, k)| (n.as_str(), k.as_deref())).collect::<Vec<_>>(), DEFAULT_NAMES[..5].iter().map(|n| (*n, Some(*n))).collect::<Vec<_>>());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+
+        // The built-in Reply was renamed, then the user made their own "Reply".
+        let path = v6_db(
+            "UPDATE transforms SET name = 'Respond' WHERE name = 'Reply';
+             INSERT INTO transforms (name, prompt, builtin, output) VALUES ('Reply', 'My own reply prompt', 0, 'copy');",
+        );
+        let db = Db::open(&path).unwrap();
+        assert_eq!(key_of(&db, "Respond").as_deref(), Some("Reply"));
+        let own: Option<String> = db.conn().query_row("SELECT builtin_key FROM transforms WHERE builtin = 0", [], |r| r.get(0)).unwrap();
+        assert_eq!(own, None, "the user's own action is never a built-in");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+
+        // ...and edited too: the only built-in left is still Reply.
+        let path = v6_db(
+            "UPDATE transforms SET name = 'Respond', prompt = 'Answer briefly' WHERE name = 'Reply';
+             INSERT INTO transforms (name, prompt, builtin, output) VALUES ('Reply', 'My own reply prompt', 0, 'copy');",
+        );
+        let db = Db::open(&path).unwrap();
+        assert_eq!(key_of(&db, "Respond").as_deref(), Some("Reply"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_builtin_is_restored_to_its_default() {
+        let db = temp_db();
+        let find = |db: &Db, name: &str| db.list_transforms().unwrap().into_iter().find(|t| t.name == name).unwrap();
+        let polish = find(&db, "Polish");
+        let id = polish.id.unwrap();
+        for edit in [
+            Transform { prompt: "My polish".into(), ..polish.clone() },
+            Transform { name: "Tidy".into(), ..polish.clone() },
+            Transform { output: "copy".into(), ..polish.clone() },
+        ] {
+            db.upsert_transform(edit).unwrap();
+            assert_eq!(edited(&db), [find_name(&db, id)]);
+            let restored = db.restore_builtin(id).unwrap();
+            assert_eq!((restored.name.as_str(), restored.prompt.as_str(), restored.output.as_str()), BUILTIN_TRANSFORMS.first().map(|(n, p)| (*n, *p, "replace")).unwrap());
+            let now = find(&db, "Polish");
+            assert_eq!((&now.prompt, &now.output, now.builtin), (&polish.prompt, &polish.output, true));
+            assert!(is_builtin_prompt(&now.prompt), "stock again");
+            assert!(edited(&db).is_empty());
+        }
+
+        db.upsert_transform(Transform { name: "Tidy".into(), ..polish.clone() }).unwrap();
+        let rows = db.list_action_rows().unwrap();
+        let default_name = |name: &str| rows.iter().find(|r| r.row.entry.name == name).unwrap().default_name;
+        assert_eq!((default_name("Tidy"), default_name("Summarize")), (Some("Polish"), Some("Summarize")), "what a restore goes back to");
+        db.restore_builtin(id).unwrap();
+
+        let reply = find(&db, "Reply");
+        db.upsert_transform(Transform { name: "Answer".into(), prompt: "x".into(), output: "replace".into(), ..reply.clone() }).unwrap();
+        assert_eq!(db.restore_builtin(reply.id.unwrap()).unwrap().output, "copy", "a copy action copies again");
+
+        let mine = db.upsert_transform(Transform { id: None, name: "Mine".into(), prompt: "p".into(), builtin: false, output: "replace".into() }).unwrap();
+        assert_eq!(db.restore_builtin(mine.id.unwrap()).unwrap_err().to_string(), "Only built-in actions can be restored to their default");
+        assert!(db.restore_builtin(9999).is_err());
+        db.conn().execute("INSERT INTO transforms (name, prompt, builtin, output, team_id) VALUES ('Team', 'p', 0, 'replace', 't1')", []).unwrap();
+        let team = db.conn().last_insert_rowid();
+        assert_eq!(db.restore_builtin(team).unwrap_err().to_string(), TEAM_READ_ONLY);
+        db.conn().execute("UPDATE transforms SET builtin_key = NULL, prompt = 'mine' WHERE id = ?1", [id]).unwrap();
+        assert!(db.restore_builtin(id).unwrap_err().to_string().contains("can't be restored"));
+        assert_eq!(find(&db, "Polish").prompt, "mine", "nothing changed");
+        assert!(edited(&db).is_empty(), "no default to restore, so not shown as edited");
+        let rows = db.list_action_rows().unwrap();
+        assert!(rows.iter().filter(|r| ["Polish", "Mine", "Team"].contains(&r.row.entry.name.as_str())).all(|r| r.default_name.is_none()), "only built-ins with a key have a default");
+    }
+
+    fn find_name(db: &Db, id: i64) -> String {
+        db.list_transforms().unwrap().into_iter().find(|t| t.id == Some(id)).unwrap().name
     }
 
     fn db_upsert_rejects_unknown_output(db: &Db) -> bool {

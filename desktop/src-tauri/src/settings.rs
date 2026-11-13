@@ -303,6 +303,24 @@ impl Settings {
         crate::secrets::write_private(path, &serde_json::to_vec_pretty(self)?)
     }
 
+    /// Preferences back to their defaults. Kept: identity, state, local data, what API keys are bound to
+    /// (a changed transcription entry loses its key on save), and privacy and team sync (never re-enabled).
+    /// `builtin_packs`: ids of the term packs that ship with the app; imported packs stay as they are.
+    pub fn reset(&self, builtin_packs: &[String]) -> Settings {
+        let d = Settings::default();
+        Settings {
+            stt_chain: self.stt_chain.clone(),
+            llm: Llm { enabled: d.llm.enabled, ..self.llm.clone() },
+            cleanup: Cleanup { term_packs: self.cleanup.term_packs.iter().filter(|id| !builtin_packs.contains(id)).cloned().collect(), ..d.cleanup },
+            privacy: self.privacy.clone(),
+            cloud: self.cloud.clone(),
+            onboarded: self.onboarded,
+            update_checked_at: self.update_checked_at,
+            workspaces: self.workspaces.clone(),
+            ..d
+        }
+    }
+
     pub fn tone(&self, category: &str) -> &str {
         self.styles.get(category).map(String::as_str).unwrap_or("formal")
     }
@@ -346,6 +364,72 @@ mod tests {
         s.save(&path).unwrap();
         assert_eq!(Settings::load(&path).auto_transforms.get("ai"), None);
         assert_eq!(Settings::default().tone("ai"), "formal");
+    }
+
+    /// Every field is set away from its default, so a new field fails here until it is classified.
+    #[test]
+    fn reset_restores_preferences_and_keeps_data() {
+        let mut s = Settings::default();
+        s.hotkeys = Hotkeys { dictate: "Fn".into(), command: "Alt+Space".into(), paste_last: "Ctrl+Shift+V".into() };
+        s.microphone = Some("USB".into());
+        s.language = "de".into();
+        s.stt_chain = vec![SttEntry { id: "dg".into(), provider: ProviderKind::Deepgram, model: "nova-3".into(), base_url: None, region: None, streaming: true, enabled: true }];
+        s.llm = Llm { enabled: true, provider: "anthropic".into(), base_url: Some("https://ai.example".into()), model: "claude".into(), local_rewrite: Some("qwen".into()) };
+        s.cleanup = Cleanup { remove_fillers: false, voice_commands: false, auto_learn: true, tech_terms: false, term_packs: vec!["medical".into(), "mine".into()] };
+        s.styles.insert("work".into(), "excited".into());
+        s.auto_transforms.insert("email".into(), 3);
+        s.app_categories.insert("my-crm".into(), "emails".into());
+        s.style_notes.insert("email".into(), "Sign off with Cheers".into());
+        s.prompt_style = "structured".into();
+        s.output_languages.insert("work".into(), "de".into());
+        s.review_rewrites = "always".into();
+        s.insertion = Insertion { method: "type".into(), restore_clipboard: false, paste_delay_ms: 900 };
+        s.privacy = Privacy { history_retention_days: Some(0), sync_usage: false, audio_retention: "all".into() };
+        s.cloud = Cloud { base_url: "https://cloud.example".into(), email: Some("me@example.com".into()), team_library: false };
+        (s.overlay, s.sounds, s.launch_at_login, s.show_in_dock, s.onboarded, s.check_updates, s.workspace_replace) = (false, false, true, false, true, true, true);
+        s.theme = "dark".into();
+        s.update_checked_at = Some(1_700_000_000);
+        s.agents = Agents { enabled: true, history: false, notes: false, add_terms: true, voice: true };
+        s.workspaces = vec!["/home/me/repo".into()];
+
+        // Every field decided once: a new one fails here until it is in one of these lists.
+        let reset = [
+            "/hotkeys/dictate", "/hotkeys/command", "/hotkeys/pasteLast", "/microphone", "/language", "/llm/enabled",
+            "/cleanup/removeFillers", "/cleanup/voiceCommands", "/cleanup/autoLearn", "/cleanup/techTerms",
+            "/styles", "/autoTransforms", "/appCategories", "/styleNotes", "/promptStyle", "/outputLanguages", "/reviewRewrites",
+            "/insertion/method", "/insertion/restoreClipboard", "/insertion/pasteDelayMs",
+            "/overlay", "/sounds", "/launchAtLogin", "/showInDock", "/theme", "/checkUpdates",
+            "/agents/enabled", "/agents/history", "/agents/notes", "/agents/addTerms", "/agents/voice", "/workspaceReplace",
+        ];
+        let kept = [
+            "/sttChain", "/llm/provider", "/llm/baseUrl", "/llm/model", "/llm/localRewrite",
+            "/privacy/historyRetentionDays", "/privacy/syncUsage", "/privacy/audioRetention",
+            "/cloud/baseUrl", "/cloud/email", "/cloud/teamLibrary", "/onboarded", "/updateCheckedAt", "/workspaces",
+        ];
+        let split = "/cleanup/termPacks"; // built-in packs reset, imported ones kept
+
+        let json = |s: &Settings| serde_json::to_value(s).unwrap();
+        let (custom, default) = (json(&s), json(&Settings::default()));
+        let mut fields: Vec<String> = Vec::new();
+        for (key, value) in default.as_object().unwrap() {
+            match value.as_object().filter(|_| ["hotkeys", "llm", "cleanup", "insertion", "privacy", "cloud", "agents"].contains(&key.as_str())) {
+                Some(sub) => fields.extend(sub.keys().map(|k| format!("/{key}/{k}"))),
+                None => fields.push(format!("/{key}")),
+            }
+        }
+        let mut decided: Vec<String> = reset.iter().chain(&kept).chain([&split]).map(|p| p.to_string()).collect();
+        fields.sort();
+        decided.sort();
+        assert_eq!(fields, decided, "every settings field is classified exactly once");
+        for path in &fields {
+            assert_ne!(custom.pointer(path), default.pointer(path), "{path} is set away from its default");
+        }
+        let mut expected = default.clone();
+        for path in kept {
+            *expected.pointer_mut(path).unwrap() = custom.pointer(path).unwrap().clone();
+        }
+        expected["cleanup"]["termPacks"] = serde_json::json!(["mine"]);
+        assert_eq!(json(&s.reset(&["medical".into()])), expected);
     }
 
     #[test]

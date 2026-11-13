@@ -141,7 +141,7 @@ export default function SettingsPage(props: Props) {
           <SettingsSection title="Backup" desc="Save your dictionary, snippets, actions and style settings to a file, or add them from one. API keys, providers and shortcuts are never included."><Backup {...props} /></SettingsSection>
           <SettingsSection title="Account"><Account {...props} /></SettingsSection>
 
-          <SettingsSection title="About"><About {...props} /></SettingsSection>
+          <SettingsSection title="About"><About {...props} /><ResetSettings {...props} /></SettingsSection>
 
         </div>
       </div>
@@ -1313,6 +1313,49 @@ function About({ settings, set, update: pending, download }: SettingsProps & { u
       <Row title="Logs" desc={error ?? "Timings and errors for each dictation, without the dictated text."}>
         <button className="btn" onClick={() => api.openLogs().then(() => setError(null), (e) => setError(errMsg(e)))}>Show logs</button>
       </Row>
+    </>
+  );
+}
+
+function ResetSettings({ set, saveNow }: SettingsProps & { saveNow: () => Promise<void> }) {
+  const [confirm, setConfirm] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function reset() {
+    setBusy(true);
+    setError(null);
+    try {
+      await saveNow().catch(() => {}); // a save still in flight would send the old values back over the reset ones
+      const s = await api.resetSettings();
+      // The backend already saved them; take them into this window so the page shows them.
+      for (const k of Object.keys(s) as (keyof Settings)[]) set(k, s[k]);
+      setMsg("Settings were reset to their defaults.");
+    } catch (e) { setError(errMsg(e)); }
+    setBusy(false);
+    setConfirm(false);
+  }
+
+  return (
+    <>
+      <Row title="Reset settings to defaults" desc={msg ?? "Preferences go back to how OpsTrellis ships. Your keys, providers, sign-in and library are kept."}>
+        <button className="btn danger" disabled={busy} onClick={() => setConfirm(true)}>Reset settings</button>
+      </Row>
+      {error && <div className="error">{error}</div>}
+      {confirm && (
+        <Modal title="Reset settings to defaults?" onClose={() => setConfirm(false)}
+          footer={<>
+            <button className="btn" onClick={() => setConfirm(false)}>Cancel</button>
+            <button className="btn danger solid" disabled={busy} onClick={reset}>Reset settings</button>
+          </>}>
+          <div>Back to their defaults: appearance, the pill, sounds, launch at login and the dock, shortcuts, microphone and spoken language,
+            text insertion, AI polish on or off, rewrite review and prompt style, cleanup and built-in term packs, tones, style notes,
+            output languages, app rules, actions run after every dictation, agent access, update checks and workspace name replacement.</div>
+          <div>Kept: API keys, transcription providers, the AI service and model, privacy choices, sign-in, server URL and
+            team library sync, workspaces, imported term packs, and your history, dictionary, snippets, notes, actions and models.</div>
+        </Modal>
+      )}
     </>
   );
 }
