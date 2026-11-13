@@ -617,7 +617,7 @@ async fn test_llm(app: State<'_>) -> Res<Value> {
     let system = llm::cleanup_prompt(&ctx, &llm::Cleanup { tone: "casual", ..Default::default() });
     let text = app
         .llm_client(&settings)
-        .complete_within(&system, &llm::wrap_dictation(sample), llm::CLEANUP_TIMEOUT)
+        .complete_within(&system, &llm::wrap_dictation(sample, None), llm::CLEANUP_TIMEOUT)
         .await
         .map_err(|e| format!("{e:#}"))?;
     Ok(json!({ "text": text, "latencyMs": started.elapsed().as_millis() as u64 }))

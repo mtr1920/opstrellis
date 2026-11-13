@@ -796,9 +796,31 @@ mod tests {
         s.to_lowercase().chars().map(|c| if c.is_alphanumeric() || c == '\'' || c.is_whitespace() { c } else { ' ' }).collect()
     }
 
+    /// An action case's score: how many of the `|`-separated `keep` strings are in `out`, and how many
+    /// of the `forbid` ones are not, each as (hits, total), ignoring case. A failed (None) or empty
+    /// answer scores no hits.
+    fn score(out: Option<&str>, keep: &str, forbid: &str) -> ((usize, usize), (usize, usize)) {
+        let out = out.filter(|o| !o.trim().is_empty()).map(str::to_lowercase);
+        let count = |list: &str, wanted: bool| {
+            let items: Vec<String> = list.split('|').filter(|f| !f.is_empty()).map(str::to_lowercase).collect();
+            (out.as_ref().map_or(0, |o| items.iter().filter(|f| o.contains(f.as_str()) == wanted).count()), items.len())
+        };
+        (count(keep, true), count(forbid, false))
+    }
+
+    #[test]
+    fn action_scores() {
+        assert_eq!(score(Some("Fix the Login button."), "login|BUTTON|cart", ""), ((2, 3), (0, 0)));
+        assert_eq!(score(Some("Fix the bug across the App."), "", "ACROSS THE APP|output format"), ((0, 0), (1, 2)));
+        assert_eq!(score(Some("anything"), "", ""), ((0, 0), (0, 0)), "empty columns count nothing");
+        assert_eq!(score(Some(" \n"), "login|bug", "output format"), ((0, 2), (0, 1)), "an empty answer adds nothing but keeps nothing");
+        assert_eq!(score(None, "login|bug", "output format"), ((0, 2), (0, 1)), "a failed request");
+    }
+
     /// Local polish bake-off: every case of desktop/bench/polish/cases.tsv through every installed
     /// model (or OPSTRELLIS_POLISH_ONLY=id,id), cleanup models with their own prompt and
-    /// instruction models with the cloud prompt, as the app runs them. Prints a table and, with
+    /// instruction models with the cloud prompt, as the app runs them; a `command:<Action>[:<said>]`
+    /// task runs the action on the input as the selection, through command mode. Prints a table and, with
     /// OPSTRELLIS_POLISH_OUT=<file>, every output. OPSTRELLIS_POLISH_NO_SPECULATE=1 turns drafting off.
     /// OPSTRELLIS_POLISH_MODELS=<models dir> cargo test --release bench_polish -- --ignored --nocapture
     #[test]
@@ -811,15 +833,17 @@ mod tests {
         let db_dir = std::env::temp_dir().join(format!("polish-bench-{}", std::process::id()));
         std::fs::create_dir_all(&db_dir).unwrap();
         let actions = crate::db::Db::open(&db_dir.join("db.sqlite")).unwrap().list_transforms().unwrap();
+        let action = |name: &str| actions.iter().find(|a| a.name == name).unwrap_or_else(|| panic!("action {name}"));
         let rt = tokio::runtime::Runtime::new().unwrap();
         let mut log = String::new();
-        println!("\n| model | kind | cleanup exact | WER as written | WER | left alone | words lost | actions: facts kept | median ms | p95 ms |\n|---|---|---|---|---|---|---|---|---|---|");
+        println!("\n| model | kind | cleanup exact | WER as written | WER | left alone | words lost | actions: facts kept | actions: nothing added | median ms | p95 ms |\n|---|---|---|---|---|---|---|---|---|---|---|");
         for m in MODELS.iter().filter(|m| is_installed(&dir, m) && only.as_ref().is_none_or(|o| o.iter().any(|id| id == m.id))) {
             let client = crate::llm::Client { provider: PROVIDER.into(), model: m.id.into(), local_dir: Some(dir.clone()), ..Default::default() };
-            let (mut n, mut exact, mut ref_words, mut err_w, mut err_p, mut kept, mut keeps, mut lost, mut facts, mut fact_n) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+            let (mut n, mut exact, mut ref_words, mut err_w, mut err_p, mut kept, mut keeps, mut lost, mut facts, mut fact_n, mut absent, mut forbid_n) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
             let mut times = Vec::new();
             for c in &cases {
-                let (id, app, task, input, expected, keep) = (&c[0], &c[1], &c[2], &c[3], &c[4], c.get(5).cloned().unwrap_or_default());
+                let (id, app, task, input, expected) = (&c[0], &c[1], &c[2], &c[3], &c[4]);
+                let (keep, forbid) = (c.get(5).cloned().unwrap_or_default(), c.get(6).cloned().unwrap_or_default());
                 let ctx = crate::context::classify(Some(app.clone()), None);
                 let started = Instant::now();
                 let deadline = started + std::time::Duration::from_secs(60);
@@ -828,17 +852,24 @@ mod tests {
                         cleanup_blocking(&dir, m, input, &Hints { tone: "none", style_category: ctx.style_category(), app: Some(app) }, deadline)
                     } else {
                         let system = crate::llm::cleanup_prompt(&ctx, &crate::llm::Cleanup { tone: "none", ..Default::default() });
-                        rt.block_on(client.complete_within(&system, &crate::llm::wrap_dictation(input), std::time::Duration::from_secs(60)))
+                        rt.block_on(client.complete_within(&system, &crate::llm::wrap_dictation(input, None), std::time::Duration::from_secs(60)))
                     }
-                } else if m.kind == Kind::Instruct {
-                    let prompt = actions.iter().find(|a| &a.name == task).map(|a| a.prompt.clone()).unwrap_or_else(|| panic!("action {task}"));
-                    let system = crate::llm::cleanup_prompt(&ctx, &crate::llm::Cleanup { tone: "none", rewrite: Some(&prompt), ..Default::default() });
-                    rt.block_on(client.complete_within(&system, &crate::llm::wrap_dictation(input), std::time::Duration::from_secs(60)))
-                } else {
+                } else if m.kind != Kind::Instruct {
                     continue;
+                } else if let Some(command) = task.strip_prefix("command:") {
+                    // As spoken: the action's name, then what the user also said.
+                    let (name, said) = command.split_once(':').map_or((command, None), |(n, s)| (n, Some(format!("{n} {s}"))));
+                    let instruction = crate::llm::action_instruction(&action(name).prompt, said.as_deref());
+                    let user = crate::llm::command_input(Some(input), &instruction);
+                    rt.block_on(client.complete_within(&crate::llm::command_prompt(Some(input), action(name).output == "copy"), &user, std::time::Duration::from_secs(60)))
+                } else {
+                    let rewrite = Some(action(task).prompt.as_str());
+                    let system = crate::llm::cleanup_prompt(&ctx, &crate::llm::Cleanup { tone: "none", rewrite, ..Default::default() });
+                    rt.block_on(client.complete_within(&system, &crate::llm::wrap_dictation(input, rewrite), std::time::Duration::from_secs(60)))
                 };
                 let ms = started.elapsed().as_millis() as u64;
                 times.push(ms);
+                let answered = out.is_ok();
                 let out = out.unwrap_or_else(|e| format!("ERROR {e:#}"));
                 log.push_str(&format!("{} {id} ({ms} ms)\n  in:  {}\n  out: {}\n  ref: {}\n", m.id, input.replace('\n', " / "), out.replace('\n', " / "), expected.replace('\n', " / ")));
                 if task == "cleanup" {
@@ -857,17 +888,15 @@ mod tests {
                         kept += (norm(&out) == norm(expected)) as usize;
                     }
                 } else {
-                    for f in keep.split('|').filter(|f| !f.is_empty()) {
-                        fact_n += 1;
-                        facts += out.to_lowercase().contains(&f.to_lowercase()) as usize;
-                    }
+                    let ((k, kn), (a, an)) = score(answered.then_some(out.as_str()), &keep, &forbid);
+                    (facts, fact_n, absent, forbid_n) = (facts + k, fact_n + kn, absent + a, forbid_n + an);
                 }
             }
             times.sort();
             let pct = |a: usize, b: usize| if b == 0 { "-".to_string() } else { format!("{:.0}%", 100.0 * a as f64 / b as f64) };
             println!(
-                "| {} | {:?} | {} | {} | {} | {} | {} | {} | {} | {} |",
-                m.name, m.kind, pct(exact, n), pct(err_w, ref_words), pct(err_p, ref_words), pct(kept, keeps), lost, pct(facts, fact_n),
+                "| {} | {:?} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                m.name, m.kind, pct(exact, n), pct(err_w, ref_words), pct(err_p, ref_words), pct(kept, keeps), lost, pct(facts, fact_n), pct(absent, forbid_n),
                 times.get(times.len() / 2).copied().unwrap_or(0), times.get(times.len() * 95 / 100).copied().unwrap_or(0)
             );
             unload_model(m.id);
@@ -875,6 +904,50 @@ mod tests {
         if let Ok(out) = std::env::var("OPSTRELLIS_POLISH_OUT") {
             std::fs::write(out, log).unwrap();
         }
+        let _ = std::fs::remove_dir_all(&db_dir);
+    }
+
+    /// The action and command cases of cases.tsv through the AI provider saved in the app on this
+    /// computer (its settings and keychain key), for people without a local instruction model.
+    /// OPSTRELLIS_DATA_DIR=<app data dir> cargo test --lib bench_actions_saved_provider -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_actions_saved_provider() {
+        let data = PathBuf::from(std::env::var("OPSTRELLIS_DATA_DIR").expect("OPSTRELLIS_DATA_DIR"));
+        let settings = crate::settings::Settings::load(&data.join("settings.json"));
+        let key = crate::llm::key_id(&settings).and_then(|id| crate::secrets::Secrets::new(&data).get(&id));
+        assert!(key.is_some(), "no saved key for provider {}", settings.llm.provider);
+        let base_url = settings.llm.base_url.clone().filter(|_| settings.llm.provider == "openai");
+        let client = crate::llm::Client { provider: settings.llm.provider.clone(), base_url, model: settings.llm.model.clone(), key, local_dir: None };
+        let tsv = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../bench/polish/cases.tsv")).unwrap();
+        let db_dir = std::env::temp_dir().join(format!("polish-bench-{}", std::process::id()));
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let actions = crate::db::Db::open(&db_dir.join("db.sqlite")).unwrap().list_transforms().unwrap();
+        let action = |name: &str| actions.iter().find(|a| a.name == name).unwrap_or_else(|| panic!("action {name}"));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (mut facts, mut fact_n, mut absent, mut forbid_n) = (0, 0, 0, 0);
+        for line in tsv.lines().skip(1) {
+            let c: Vec<String> = line.split('\t').map(|c| c.replace("\\n", "\n")).collect();
+            let (id, app, task, input) = (&c[0], &c[1], &c[2], &c[3]);
+            if task == "cleanup" {
+                continue;
+            }
+            let out = if let Some(command) = task.strip_prefix("command:") {
+                let (name, said) = command.split_once(':').map_or((command, None), |(n, s)| (n, Some(format!("{n} {s}"))));
+                let instruction = crate::llm::action_instruction(&action(name).prompt, said.as_deref());
+                rt.block_on(client.complete(&crate::llm::command_prompt(Some(input), action(name).output == "copy"), &crate::llm::command_input(Some(input), &instruction)))
+            } else {
+                let ctx = crate::context::classify(Some(app.clone()), None);
+                let rewrite = Some(action(task).prompt.as_str());
+                let system = crate::llm::cleanup_prompt(&ctx, &crate::llm::Cleanup { tone: "none", rewrite, ..Default::default() });
+                rt.block_on(client.complete(&system, &crate::llm::wrap_dictation(input, rewrite)))
+            };
+            let ((k, kn), (a, an)) = score(out.as_deref().ok(), c.get(5).map_or("", String::as_str), c.get(6).map_or("", String::as_str));
+            (facts, fact_n, absent, forbid_n) = (facts + k, fact_n + kn, absent + a, forbid_n + an);
+            let shown = out.unwrap_or_else(|e| format!("ERROR {}", e.root_cause()));
+            println!("{id} [{task}] kept {k}/{kn}, nothing added {a}/{an}\n  in:  {input}\n  out: {}\n", shown.replace('\n', "\n       "));
+        }
+        println!("{} {}: facts kept {facts}/{fact_n}, nothing added {absent}/{forbid_n}", settings.llm.provider, settings.llm.model);
         let _ = std::fs::remove_dir_all(&db_dir);
     }
 }

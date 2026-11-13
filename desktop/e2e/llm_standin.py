@@ -19,7 +19,7 @@ class Handler(BaseHTTPRequestHandler):
                 f.write(json.dumps({"system": system, "user": user}) + "\n")
         sel = re.search(r"<selected_text>\n(.*)\n</selected_text>", user, re.S)
         dic = re.search(r"<dictation>\n(.*)\n</dictation>", user, re.S)
-        if "KEEP_ACTION_INDENT" in system:
+        if "KEEP_ACTION_INDENT" in system + user:
             content = "- Plan\n  - Use Postgres\n\n```python\nif ready:\n    run()\n```"
         elif dic and "SHOUT_DICTATION" in system:
             content = dic.group(1).upper()

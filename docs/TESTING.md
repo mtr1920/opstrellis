@@ -34,6 +34,8 @@ cargo test --release terms_speed -- --ignored --nocapture   # cost of the tech-t
 OPSTRELLIS_POLISH_MODELS=<dir> cargo test --release polish_live -- --ignored --nocapture
 # Local polish bake-off: every installed model in <dir>/polish/ on desktop/bench/polish/cases.tsv (below)
 OPSTRELLIS_POLISH_MODELS=<dir> [OPSTRELLIS_POLISH_ONLY=id,id] [OPSTRELLIS_POLISH_OUT=<file>] cargo test --release bench_polish -- --ignored --nocapture
+# The action and command cases through the AI provider saved in the app (its settings and keychain key)
+OPSTRELLIS_DATA_DIR=<app data dir> cargo test --lib bench_actions_saved_provider -- --ignored --nocapture
 # Engine plumbing with any small Qwen3 GGUF, random weights are fine (load, prompt, token and time caps)
 OPSTRELLIS_POLISH_GGUF=<file.gguf> cargo test polish_engine -- --ignored --nocapture
 # Re-mine tech-term aliases (Kokoro/Piper TTS from the sherpa-onnx tts-models release + the local STT models); review the output, then edit src-tauri/terms/tech.json
@@ -186,21 +188,35 @@ compare rows with each other.
 `bench_polish` runs [`desktop/bench/polish/cases.tsv`](../desktop/bench/polish/cases.tsv) through
 each on-device model as the app does: cleanup models with the prompt they were trained on,
 instruction models with the cloud cleanup prompt (and an action's prompt for the action cases). The
-36 cleanup cases are Parakeet-style text after the rule pass: self-corrections, repeats, lists,
+37 cleanup cases are Parakeet-style text after the rule pass: self-corrections, repeats, lists,
 numbers, emails, grammar, AI prompts with code names, questions and instructions that must not be
-answered, and text that is already right and must come back unchanged ("left alone"). The 9 action
-cases (Prompt engineer, Make formal, Shorten, Bullet points) are scored on the facts they must keep;
-their outputs were also read by hand. Apple M-series Mac, Metal, Q4_K_M or Q8_0 files.
+answered, and text that is already right and must come back unchanged ("left alone"). The 16 action
+cases run an action on a dictation, as an auto action does (Prompt engineer, including requests about
+one component that must not grow into app-wide ones, Polish on numbers and names, Spanish and an
+instruction-like sentence, Make formal, Shorten, Bullet points). The 7 command cases (task
+`command:<Action>`, or `command:<Action>:<what the user also said>`) run an action on the input as the
+selected text, through command mode's prompt (Polish, Make formal, Summarize, Reply, Shorten, Prompt
+engineer). Both kinds run only on instruction models and are scored on the `keep` column, the facts
+the output must contain ("facts kept"), and the `forbid` column, text that appears only if the model
+added something ("nothing added"); both are `|`-separated and ignore case. Apple M-series Mac, Metal, Q4_K_M or Q8_0 files.
 
-| Model | Kind | Exact | WER as written | WER | Left alone | Words lost | Action facts kept | Median / p95 |
-|---|---|---|---|---|---|---|---|---|
-| **Spokenly Cleanup 1** (shipped, recommended) | cleanup | 57% | 16% | 8% | 100% | 5 | - | 70 / 221 ms |
-| **S1-mini** (shipped) | cleanup | 51% | 13% | 7% | 70% | 9 | - | 88 / 190 ms |
-| SpeakoFlow Mini 0.8B | cleanup | 41% | 20% | 11% | 70% | 8 | - | 276 / 678 ms |
-| **Qwen3.5 4B** (shipped, recommended for actions) | instruction | 49% | 15% | 9% | 60% | 6 | 90% | 1112 / 2727 ms |
-| Qwen3.5 2B | instruction | 32% | 28% | 22% | 80% | 13 | 90% | 499 / 1246 ms |
-| Qwen3.5 0.8B | instruction | 27% | 33% | 26% | 70% | 23 | 87% | 258 / 1017 ms |
-| Ministral 3 3B | instruction | 11% | 49% | 50% | 20% | 43 | 81% | 769 / 7463 ms |
+With Claude Haiku 4.5 as the saved provider (`bench_actions_saved_provider`), the action and command
+cases kept 77 of 82 facts and added nothing in 50 of 50 checks; the misses are numbers written as
+words ("seven" for 7) and one instruction-like sentence that Polish dropped instead of keeping.
+
+The table predates the "nothing added" column and the command cases (its action figures are from the
+first 9 action cases, whose outputs were also read by hand), so it has no figures for them, and it was
+measured with the earlier action prompts and wrapper, so "facts kept" has not been re-measured since.
+
+| Model | Kind | Exact | WER as written | WER | Left alone | Words lost | Action facts kept | Nothing added | Median / p95 |
+|---|---|---|---|---|---|---|---|---|---|
+| **Spokenly Cleanup 1** (shipped, recommended) | cleanup | 57% | 16% | 8% | 100% | 5 | - | - | 70 / 221 ms |
+| **S1-mini** (shipped) | cleanup | 51% | 13% | 7% | 70% | 9 | - | - | 88 / 190 ms |
+| SpeakoFlow Mini 0.8B | cleanup | 41% | 20% | 11% | 70% | 8 | - | - | 276 / 678 ms |
+| **Qwen3.5 4B** (shipped, recommended for actions) | instruction | 49% | 15% | 9% | 60% | 6 | 90% | - | 1112 / 2727 ms |
+| Qwen3.5 2B | instruction | 32% | 28% | 22% | 80% | 13 | 90% | - | 499 / 1246 ms |
+| Qwen3.5 0.8B | instruction | 27% | 33% | 26% | 70% | 23 | 87% | - | 258 / 1017 ms |
+| Ministral 3 3B | instruction | 11% | 49% | 50% | 20% | 43 | 81% | - | 769 / 7463 ms |
 
 - S1-mini dropped "Translate this to French." (it acted on the text), turned a plain list of four
   items into bullets and added line breaks to short emails. Spokenly Cleanup 1 changed nothing that

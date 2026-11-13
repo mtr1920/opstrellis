@@ -292,19 +292,24 @@ pub fn dictionary_usage(c: &Connection, except: Option<i64>) -> Result<(usize, u
 }
 
 const BUILTIN_TRANSFORMS: &[(&str, &str)] = &[
-    ("Polish", "Fix grammar, spelling and awkward phrasing so the text reads clearly. Keep the author's meaning, tone and every detail; add nothing and drop nothing."),
-    ("Prompt engineer", "Rewrite the text as a clear prompt for an AI assistant, written as the author's own request. Put the main request first, then the details and limits the author gave; list separate requests as short bullets. Keep the scope exactly as the author set it: what they said about one part stays about that part only. Add no requirements, steps, assumptions or output format they did not state, and do not answer the prompt."),
+    ("Polish", "Fix grammar, spelling and awkward phrasing so the text reads clearly. Keep the author's meaning, tone and every detail; add nothing and drop nothing. If already correct, return it unchanged."),
+    ("Prompt engineer", "Rewrite text as clear prompt for AI assistant, in author's own voice. Fix grammar, spelling, awkward phrasing. Main request first, then author's details and limits; separate requests as \"- \" bullets. Code, commands, file names in backticks; exact labels and messages in double quotes. Same scope: request about one part stays about that part. Add nothing author did not say: no requirements, steps, assumptions, output format. Output the prompt only: never answer it, refuse, or ask for missing things. Already clear: return unchanged."),
     ("Make formal", "Rewrite the text in a formal, professional tone. Change only the tone and word choice: keep the meaning and every detail, and add nothing."),
     ("Shorten", "Shorten the text to about half its length by cutting filler, repetition and minor asides. Keep every key point, name, number and date, and the author's tone; add nothing."),
-    ("Bullet points", "Turn the text into a bulleted list: one short bullet per point, in the original order. Keep every point and detail; add nothing."),
+    ("Bullet points", "Turn the text into a list of \"- \" bullets: one short bullet per point, in the original order. Keep every point and detail; add nothing."),
 ];
 /// Added in v0.2; their results go to the clipboard (the selection is a message to answer or a
 /// text to digest, not text to replace). Seeded once, also into existing databases.
 const BUILTIN_COPY_ACTIONS: &[(&str, &str)] = &[
     ("Reply", "Write a reply to the selected message, from the user's point of view, saying what the user asked to say. If the user gave no direction, write a brief, neutral reply. Do not invent facts, promises or dates. Match the message's language and formality. Output only the reply text, with no subject line or placeholders."),
-    ("Summarize", "Summarize the selected text in a few short bullet points: the key facts, decisions, requests and deadlines. Use only what the text says; add no opinions or advice."),
+    ("Summarize", "Summarize the selected text in a few short \"- \" bullet points: the key facts, decisions, requests and deadlines. Use only what the text says; add no opinions or advice."),
 ];
-/// Built-in prompts as first shipped, by action: a row still holding one gets today's
+/// Whether `prompt` is one of today's built-in action prompts, i.e. the user has not edited it.
+pub fn is_builtin_prompt(prompt: &str) -> bool {
+    BUILTIN_TRANSFORMS.iter().chain(BUILTIN_COPY_ACTIONS).any(|(_, p)| *p == prompt)
+}
+
+/// Built-in prompts of earlier versions, by action: a row still holding one gets today's
 /// prompt, a prompt the user edited stays theirs.
 const RETIRED_PROMPTS: &[(&str, &str)] = &[
     ("Polish", "Rewrite the text to be clear, concise and well structured. Fix grammar and flow. Keep the author's meaning, voice and language."),
@@ -314,6 +319,9 @@ const RETIRED_PROMPTS: &[(&str, &str)] = &[
     ("Bullet points", "Turn the text into a concise bulleted list."),
     ("Reply", "Write a reply to the selected message, from the user's point of view, following what the user said they want to answer. Match the message's language and level of formality. Output only the reply text, without a subject line or placeholders."),
     ("Summarize", "Summarize the selected text in a few short bullet points: the key facts, decisions and any requests or deadlines."),
+    ("Prompt engineer", "Rewrite the text as a clear prompt for an AI assistant, written as the author's own request. Put the main request first, then the details and limits the author gave; list separate requests as short bullets. Keep the scope exactly as the author set it: what they said about one part stays about that part only. Add no requirements, steps, assumptions or output format they did not state, and do not answer the prompt."),
+    ("Bullet points", "Turn the text into a bulleted list: one short bullet per point, in the original order. Keep every point and detail; add nothing."),
+    ("Summarize", "Summarize the selected text in a few short bullet points: the key facts, decisions, requests and deadlines. Use only what the text says; add no opinions or advice."),
 ];
 
 impl Db {
@@ -383,13 +391,13 @@ impl Db {
                 }
             }
         }
-        if version < 5 {
+        if version < 6 {
             for (name, retired) in RETIRED_PROMPTS {
                 if let Some((_, current)) = BUILTIN_TRANSFORMS.iter().chain(BUILTIN_COPY_ACTIONS).find(|(n, _)| n == name) {
                     migration.execute("UPDATE transforms SET prompt = ?1 WHERE builtin = 1 AND prompt = ?2", params![current, retired])?;
                 }
             }
-            migration.pragma_update(None, "user_version", 5)?;
+            migration.pragma_update(None, "user_version", 6)?;
         }
         migration.commit()?;
         // v0.5: entries synced from the user's team library (`team.rs`), marked by the server's entry id.
@@ -1322,27 +1330,36 @@ mod tests {
 
     #[test]
     fn retired_builtin_prompts_are_replaced_unless_edited() {
+        // One entry per earlier version of a built-in prompt: dropping one would leave its users on it.
+        let names: Vec<&str> = RETIRED_PROMPTS.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, ["Polish", "Prompt engineer", "Make formal", "Shorten", "Bullet points", "Reply", "Summarize", "Prompt engineer", "Bullet points", "Summarize"]);
         let dir = std::env::temp_dir().join(format!("opstrellis-prompts-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("db");
         drop(Db::open(&path).unwrap());
-        let conn = Connection::open(&path).unwrap();
-        for (name, retired) in RETIRED_PROMPTS {
-            assert_eq!(conn.execute("UPDATE transforms SET prompt = ?1 WHERE name = ?2", params![retired, name]).unwrap(), 1, "{name}");
-        }
-        conn.execute_batch(
-            "UPDATE transforms SET prompt = 'My polish' WHERE name = 'Polish';
-             UPDATE transforms SET name = 'Tighten' WHERE name = 'Shorten';
-             PRAGMA user_version = 4;",
-        )
-        .unwrap();
-        drop(conn);
-        let actions = Db::open(&path).unwrap().list_transforms().unwrap();
-        let prompt = |name: &str| actions.iter().find(|t| t.name == name).unwrap().prompt.clone();
-        assert_eq!(prompt("Polish"), "My polish", "an edited prompt stays");
-        assert_eq!(prompt("Tighten"), BUILTIN_TRANSFORMS[3].1, "a renamed built-in still updates");
-        for (name, current) in BUILTIN_TRANSFORMS.iter().chain(BUILTIN_COPY_ACTIONS).filter(|(n, _)| !matches!(*n, "Polish" | "Shorten")) {
-            assert_eq!(prompt(name), *current);
+        let current = |name: &str| BUILTIN_TRANSFORMS.iter().chain(BUILTIN_COPY_ACTIONS).find(|(n, _)| *n == name).unwrap().1;
+        for version in [4, 5] {
+            for (name, retired) in RETIRED_PROMPTS {
+                assert_ne!(*retired, current(name), "{name}");
+                let conn = Connection::open(&path).unwrap();
+                assert_eq!(conn.execute("UPDATE transforms SET prompt = ?1 WHERE builtin = 1 AND name = ?2", params![retired, name]).unwrap(), 1, "{name}");
+                conn.pragma_update(None, "user_version", version).unwrap();
+                drop(conn);
+                let actions = Db::open(&path).unwrap().list_transforms().unwrap();
+                assert_eq!(actions.iter().find(|t| t.name == *name).unwrap().prompt, current(name), "v{version}: {retired}");
+            }
+            let conn = Connection::open(&path).unwrap();
+            conn.execute("UPDATE transforms SET prompt = 'My polish' WHERE name = 'Polish'", []).unwrap();
+            conn.execute("UPDATE transforms SET name = 'Tighten', prompt = ?1 WHERE name = 'Shorten'", [RETIRED_PROMPTS[3].1]).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            drop(conn);
+            let actions = Db::open(&path).unwrap().list_transforms().unwrap();
+            let prompt = |name: &str| actions.iter().find(|t| t.name == name).unwrap().prompt.clone();
+            assert_eq!(prompt("Polish"), "My polish", "v{version}: an edited prompt stays");
+            assert_eq!(prompt("Tighten"), BUILTIN_TRANSFORMS[3].1, "v{version}: a renamed built-in still updates");
+            let conn = Connection::open(&path).unwrap();
+            conn.execute("UPDATE transforms SET name = 'Shorten' WHERE name = 'Tighten'", []).unwrap();
+            conn.execute("UPDATE transforms SET prompt = ?1 WHERE name = 'Polish'", [BUILTIN_TRANSFORMS[0].1]).unwrap();
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
