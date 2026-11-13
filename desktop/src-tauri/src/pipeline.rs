@@ -966,8 +966,8 @@ impl App {
                 .and_then(|r| r)
                 .map(|t| llm::strip_controls(&t))
             }
-            Some(m) => self.local_client(m).complete_within(&system, &llm::wrap_dictation(&pre.text), llm::CLEANUP_TIMEOUT).await,
-            None => self.llm_client(settings).complete_within(&system, &llm::wrap_dictation(&pre.text), llm::CLEANUP_TIMEOUT).await,
+            Some(m) => self.local_client(m).complete_within(&system, &llm::wrap_dictation(&pre.text, rewrite), llm::CLEANUP_TIMEOUT).await,
+            None => self.llm_client(settings).complete_within(&system, &llm::wrap_dictation(&pre.text, rewrite), llm::CLEANUP_TIMEOUT).await,
         };
         // A cleanup (not a rewrite action) must keep every dictionary term that was said, offline
         // or cloud: the local model can't be told the user's words, so this is how it respects them.
@@ -983,7 +983,7 @@ impl App {
                 warning = Some(format!("AI polish changed “{term}” from your dictionary. {plain}"));
                 pre.text.clone()
             }
-            Ok(out) if llm::accept_cleanup(&pre.text, &out, rewrite.is_some() || output.is_some()) => out,
+            Ok(out) if llm::accept_cleanup(&pre.text, &out, rewrite.is_some() || output.is_some()) => without_backticks(out, rewrite.is_some(), ctx),
             Ok(out) => {
                 log::warn!("discarded implausible LLM cleanup output ({} chars)", out.len());
                 warning = Some(format!("AI polish skipped (odd result). {plain}"));
@@ -1065,19 +1065,22 @@ impl App {
         .await??;
         // "polish" / "make formal" etc. run the saved transform prompt.
         let spoken = instruction.trim().trim_end_matches(['.', '!', '?']).to_lowercase();
-        let transform = spoken_action(&spoken, &self.db)?;
-        let copy = transform.as_ref().is_some_and(|t| t.output == "copy");
+        let matched = spoken_action(&spoken, &self.db)?;
+        // Free writing that named a copy action ("reply saying Thursday works") is still copied, not pasted.
+        let copy = matched.as_ref().is_some_and(|t| t.output == "copy");
+        let transform = action_for_selection(&spoken, selection.is_some(), matched)?;
         // A named action keeps what was said around its name ("reply saying Thursday works").
+        let named = transform.is_some();
         let instruction = match transform {
-            Some(t) if spoken == t.name.to_lowercase() => t.prompt,
-            Some(t) => format!("{}\nThe user also said: {}", t.prompt, instruction.trim()),
+            Some(t) => llm::action_instruction(&t.prompt, (spoken != t.name.to_lowercase()).then_some(instruction.trim())),
             None => instruction.to_string(),
         };
         let out = self
             .llm_client(settings)
-            .complete(&llm::command_prompt(selection.as_deref()), &llm::command_input(selection.as_deref(), &instruction))
+            .complete(&llm::command_prompt(selection.as_deref(), copy), &llm::command_input(selection.as_deref(), &instruction))
             .await?;
         llm::check_command_output(selection.as_deref(), &out)?;
+        let out = without_backticks(out, named, ctx);
         // In a shell the model's answer would run as typed: the user reads it and pastes it.
         let shell = !ctx.allows_rewrite();
         let copy_note = shell.then_some("Copied, not pasted: check it, then paste it into the terminal.");
@@ -1254,6 +1257,11 @@ impl From<text::Processed> for Cleaned {
     }
 }
 
+/// An action's result for a terminal loses its backticks, as dictation there gets none.
+fn without_backticks(text: String, rewrite: bool, ctx: &AppContext) -> String {
+    if rewrite && ctx.is_terminal { text.replace('`', "") } else { text }
+}
+
 /// Whether a command's `result`, which replaces `selection`, waits for review first (`reviewRewrites`).
 /// Nothing selected means nothing is replaced: no review.
 fn needs_review(setting: &str, selection: Option<&str>, result: &str) -> bool {
@@ -1283,6 +1291,20 @@ fn command_action(spoken: &str, actions: Vec<crate::db::Transform>) -> Option<cr
         (exact || spoken.ends_with(&format!(" {name}")) || spoken.starts_with(&format!("{name} ")))
             .then_some(((exact, name.len(), !action.builtin), action))
     }).max_by_key(|(rank, _)| *rank).map(|(_, action)| action)
+}
+
+/// With nothing selected a built-in action has nothing to work on: its bare name is an error, and a longer
+/// instruction containing it ("summarize the pros and cons of Rust") is free writing. Other actions, and built-ins
+/// whose prompt the user edited, may generate text.
+fn action_for_selection(spoken: &str, selected: bool, action: Option<crate::db::Transform>) -> Result<Option<crate::db::Transform>> {
+    let stock = |t: &crate::db::Transform| t.builtin && !selected && crate::db::is_builtin_prompt(&t.prompt);
+    match action {
+        Some(t) if stock(&t) && spoken == t.name.to_lowercase() => {
+            Err(anyhow!("Nothing is selected. Select the text first, then say “{}”.", t.name))
+        }
+        Some(t) if stock(&t) => Ok(None),
+        action => Ok(action),
+    }
 }
 
 pub(crate) fn lang(settings: &Settings) -> Option<String> {
@@ -1420,6 +1442,51 @@ mod tests {
         assert_eq!(prompt("summarize").as_deref().map(|p| p.starts_with("Summarize the selected text")), Some(true), "a built-in wins");
         drop(db);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn built_in_actions_need_a_selection() {
+        let dir = std::env::temp_dir().join(format!("opstrellis-unselected-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Db::open(&dir.join("t.db")).unwrap();
+        let seeded = db.list_transforms().unwrap();
+        let builtin = |name: &str| seeded.iter().find(|t| t.builtin && t.name == name).cloned().unwrap();
+        let mine = crate::db::Transform { id: Some(99), name: "Signature".into(), prompt: "Write my email signature.".into(), builtin: false, output: "replace".into() };
+        let run = |spoken: &str, selected: bool, t: crate::db::Transform| action_for_selection(spoken, selected, Some(t)).map(|a| a.map(|a| a.prompt));
+        let err = run("polish", false, builtin("Polish")).unwrap_err().to_string();
+        assert_eq!(err, "Nothing is selected. Select the text first, then say “Polish”.");
+        assert_eq!(run("summarize the pros and cons of rust", false, builtin("Summarize")).unwrap(), None, "prefix: free writing");
+        assert_eq!(run("now please summarize", false, builtin("Summarize")).unwrap(), None, "suffix: free writing");
+        assert_eq!(run("signature", false, mine.clone()).unwrap(), Some(mine.prompt.clone()), "the user's own may generate text");
+        let renamed = crate::db::Transform { name: "Tidy".into(), ..builtin("Polish") };
+        assert_eq!(run("tidy", false, renamed).unwrap_err().to_string(), "Nothing is selected. Select the text first, then say “Tidy”.", "renamed, prompt unedited");
+        let edited = crate::db::Transform { prompt: "Write a haiku about the sea.".into(), ..builtin("Polish") };
+        assert_eq!(run("polish", false, edited.clone()).unwrap(), Some(edited.prompt.clone()), "an edited built-in runs as before");
+        assert_eq!(run("polish the sea", false, edited.clone()).unwrap(), Some(edited.prompt), "also with more words");
+        for (spoken, t) in [("polish", builtin("Polish")), ("summarize the pros", builtin("Summarize")), ("signature", mine)] {
+            assert_eq!(run(spoken, true, t.clone()).unwrap(), Some(t.prompt), "{spoken}: with a selection, unchanged");
+        }
+        assert!(action_for_selection("anything", false, None).unwrap().is_none());
+
+        let entry = serde_json::json!({ "id": "a", "kind": "action", "data": { "name": "Standup", "prompt": "team standup", "output": "replace" } });
+        let page = crate::team::Page { team: Some(crate::team::TeamRef { id: "t".into(), name: "T".into() }), version: 1, entries: vec![entry], more: false, reset: false };
+        crate::team::apply(&db, &crate::team::cursor(&db).unwrap(), &page).unwrap();
+        let team = action_for_selection("standup", false, spoken_action("standup", &db).unwrap()).unwrap();
+        assert_eq!(team.map(|t| t.prompt).as_deref(), Some("team standup"), "a team action keeps running with nothing selected");
+        assert!(action_for_selection("polish", false, spoken_action("polish", &db).unwrap()).is_err(), "the seeded Polish is built in");
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rewrites_for_a_terminal_have_no_backticks() {
+        let agent = crate::context::classify(Some("kitty".into()), Some("\u{2733} Claude Code".into()));
+        let chat = crate::context::classify(Some("firefox".into()), Some("ChatGPT".into()));
+        assert!(agent.is_terminal && agent.allows_rewrite() && !chat.is_terminal);
+        let out = || "Fix `src/app.rs` so `cargo test` passes.\n```\nrun()\n```".to_string();
+        assert_eq!(without_backticks(out(), true, &agent), "Fix src/app.rs so cargo test passes.\n\nrun()\n");
+        assert_eq!(without_backticks(out(), true, &chat), out(), "other apps keep them");
+        assert_eq!(without_backticks(out(), false, &agent), out(), "plain cleanup is untouched");
     }
 
     #[test]
