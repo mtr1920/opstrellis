@@ -185,6 +185,9 @@ auto-repeat never reaches the app below; after Enter the paste waits for that.
 | `reindex_workspace` | `{ path }` | `Workspace[]`: indexes it again in the background, unless a run for it is already going; rejects an unknown path |
 | `check_update` | – | `UpdateInfo`: asks `api.github.com` for the latest release (only its `tag_name`, which must be `v?N.N.N`), whatever `checkUpdates` says |
 | `open_release_page` | `{ tag }` | – (opens `https://github.com/mtr1920/opstrellis/releases/tag/<tag>`; rejects a tag that isn't `v?N.N.N`) |
+| `self_update_supported` | – | `boolean`: true on macOS when running from an app bundle, and on Linux for the AppImage build running as an AppImage (`APPIMAGE` set and that file exists, and the binary inside `APPDIR`); false for a `.deb` install (updated by installing the new `.deb` from the release page) or an unbundled dev build. The UI then shows "Open release page" and the install command |
+| `download_update` | – | – (reads `https://github.com/mtr1920/opstrellis/releases/latest/download/latest.json` through the updater plugin, downloads this platform's build and verifies its signature, then keeps it in memory; progress and outcome as `update-download` events. Never a downgrade. A call while a download runs joins it; after one finished it reports `ready` again without downloading. Rejects when `self_update_supported` is false; rejects, also as a `failed` event, when GitHub can't be reached, the latest release has no `latest.json` (releases before in-app updates), the signature doesn't match, or the download breaks off) |
+| `install_update` | – | – (installs the downloaded update and restarts the app; never returns on success. Rejects with "Finish the recording first, then restart." while a dictation is recording or processing or a meeting is recording or finishing. Before restarting it writes `<app data>/update-restart`; the launch that finds it deletes it, ignores its launch arguments and opens the main window. macOS replaces the app bundle, asking for an administrator password if its folder isn't writable; Linux replaces the AppImage and, if it is the one `install.sh` manages, rewrites its `VERSION` marker. On failure the installed app is unchanged and the download is kept for another try; rejects when nothing was downloaded) |
 
 ## Events (`listen(name, cb)` from `@tauri-apps/api/event`)
 
@@ -201,6 +204,7 @@ auto-repeat never reaches the app below; after Enter the paste waits for that.
 | `workspaces-changed` | – (an indexing run ended; call `list_workspaces`) |
 | `settings-changed` | `Settings` (changed outside the window, e.g. the tray's AI polish toggle) |
 | `permissions-changed` | – (something `permissions` reports changed, e.g. the desktop bound the Wayland shortcuts) |
+| `update-download` | `{ state: "downloading" \| "ready" \| "installing" \| "failed", percent: number \| null, error: string \| null }` (`percent` is null until the size is known, stays below 100 until the signature is checked; `installing` while `install_update` runs, back to `ready` if it fails) |
 | `update-available` | `UpdateInfo` (only while `checkUpdates` is on. The backend looks every 30 s and checks when the last successful check, `updateCheckedAt`, is over 24 h old or missing, so a restart does not trigger one; a failed try is repeated after an hour; the setting is read every time; failures are only logged) |
 | `shortcut-captured` | `string` (a single key such as `"Fn"` or `"RightOption"`, pressed on its own while the recorder is open; macOS) |
 | `history-updated` | – |

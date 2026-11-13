@@ -68,8 +68,12 @@ macOS (Apple silicon, macOS 11 or later) or Linux (x86_64, glibc 2.35 or later, 
 curl -fsSL https://raw.githubusercontent.com/mtr1920/opstrellis/main/install.sh | bash
 ```
 
-That's it. Run the same command again any time to update; your settings, history, models and keys
-are kept. To check the installed version, run `opstrellis --version` or open Settings → About.
+That's it. To update, open Settings → About, click **Check for updates**, then **Download update**
+and **Restart to update** once it's downloaded; the update is signed, and checked before it's
+installed. Running the same command again also updates. A `.deb` install is updated by installing
+the new `.deb` from the [releases page](https://github.com/mtr1920/opstrellis/releases) (the command
+would add a second copy, an AppImage). Your settings, history, models and keys are kept either way. To check the installed version, run
+`opstrellis --version` or open Settings → About.
 
 <details>
 <summary>What the installer does, and other options</summary>
@@ -279,6 +283,9 @@ other software running as you can read OpsTrellis's files directly.
 - Optional update check (off by default, Settings → About): once a day OpsTrellis asks github.com
   for the latest version number. The request carries no account, device or usage data (GitHub sees
   your IP address, as with any request), and nothing is installed automatically.
+- Only when you click **Download update** does OpsTrellis download the update from github.com (the
+  release's `latest.json`, then the build for your system). It is installed when you click
+  **Restart to update**.
 
 ## OpsTrellis Cloud (optional, self-hosted)
 

@@ -331,6 +331,14 @@ with open(sys.argv[2]+'.plist','rb') as f: print(plistlib.load(f)['CFBundleShort
         self.assertFalse((self.home / '.bashrc').exists())
         self.assertFalse((self.home / '.bash_profile').exists())
 
+    @unittest.skipUnless(REAL_ASSET, 'needs the native bundle')
+    def test_native_bundle_can_update_itself(self):
+        # The installed AppImage or .app must offer in-app updates; a .deb-style "no" would leave
+        # users with the command only.
+        self.run_install()
+        r = subprocess.run([str(self.home / '.local/bin/opstrellis'), '--can-self-update'], env=dict(self.env, APPIMAGE_EXTRACT_AND_RUN='1'), text=True, capture_output=True)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, 'yes'), r.stderr)
+
     @unittest.skipUnless(NATIVE == 'Darwin' and REAL_ASSET, 'native macOS system installation')
     def test_native_system_app_directory(self):
         app = Path('/Applications/OpsTrellis.app')

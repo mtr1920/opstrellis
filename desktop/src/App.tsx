@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, errMsg, useEvent, type DictationState, type Permissions, type Settings, type UpdateInfo } from "./api";
+import { api, errMsg, useEvent, type DictationState, type Permissions, type Settings, type UpdateDownload, type UpdateInfo } from "./api";
 import { Icon, Logo, type IconName } from "./icons";
 import { applyTheme, comboText, IS_MAC, isDarkTheme, PageGroup, Tabs, type SetSetting } from "./ui";
 import Home from "./pages/Home";
@@ -105,7 +105,13 @@ export default function App() {
   // A newer version found by the daily check. It is announced once per version, but only while the
   // window is showing: otherwise nobody would see the toast, and the version would be used up.
   const [update, setUpdate] = useState<UpdateInfo | null>(null);
-  useEvent("update-available", setUpdate);
+  // Kept here so a download keeps showing its progress after leaving Settings and coming back.
+  const [download, setDownload] = useState<UpdateDownload | null>(null);
+  useEvent("update-download", setDownload);
+  useEvent("update-available", (info) => {
+    setUpdate(info);
+    setDownload((d) => (d?.state === "failed" ? null : d)); // an earlier failure isn't about this result
+  });
   useEffect(() => {
     if (!update) return;
     const announce = () => {
@@ -232,7 +238,7 @@ export default function App() {
           {page === "home" && <Home {...props} onSetup={() => setOnboarding(true)} />}
           {page === "insights" && <Insights />}
           {page === "style" && <Style {...props} />}
-          {page === "settings" && <SettingsPage {...props} saveError={saveError} saveNow={saveNow} update={update} />}
+          {page === "settings" && <SettingsPage {...props} saveError={saveError} saveNow={saveNow} update={update} download={download} />}
           {page in GROUPS && (
             <PageGroup.Provider value={{
               title: PAGES.find((p) => p.id === page)!.label,

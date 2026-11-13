@@ -182,6 +182,8 @@ export interface SettingsDetail {
 export interface BackupExport { path: string; dictionary: number; snippets: number; actions: number; notes: number; skipped: number }
 /** `latest` is the release tag ("v0.3.3"); `url` is its release page. */
 export interface UpdateInfo { current: string; latest: string; newer: boolean; url: string }
+/** An in-app update: `percent` is null while the size is unknown; `ready` waits for a restart, `installing` for the install (macOS may ask for a password). */
+export interface UpdateDownload { state: "downloading" | "ready" | "installing" | "failed"; percent: number | null; error: string | null }
 
 export interface Events {
   "theme-changed": Theme;
@@ -210,6 +212,7 @@ export interface Events {
   "permissions-changed": null;
   /** A newer release exists (only while "Check for updates automatically" is on). */
   "update-available": UpdateInfo;
+  "update-download": UpdateDownload;
   /** A workspace finished indexing (or failed to). */
   "workspaces-changed": null;
 }
@@ -325,6 +328,12 @@ export const api = {
   reindexWorkspace: (path: string) => call<Workspace[]>("reindex_workspace", { path }),
   checkUpdate: () => call<UpdateInfo>("check_update"),
   openReleasePage: (tag: string) => call<void>("open_release_page", { tag }),
+  /** False for a .deb install on Linux: it is updated by installing the new .deb from the release page. */
+  selfUpdateSupported: () => call<boolean>("self_update_supported"),
+  /** Its progress and outcome arrive as `update-download` events. */
+  downloadUpdate: () => call<void>("download_update"),
+  /** Installs the downloaded update and restarts into it; it only returns on an error. */
+  installUpdate: () => call<void>("install_update"),
   version: () => (isTauri ? getVersion() : Promise.resolve("dev")),
 };
 
