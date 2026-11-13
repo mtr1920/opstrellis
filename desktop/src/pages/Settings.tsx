@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import {
-  api, errMsg, useEvent, type BackupSummary, type CloudStatus, type SettingsDetail, type LocalModel, type Permissions, type PolishModel, type WaylandShortcuts, type ProviderKind, type Settings, type SttEntry, type TeamStatus, type UpdateInfo,
+  api, errMsg, useEvent, type BackupSummary, type CloudStatus, type SettingsDetail, type LocalModel, type Permissions, type PolishModel, type WaylandShortcuts, type ProviderKind, type Settings, type SttEntry, type TeamStatus, type UpdateDownload, type UpdateInfo,
 } from "../api";
 import { Icon } from "../icons";
 import { LLM_SERVICES, OTHER_SERVICE, serviceFor } from "../llmServices";
@@ -35,7 +35,7 @@ const GROUPS: [string, string[]][] = [
 ];
 const SECTIONS = GROUPS.flatMap(([, sections]) => sections);
 
-type Props = SettingsProps & { saveError: string | null; saveNow: () => Promise<void>; update: UpdateInfo | null };
+type Props = SettingsProps & { saveError: string | null; saveNow: () => Promise<void>; update: UpdateInfo | null; download: UpdateDownload | null };
 
 export default function SettingsPage(props: Props) {
   const { settings, set } = props;
@@ -1235,35 +1235,70 @@ const humanize = (k: string) => k.replace(/([A-Z])/g, " $1").replace(/_/g, " ").
 
 const INSTALL_COMMAND = "curl -fsSL https://raw.githubusercontent.com/mtr1920/opstrellis/main/install.sh | bash";
 
-function About({ settings, set, update: pending }: SettingsProps & { update: UpdateInfo | null }) {
+function About({ settings, set, update: pending, download }: SettingsProps & { update: UpdateInfo | null; download: UpdateDownload | null }) {
   const [version, setVersion] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
   const [checked, setChecked] = useState<UpdateInfo | null>(null);
   const [updateError, setUpdateError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [selfUpdate, setSelfUpdate] = useState<boolean | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  // A failed download from before the latest check isn't shown again.
+  const [staleFailure, setStaleFailure] = useState<UpdateDownload | null>(null);
   useEffect(() => void api.version().then(setVersion, () => {}), []);
+  useEffect(() => void api.selfUpdateSupported().then(setSelfUpdate, () => setSelfUpdate(false)), []);
 
   async function check() {
     setChecking(true);
     setUpdateError(null);
-    try { setChecked(await api.checkUpdate()); } catch (e) { setChecked(null); setUpdateError(errMsg(e)); }
+    try {
+      setChecked(await api.checkUpdate());
+      setActionError(null);
+      setStaleFailure(download);
+    } catch (e) { setChecked(null); setUpdateError(errMsg(e)); }
     setChecking(false);
   }
   const update = checked ?? pending; // a newer version the daily check already found shows without a click
   const copy = () => navigator.clipboard.writeText(INSTALL_COMMAND).then(() => setCopied(true), () => {});
+  const downloading = download?.state === "downloading";
+  const ready = download?.state === "ready";
+  const installing = download?.state === "installing";
+  const failure = actionError ?? (download?.state === "failed" && download !== staleFailure ? download.error : null);
+  // A download outlives this page (and its check result), so it keeps its controls.
+  const offered = !!update?.newer || downloading || ready || installing;
+  // Where the app can't replace itself, or that failed, the terminal command still updates it.
+  const manual = offered && (selfUpdate === false || !!failure);
+  const startDownload = () => {
+    setActionError(null);
+    api.downloadUpdate().catch((e) => setActionError(errMsg(e)));
+  };
+  const install = () => {
+    setActionError(null);
+    api.installUpdate().catch((e) => setActionError(errMsg(e)));
+  };
+  const status = !offered ? null
+    : installing ? "Installing the update. OpsTrellis will reopen on the new version."
+    : ready ? `OpsTrellis will close and reopen on the new version.${IS_MAC ? " macOS may ask for Accessibility and Input Monitoring again." : ""}`
+    : <>{update?.newer ? `Version ${update.latest.replace(/^v/, "")} is available.` : "Downloading the update."}
+      {downloading && <Progress value={(download.percent ?? 0) / 100} />}</>;
+  const primary = manual ? "btn" : "btn primary";
 
   return (
     <>
       <Row title="Version" desc="MIT licensed: free for anyone, including commercial use."><span className="meta mono">{version ?? "…"}</span></Row>
       <Row title="Check for updates"
-        desc={updateError ? <span className="error">{updateError}</span>
-          : update ? (update.newer ? `Version ${update.latest.replace(/^v/, "")} is available.` : "You're on the latest version.")
-          : "Looks up the latest version on github.com. Nothing is installed."}>
-        {update?.newer && <button className="btn primary" onClick={() => api.openReleasePage(update.latest).catch((e) => setUpdateError(errMsg(e)))}>Open release page</button>}
+        desc={<span aria-live="polite">{updateError ? <span className="error">{updateError}</span>
+          : failure && offered ? <span className="error">{failure}</span>
+          : status ?? (update ? "You're on the latest version." : "Looks up the latest version on github.com. Nothing is installed.")}</span>}>
+        {offered && selfUpdate && (ready || installing
+          ? <button className={primary} disabled={installing} onClick={install}>{installing ? "Installing…" : "Restart to update"}</button>
+          : <button className={primary} disabled={downloading} onClick={startDownload}>
+            {downloading ? `Downloading…${download.percent === null ? "" : ` ${download.percent}%`}` : "Download update"}</button>)}
+        {manual && update?.newer && <button className="btn primary" onClick={() => api.openReleasePage(update.latest).catch((e) => setUpdateError(errMsg(e)))}>Open release page</button>}
         <button className="btn" disabled={checking} onClick={check}>{checking ? "Checking…" : "Check for updates"}</button>
       </Row>
-      {update?.newer && (
+      {manual && (
         <div className="row column">
           <div className="row-desc">To update, run this in a terminal:</div>
           <div className="code-row">

@@ -10,8 +10,8 @@ You'll get a reply as soon as possible, and credit in the release notes if you'd
 
 ## Supported versions
 
-Security fixes go into the latest release. Update with the install command in the
-[README](README.md#install).
+Security fixes go into the latest release. Update from Settings → About, or with the install command
+in the [README](README.md#install).
 
 ## How OpsTrellis protects you
 
@@ -20,4 +20,6 @@ Security fixes go into the latest release. Update with the install command in th
   provider you chose.
 - Releases are checked against SHA-256 checksums by the installer, and the offline AI model is
   pinned to one version and verified before it's loaded.
+- In-app updates are signed: the app installs one only if its signature matches the public key
+  built into the app.
 - Logs contain timings and errors, never what you said or typed.

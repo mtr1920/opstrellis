@@ -159,6 +159,28 @@ function upsert<T extends { id: number }>(list: T[], item: Partial<T>, fill: Par
 }
 
 const UPDATE = { current: "0.3.2", latest: "v0.3.3", newer: true, url: "https://github.com/mtr1920/opstrellis/releases/tag/v0.3.3" };
+// In-app update, like the backend: one download at a time, kept until the restart. `?noSelfUpdate`
+// acts like a .deb install, `?updateError` fails the download and `?installError` the install.
+let updateStage: "idle" | "downloading" | "ready" = "idle";
+function downloadUpdate() {
+  if (updateStage === "ready") emit("update-download", { state: "ready", percent: 100, error: null });
+  if (updateStage !== "idle") return;
+  updateStage = "downloading";
+  let percent = 0;
+  emit("update-download", { state: "downloading", percent: null, error: null });
+  const t = setInterval(() => {
+    percent += 7;
+    if (location.search.includes("updateError") && percent > 40) {
+      clearInterval(t);
+      updateStage = "idle";
+      emit("update-download", { state: "failed", percent: null, error: "Couldn't download the update from github.com: connection reset" });
+    } else if (percent >= 100) {
+      clearInterval(t);
+      updateStage = "ready";
+      emit("update-download", { state: "ready", percent: 100, error: null });
+    } else emit("update-download", { state: "downloading", percent, error: null });
+  }, 200);
+}
 
 const BUILTIN_PACKS: TermPack[] = [
   { id: "tech", name: "Tech terms", description: "Developer tools, cloud services and workplace apps.", terms: 304, builtin: true, enabled: true },
@@ -481,6 +503,21 @@ const handlers: Record<string, (a: any) => unknown> = {
     settings.cleanup.termPacks = settings.cleanup.termPacks.filter((x) => x !== id);
   },
   check_update: () => new Promise((r) => setTimeout(() => r(UPDATE), 600)),
+  self_update_supported: () => !location.search.includes("noSelfUpdate"),
+  download_update: () => downloadUpdate(),
+  install_update: () => {
+    if (updateStage !== "ready") throw "Download the update first.";
+    emit("update-download", { state: "installing", percent: 100, error: null });
+    if (location.search.includes("installError")) {
+      return new Promise((_, reject) => setTimeout(() => {
+        emit("update-download", { state: "ready", percent: 100, error: null });
+        reject("Couldn't install the update: Read-only file system (os error 30)");
+      }, 800));
+    }
+    // Like the restart: the page starts over on the "new version".
+    setTimeout(() => location.reload(), 800);
+    return new Promise(() => {});
+  },
   open_release_page: ({ tag }) => {
     if (!/^v?\d+\.\d+\.\d+$/.test(tag)) throw "Not a release version";
     window.open(`https://github.com/mtr1920/opstrellis/releases/tag/${tag}`, "_blank", "noopener");

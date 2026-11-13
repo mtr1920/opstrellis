@@ -45,6 +45,8 @@ enum Command {
     Notes { kind: Option<String>, json: bool },
     Note { id: i64, json: bool },
     Ask { question: String, json: bool },
+    /// Hidden, for release checks: prints whether this copy can install updates itself.
+    CanSelfUpdate,
 }
 
 /// Runs a subcommand and returns its exit code, or None to start the app (no arguments, or the
@@ -57,6 +59,10 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
             Some(0)
         }
         Ok(Command::Mcp) => Some(crate::mcp::serve()),
+        Ok(Command::CanSelfUpdate) => {
+            println!("{}", if crate::update::self_update_supported() { "yes" } else { "no" });
+            Some(0)
+        }
         Ok(cmd) => Some(run(&Store::locate(), cmd, &mut std::io::stdout().lock(), &mut std::io::stderr().lock())),
         Err(e) => {
             let _ = write!(std::io::stderr(), "opstrellis: {e}\n\n{HELP}");
@@ -68,6 +74,9 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
 fn parse(args: &[String]) -> Result<Command, String> {
     let help = |a: &String| a == "--help" || a == "-h";
     let Some((first, rest)) = args.split_first() else { return Ok(Command::App) };
+    if first == "--can-self-update" && rest.is_empty() {
+        return Ok(Command::CanSelfUpdate);
+    }
     if first.starts_with('-') {
         if args.iter().any(help) {
             return Ok(Command::Help);
@@ -119,7 +128,7 @@ fn run(store: &Store, cmd: Command, out: &mut impl Write, err: &mut impl Write) 
         Command::Notes { kind, json } => (Tool::ListNotes, json!({ "kind": kind, "limit": agent::MAX_NOTES }), json),
         Command::Note { id, json } => (Tool::GetNote, json!({ "id": id }), json),
         Command::Ask { question, json } => (Tool::AskUser, json!({ "question": question }), json),
-        Command::App | Command::Help | Command::Mcp => return 2,
+        Command::App | Command::Help | Command::Mcp | Command::CanSelfUpdate => return 2,
     };
     let result = match args.as_object().map(|a| agent::call(store, tool, a)) {
         Some(Ok(v)) => v,
@@ -183,6 +192,13 @@ mod tests {
 
     fn parsed(args: &[&str]) -> Result<Command, String> {
         parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn the_self_update_check_is_hidden() {
+        assert_eq!(parsed(&["--can-self-update"]), Ok(Command::CanSelfUpdate));
+        assert_eq!(parsed(&["--can-self-update", "extra"]), Ok(Command::App));
+        assert!(!HELP.contains("self-update"));
     }
 
     #[test]

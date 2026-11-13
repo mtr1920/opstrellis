@@ -3,7 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
-    # A version tag (v0.2.0, matching Cargo.toml) also publishes a GitHub release for install.sh.
+    # A version tag (v0.2.0, matching Cargo.toml) also publishes a GitHub release for install.sh and
+    # the in-app updater.
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
@@ -107,7 +108,22 @@ jobs:
           touch sherpa-onnx-moonshine-tiny-en-int8/.complete
           cd "$GITHUB_WORKSPACE/desktop/src-tauri" && cargo test
       - name: Bundle
-        run: npx tauri build --bundles ${{ matrix.bundles }}
+        # Every build makes the signed updater artifacts the in-app updater installs: the AppImage's
+        # .sig, and macOS's OpsTrellis.app.tar.gz with its .sig. Release tags sign with the real key.
+        env:
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ startsWith(github.ref, 'refs/tags/') && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: |
+          config='{"bundle":{"createUpdaterArtifacts":true}}'
+          if [ "$RELEASE_TAG" != true ]; then
+            # Not a release: signed with a throwaway key nobody keeps (and never uploaded), and that
+            # build trusts only it. Needs no secret, so fork PRs work.
+            npx tauri signer generate --ci -p "" -w "$RUNNER_TEMP/throwaway-updater.key" >/dev/null
+            export TAURI_SIGNING_PRIVATE_KEY="$RUNNER_TEMP/throwaway-updater.key"
+            config="{\"bundle\":{\"createUpdaterArtifacts\":true},\"plugins\":{\"updater\":{\"pubkey\":\"$(cat "$RUNNER_TEMP/throwaway-updater.key.pub")\"}}}"
+          fi
+          npx tauri build --bundles ${{ matrix.bundles }} --config "$config"
       - name: Installer asset (fixed name, as install.sh expects)
         env: { INSTALLER_TARGET: "${{ matrix.target }}" }
         run: |
@@ -119,15 +135,21 @@ jobs:
           mkdir -p release
           bundle=src-tauri/target/release/bundle
           if [ "$RUNNER_OS" = Linux ]; then
-            cp $bundle/appimage/*.AppImage release/opstrellis-${{ matrix.target }}.AppImage
+            asset=release/opstrellis-${{ matrix.target }}.AppImage
+            cp $bundle/appimage/*.AppImage "$asset"
+            cp $bundle/appimage/*.AppImage.sig "$asset.sig"
           else
-            # A tarball keeps the app bundle's symlinks and permissions, which the artifact zip drops.
-            tar -czf release/opstrellis-${{ matrix.target }}.app.tar.gz -C $bundle/macos OpsTrellis.app
+            # Tauri's own archive (OpsTrellis.app at its top, symlinks and permissions kept, which the
+            # artifact zip would drop). The .sig signs these exact bytes.
+            asset=release/opstrellis-${{ matrix.target }}.app.tar.gz
+            cp $bundle/macos/OpsTrellis.app.tar.gz "$asset"
+            cp $bundle/macos/OpsTrellis.app.tar.gz.sig "$asset.sig"
           fi
+          python3 ../.github/scripts/latest_json.py --check "$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -1)" "$asset"
       - name: Install and rerun the native bundle before publishing
         env: { APPIMAGE_EXTRACT_AND_RUN: 1 }
         run: |
-          OPSTRELLIS_TEST_ASSET="$(find "$PWD/release" -type f | head -1)"
+          OPSTRELLIS_TEST_ASSET="$(find "$PWD/release" -type f ! -name '*.sig' | head -1)"
           OPSTRELLIS_TEST_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -1)"
           export OPSTRELLIS_TEST_ASSET OPSTRELLIS_TEST_VERSION
           python3 ../tests/test_installer.py
@@ -162,8 +184,13 @@ jobs:
           # Refuse incomplete releases even if an upload/download step lost an asset.
           test -s dist/opstrellis-linux-x86_64.AppImage
           test -s dist/opstrellis-macos-aarch64.app.tar.gz
+          test -s dist/opstrellis-linux-x86_64.AppImage.sig
+          test -s dist/opstrellis-macos-aarch64.app.tar.gz.sig
           test "$(find dist -name '*.deb' | wc -l)" -eq 1
           test "$(find dist -name '*.dmg' | wc -l)" -eq 1
+          # The in-app updater's manifest. Apps read it through releases/latest/download/, which
+          # never serves a pre-release's.
+          python3 .github/scripts/latest_json.py "$GITHUB_REF_NAME" dist
           (cd dist && sha256sum -- * > SHA256SUMS && sha256sum --check SHA256SUMS)
           extra=()
           case "$GITHUB_REF_NAME" in *-*) extra+=(--prerelease) ;; esac

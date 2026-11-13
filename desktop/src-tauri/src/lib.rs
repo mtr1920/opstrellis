@@ -900,6 +900,41 @@ async fn check_update(app: State<'_>) -> Res<update::UpdateInfo> {
     update::check(&app.handle.package_info().version.to_string()).await.map_err(|e| format!("{e:#}"))
 }
 
+/// Whether this copy can install an update itself (else the UI shows the install command).
+#[tauri::command]
+fn self_update_supported() -> bool {
+    update::self_update_supported()
+}
+
+/// Downloads and verifies the latest release's update; progress arrives as `update-download` events.
+#[tauri::command]
+async fn download_update(app: State<'_>) -> Res<()> {
+    update::download(&app.handle).await.map_err(|e| format!("{e:#}"))
+}
+
+/// Installs the downloaded update and restarts into it. Off the main thread: macOS may ask for an
+/// administrator password there while the install waits.
+#[tauri::command]
+async fn install_update(app: State<'_>) -> Res<()> {
+    let meeting = notetaker::status(&app);
+    if app.is_recording() || app.busy.load(std::sync::atomic::Ordering::SeqCst) || meeting.active || meeting.finishing {
+        return Err("Finish the recording first, then restart.".into());
+    }
+    let handle = app.handle.clone();
+    tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<()> {
+        update::install(&handle)?;
+        let marked = handle.path().app_data_dir().map_err(anyhow::Error::from).and_then(|dir| Ok(update::mark_restart(&dir)?));
+        if let Err(e) = marked {
+            log::warn!("couldn't mark the restart: {e:#}");
+            anyhow::bail!("The update is installed. Quit OpsTrellis and open it again to use it.");
+        }
+        handle.restart()
+    })
+    .await
+    .map_err(err)?
+    .map_err(|e| format!("{e:#}"))
+}
+
 /// Opens the release page for `tag`; the URL is built here, only for a plain version tag.
 #[tauri::command]
 fn open_release_page(tag: String) -> Res<()> {
@@ -1129,6 +1164,7 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(hotkeys::handle).build())
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec!["--background"])))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|tapp| {
             init_logging(tapp.handle());
             std::thread::spawn(terms::warm);
@@ -1136,6 +1172,8 @@ pub fn run() {
                 vad::set_model(vad);
             }
             let data_dir = tapp.path().app_data_dir()?;
+            // Taken first, so a startup that fails below can't leave it for a later launch.
+            let updated = update::take_restart_marker(&data_dir);
             secrets::private_dir(&data_dir)?;
             let settings_path = data_dir.join("settings.json");
             let models_dir = std::env::var("OPSTRELLIS_MODELS_DIR").map(PathBuf::from).unwrap_or_else(|_| data_dir.join("models"));
@@ -1249,7 +1287,8 @@ pub fn run() {
                 })
                 .build(tapp)?;
 
-            let args: Vec<String> = std::env::args().collect();
+            // A restart into an update repeats this launch's arguments: open the window instead.
+            let args: Vec<String> = if updated { Vec::new() } else { std::env::args().collect() };
             if !args.iter().any(|a| a == "--background") && !handle_cli(&app, &args) {
                 show_main(tapp.handle());
             }
@@ -1288,6 +1327,7 @@ pub fn run() {
             set_shortcut_recording,
             meeting_start, meeting_stop, meeting_status, meeting_templates, meeting_follow_up,
             export_backup, preview_backup, import_backup, import_dictionary_text, check_update, open_release_page,
+            self_update_supported, download_update, install_update,
             list_term_packs, preview_term_pack, import_term_pack, delete_term_pack,
             list_workspaces, add_workspace, remove_workspace, reindex_workspace,
             ask::question_shown
