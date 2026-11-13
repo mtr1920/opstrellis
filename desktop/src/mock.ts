@@ -80,12 +80,32 @@ let snippets: Snippet[] = [
 ];
 let transforms: Transform[] = [
   { id: 1, name: "Make formal", prompt: "Rewrite the text in a formal, professional tone.", builtin: true, output: "replace" },
-  { id: 2, name: "Bullet points", prompt: "Turn the text into a concise bulleted list.", builtin: true, output: "replace" },
+  { id: 2, name: "Bullets", prompt: "Turn the text into a bulleted list, one bullet per sentence.", builtin: true, output: "replace" },
   { id: 3, name: "Reply", prompt: "Write a reply to the selected message.", builtin: true, output: "copy" },
   { id: 4, name: "Summarize", prompt: "Summarize the selected text in a few short bullet points.", builtin: true, output: "copy" },
   { id: 5, name: "Pirate", prompt: "Rewrite the text as a pirate would say it.", builtin: false, output: "replace" },
   { id: 6, name: "Acme voice", prompt: "Rewrite the text in Acme's house style: plain words, short sentences, no exclamation marks.", builtin: false, output: "replace", team: true, unused: null },
 ];
+/** Like the backend's built-in defaults, by row id: "Bullet points" (2) has been edited. */
+const builtinDefaults: Record<number, Pick<Transform, "name" | "prompt" | "output">> = {
+  1: { name: "Make formal", prompt: "Rewrite the text in a formal, professional tone.", output: "replace" },
+  2: { name: "Bullet points", prompt: "Turn the text into a concise bulleted list.", output: "replace" },
+  3: { name: "Reply", prompt: "Write a reply to the selected message.", output: "copy" },
+  4: { name: "Summarize", prompt: "Summarize the selected text in a few short bullet points.", output: "copy" },
+};
+const edited = (t: Transform) => {
+  const d = builtinDefaults[t.id];
+  return !!t.builtin && !!d && (d.name !== t.name || d.prompt !== t.prompt || d.output !== t.output);
+};
+/** Like `Settings::reset`: the preferences `Settings::default` has; providers, AI service, privacy, cloud and team sync, onboarding and workspaces stay. */
+const DEFAULT_PREFERENCES = {
+  hotkeys: { dictate: "Ctrl+Shift+Space", command: "Ctrl+Alt+Space", pasteLast: "Ctrl+Alt+V" },
+  microphone: null, language: "auto", autoTransforms: {}, appCategories: {}, styleNotes: {}, promptStyle: "clean", outputLanguages: {}, reviewRewrites: "long",
+  styles: { personal: "casual", work: "casual", email: "formal", ai: "formal", other: "formal" },
+  insertion: { method: "paste", restoreClipboard: true, pasteDelayMs: 250 },
+  overlay: true, sounds: true, launchAtLogin: false, showInDock: true, theme: "system", checkUpdates: false, workspaceReplace: false,
+  agents: { enabled: false, history: true, notes: true, addTerms: false, voice: false },
+} satisfies Partial<Settings>;
 let teamSyncedAt = iso(3 * 60e3);
 const teamStatus = (): TeamStatus => (settings.cloud.teamLibrary
   ? { team: { id: "t1", name: "Acme" }, dictionary: dictionary.filter((x) => x.source === "team").length, snippets: snippets.filter((x) => x.team).length,
@@ -334,6 +354,10 @@ const handlers: Record<string, (a: any) => unknown> = {
     if (turnedOnUpdates) setTimeout(() => emit("update-available", UPDATE), 3000);
     return structuredClone(settings);
   },
+  reset_settings: () => handlers.save_settings({ settings: { ...settings, ...structuredClone(DEFAULT_PREFERENCES),
+    llm: { ...settings.llm, enabled: false },
+    cleanup: { removeFillers: true, voiceCommands: true, autoLearn: false, techTerms: true,
+      termPacks: settings.cleanup.termPacks.filter((id) => !BUILTIN_PACKS.some((p) => p.id === id)) } } }),
   // Like the backend: the AI key ("llm") is kept per server.
   set_secret: ({ id }) => {
     if (id === "llm" && (settings.llm.provider === "cloud" || settings.llm.provider === "local")) throw "This AI service takes no key";
@@ -372,9 +396,19 @@ const handlers: Record<string, (a: any) => unknown> = {
   list_snippets: () => snippets.filter((x) => settings.cloud.teamLibrary || !x.team),
   upsert_snippet: ({ snippet }) => { own(snippets, snippet.id, (x) => x.team); let e; [snippets, e] = upsert(snippets, snippet, { createdAt: iso(0) }); return e; },
   delete_snippet: ({ id }) => void (own(snippets, id, (x) => x.team), snippets = snippets.filter((x) => x.id !== id)),
-  list_transforms: () => transforms.filter((x) => settings.cloud.teamLibrary || !x.team),
+  list_transforms: () => transforms.filter((x) => settings.cloud.teamLibrary || !x.team)
+    .map((x) => ({ ...x, edited: edited(x), defaultName: x.builtin ? builtinDefaults[x.id]?.name : undefined })),
   upsert_transform: ({ transform }) => { own(transforms, transform.id, (x) => x.team); let e; [transforms, e] = upsert(transforms, transform, { builtin: false, output: "replace" }); return e; },
   delete_transform: ({ id }) => void (own(transforms, id, (x) => x.team), transforms = transforms.filter((x) => x.id !== id || x.builtin)),
+  restore_transform: ({ id }) => {
+    own(transforms, id, (x) => x.team);
+    const t = transforms.find((x) => x.id === id);
+    if (!t?.builtin) throw "Only built-in actions can be restored to their default";
+    if (!builtinDefaults[id]) throw "This built-in action's default isn't known, so it can't be restored";
+    const restored = { ...t, ...builtinDefaults[id] };
+    transforms = transforms.map((x) => (x.id === id ? restored : x));
+    return restored;
+  },
   list_notes: ({ kind }) => notes.filter((n) => !kind || n.kind === kind),
   meeting_start: () => null,
   meeting_templates: () => [{ id: "general", name: "General" }, { id: "sales", name: "Sales call" }, { id: "interview", name: "Interview" }, { id: "one_on_one", name: "1:1" }, { id: "standup", name: "Standup" }],

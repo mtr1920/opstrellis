@@ -9,6 +9,7 @@ export default function Transforms({ settings, set }: SettingsProps) {
   const [items, setItems] = useState<Transform[]>([]);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [restoring, setRestoring] = useState<Transform | null>(null);
 
   const load = () => api.listTransforms().then(setItems, (e) => setError(errMsg(e)));
   useEffect(() => void load(), []);
@@ -22,13 +23,24 @@ export default function Transforms({ settings, set }: SettingsProps) {
       load();
     } catch (e) { setError(errMsg(e)); }
   }
+  function dropAuto(id: number) {
+    const auto = Object.entries(settings.autoTransforms).filter(([, v]) => v !== id);
+    if (auto.length !== Object.keys(settings.autoTransforms).length) set("autoTransforms", Object.fromEntries(auto));
+  }
   async function remove(id: number) {
     try {
       await api.deleteTransform(id);
       // SQLite can reuse a deleted id, so a stale auto transform would silently run a new transform.
-      const auto = Object.entries(settings.autoTransforms).filter(([, v]) => v !== id);
-      if (auto.length !== Object.keys(settings.autoTransforms).length) set("autoTransforms", Object.fromEntries(auto));
+      dropAuto(id);
     } catch (e) { setError(errMsg(e)); }
+    load();
+  }
+  async function restore(t: Transform) {
+    try {
+      // Auto actions run only actions that replace: a new output would silently start or stop one.
+      if ((await api.restoreTransform(t.id)).output !== t.output) dropAuto(t.id);
+    } catch (e) { setError(errMsg(e)); }
+    setRestoring(null);
     load();
   }
 
@@ -53,6 +65,7 @@ export default function Transforms({ settings, set }: SettingsProps) {
             {!t.team && (
               <div className="li-actions">
                 <button className="icon-btn" title="Edit" aria-label="Edit" onClick={() => setDraft({ id: t.id, name: t.name, prompt: t.prompt, output: t.output })}><Icon name="edit" /></button>
+                {t.builtin && t.edited && t.defaultName && <button className="icon-btn" title="Restore default" aria-label="Restore default" onClick={() => setRestoring(t)}><Icon name="undo" /></button>}
                 {!t.builtin && <button className="icon-btn" title="Delete" aria-label="Delete" onClick={() => remove(t.id)}><Icon name="trash" /></button>}
               </div>
             )}
@@ -60,6 +73,16 @@ export default function Transforms({ settings, set }: SettingsProps) {
         ))}
         {items.length === 0 && <div className="list-empty">No actions yet.</div>}
       </div>
+
+      {restoring && (
+        <Modal title={`Restore “${restoring.name}” to the original “${restoring.defaultName}”?`} onClose={() => setRestoring(null)}
+          footer={<>
+            <button className="btn" onClick={() => setRestoring(null)}>Cancel</button>
+            <button className="btn danger solid" onClick={() => restore(restoring)}>Restore default</button>
+          </>}>
+          Its name, instruction and result go back to the original. Your changes to it are lost. This can't be undone.
+        </Modal>
+      )}
 
       {draft && (
         <Modal title={draft.id ? "Edit action" : "New action"} onClose={() => setDraft(null)}

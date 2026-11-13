@@ -379,7 +379,7 @@ fn detail(p: &SettingsPatch, action_ids: &HashMap<String, i64>) -> SettingsDetai
 }
 
 /// Ids of the term packs that ship with the app (the "tech" pack is its own switch).
-fn builtin_pack_ids() -> Vec<String> {
+pub(crate) fn builtin_pack_ids() -> Vec<String> {
     crate::terms::list(false, &[]).into_iter().filter(|p| p.builtin && p.id != "tech").map(|p| p.id).collect()
 }
 
